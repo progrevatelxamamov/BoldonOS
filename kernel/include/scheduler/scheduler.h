@@ -74,12 +74,14 @@ typedef struct process {
 struct cpu_local_data {
     struct cpu_local_data *self; // Обязательно на offset 0x00!
     int cpu_id;                  // Логический ID ядра (offset 0x08)
+
+    // Поля для syscall / контекста
+    uint64_t kernel_rsp;
+    uint64_t user_rsp;
+
     process_t *current_proc;     // Текущий процесс
     thread_t  *current_thread;   // Текущий поток
-    
-    // Поля для syscall / контекста
-    uint64_t user_rsp;
-    uint64_t kernel_rsp;
+
     uint64_t user_rip;
     uint64_t user_rflags;
     uint64_t user_rdx;
@@ -94,7 +96,12 @@ struct cpu_local_data {
     uint64_t user_r13;
     uint64_t user_r14;
     uint64_t user_r15;
-} __attribute__((packed));
+};
+
+_Static_assert(offsetof(struct cpu_local_data, self) == 0x00, "cpu_local_data: self must stay at 0x00");
+_Static_assert(offsetof(struct cpu_local_data, cpu_id) == 0x08, "cpu_local_data: cpu_id must stay at 0x08");
+_Static_assert(offsetof(struct cpu_local_data, kernel_rsp) == 0x10, "cpu_local_data: kernel_rsp must stay at 0x10");
+_Static_assert(offsetof(struct cpu_local_data, user_rsp) == 0x18, "cpu_local_data: user_rsp must stay at 0x18");
 
 static inline struct cpu_local_data* get_cpu_local_data(void) {
     struct cpu_local_data *ptr;
