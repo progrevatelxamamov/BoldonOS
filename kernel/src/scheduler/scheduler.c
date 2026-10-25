@@ -12,6 +12,7 @@
 #include <stdbool.h>
 #include <memory.h>
 #include <io.h>
+#include <cpu/smp.h>
 
 #define MAX_TASKS   512
 #define MAX_THREADS 256
@@ -52,6 +53,10 @@ struct cpu_local_data* get_current_local_data(void) {
     int cpu = get_cpu_id();
     if (cpu < 0 || cpu >= MAX_CPUS) cpu = 0;
     return &cpu_locals[cpu];
+}
+
+bool scheduler_is_ready(void) {
+    return __atomic_load_n(&scheduler_ready, __ATOMIC_ACQUIRE);
 }
 
 static char *kstrdup(const char *s) {
@@ -199,7 +204,10 @@ void scheduler_init(void) {
     idle->state             = TASK_RUNNING;
 
     // Создаем Idle-поток для каждого ядра, чтобы никому не было скучно
-    for (int i = 0; i < MAX_CPUS; i++) {
+    uint32_t cpu_count = smp_cpu_count();
+    if (cpu_count == 0) cpu_count = 1;
+    if (cpu_count > MAX_CPUS) cpu_count = MAX_CPUS;
+    for (uint32_t i = 0; i < cpu_count; i++) {
         void *stack = malloc_alloc(IDLE_STACK_SIZE);
         if (!stack) break;
         thread_t *t = build_thread((void*)idle_task, stack, IDLE_STACK_SIZE, KERNEL_CS, KERNEL_DS);
@@ -210,7 +218,7 @@ void scheduler_init(void) {
     }
 
     tasks[0] = idle;
-    scheduler_ready = true;
+    __atomic_store_n(&scheduler_ready, true, __ATOMIC_RELEASE);
 }
 
 process_t* create_task_user(void *addr, page_table_t *pml4,
@@ -471,8 +479,7 @@ void schedule(struct interrupt_frame *frame) {
     local->current_thread = thr;
     local->kernel_rsp = thr->kernel_stack_top;
     wrmsr(IA32_FS_BASE, thr->fs_base);
-    wrmsr(IA32_GS_BASE, (uint64_t)&cpu_locals[cpu]);
-    wrmsr(IA32_KERNEL_GS_BASE, 0);
+    wrmsr(IA32_KERNEL_GS_BASE, (uint64_t)&cpu_locals[cpu]);
 
     struct interrupt_frame *restore = thr->regs;
     if (thr->syscall_frame && thr->syscall_frame->rip != 0) {

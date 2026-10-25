@@ -277,8 +277,7 @@ void execption_handlerer(struct interrupt_frame *frame) {
 uint64_t g_ticks_ms;
 
 void exception_handler(struct interrupt_frame *frame) {
-    wrmsr(0xC0000101, (uint64_t)get_current_local_data());
-    wrmsr(0xC0000102, 0);
+    wrmsr(0xC0000102, (uint64_t)get_current_local_data());
     // console_print_string("!");
     // console_print_hex(frame->rip);
     // console_print_string(";");

@@ -103,7 +103,10 @@ _Static_assert(offsetof(struct cpu_local_data, cpu_id) == 0x08, "cpu_local_data:
 _Static_assert(offsetof(struct cpu_local_data, kernel_rsp) == 0x10, "cpu_local_data: kernel_rsp must stay at 0x10");
 _Static_assert(offsetof(struct cpu_local_data, user_rsp) == 0x18, "cpu_local_data: user_rsp must stay at 0x18");
 
+extern struct cpu_local_data cpu_locals[];
+
 struct cpu_local_data* get_current_local_data(void);
+bool scheduler_is_ready(void);
 
 bool thread_stack_guard_ok(thread_t *t);
 extern int g_stack_guard_broken;

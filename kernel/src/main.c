@@ -44,6 +44,20 @@ static volatile struct limine_module_request module_request = {
     .revision = 0
 };
 
+__attribute__((used, section(".limine_requests")))
+static volatile struct limine_mp_request mp_request = {
+    .id = LIMINE_MP_REQUEST_ID,
+    .revision = 0,
+    .flags = 0
+};
+
+__attribute__((used, section(".limine_requests")))
+static volatile struct limine_stack_size_request stack_size_request = {
+    .id = LIMINE_STACK_SIZE_REQUEST_ID,
+    .revision = 0,
+    .stack_size = 65536
+};
+
 __attribute__((used, section(".limine_requests_start")))
 static volatile uint64_t limine_requests_start_marker[] = LIMINE_REQUESTS_START_MARKER;
 
@@ -86,7 +100,8 @@ void kmain(void) {
         memmap_request.response,
         hhdm_request.response,
         kernel_file_request.response,
-        module_request.response
+        module_request.response,
+        mp_request.response
     };
 
     kstart(blinfo);

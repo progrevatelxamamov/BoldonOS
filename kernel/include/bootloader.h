@@ -10,6 +10,7 @@ typedef struct {
     struct limine_hhdm_response *hhdm;
     struct limine_executable_cmdline_response *kernel_file;
     struct limine_module_response *modules;
+    struct limine_mp_response *mp;
 } bootloader_t;
 
 #endif

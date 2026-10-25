@@ -132,7 +132,7 @@ void madt_init(void) {
         }
         case MADT_TYPE_LAPIC: {
             struct MADT_lapic *la = (struct MADT_lapic *)e;
-            if (la->flags & 1) {
+            if ((la->flags & 1) && lapic_count < 32) {
                 lapic_ids[lapic_count++] = la->apic_id;
             }
             break;
@@ -143,7 +143,9 @@ void madt_init(void) {
         p += e->length;
     }
 
-    ioapic_init_legacy(0, 32);
+    uint32_t cpuid_eax, cpuid_ebx, cpuid_ecx, cpuid_edx;
+    cpuid(1, &cpuid_eax, &cpuid_ebx, &cpuid_ecx, &cpuid_edx);
+    ioapic_init_legacy((uint8_t)(cpuid_ebx >> 24), 32);
     PIC_disable();
 }
 
