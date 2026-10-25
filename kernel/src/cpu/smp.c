@@ -116,12 +116,6 @@ void smp_ap_main(struct limine_mp_info *info) {
 
     smp_set_online(logical_id);
 
-    console_print_string("[SMP] AP logical=");
-    console_print_num((uint64_t)logical_id);
-    console_print_string(" apic=");
-    console_print_num(info->lapic_id);
-    console_print_string(" online\n");
-
     while (!scheduler_is_ready()) {
         __asm__ volatile("pause");
     }
@@ -214,6 +208,12 @@ void smp_init(void) {
             console_print_string(" apic=");
             console_print_num(smp_cpus[id].apic_id);
             console_print_string(" timeout\n");
+        } else {
+            console_print_string("[SMP] AP logical=");
+            console_print_num(id);
+            console_print_string(" apic=");
+            console_print_num(smp_cpus[id].apic_id);
+            console_print_string(" online\n");
         }
     }
 

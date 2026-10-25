@@ -24,6 +24,7 @@ typedef struct thread {
     uint64_t kernel_stack_top;
     uint64_t fs_base;
     int state;
+    bool switch_held;
     uint64_t tid;
     uint64_t ctid;
     bool is_kernel;
