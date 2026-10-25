@@ -201,13 +201,14 @@ void smp_init(void) {
     uint32_t ebx;
     __asm__ volatile("cpuid" : "=b"(ebx) : "a"(1) : "ecx", "edx");
     uint8_t bsp_apic = (ebx >> 24) & 0xFF;
-    register_cpu(bsp_apic);
+    int bsp_logical = register_cpu(bsp_apic);
+    if (bsp_logical < 0) return;
 
     console_print_string("[SMP] BSP APIC ID = ");
     console_print_num(bsp_apic);
     console_print_string("\n");
 
-    percpu_init(bsp_apic);
+    percpu_init(bsp_logical);
 
     /* Identity-map 1-го МБ */
     for (uint64_t a = 0; a < 0x100000; a += 0x1000) {
