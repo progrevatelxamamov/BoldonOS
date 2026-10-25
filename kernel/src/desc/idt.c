@@ -173,7 +173,7 @@ void execption_handlerer(struct interrupt_frame *frame) {
     bool user_mode = (frame->cs & 3) == 3;
     bool exit_process = user_mode || !kernel_proc;
 
-    if (panic_active) {
+    if (__atomic_exchange_n(&panic_active, 1, __ATOMIC_SEQ_CST)) {
         console_print_string("\n[PANIC] nested exception vector=");
         console_print_num(frame->isr_number);
         console_print_string(" rip=");
@@ -183,7 +183,6 @@ void execption_handlerer(struct interrupt_frame *frame) {
             __asm__ volatile ("cli; hlt");
         }
     }
-    panic_active = 1;
 
     uint64_t fs  = rdmsr(0xC0000100);
     uint64_t gs  = rdmsr(0xC0000101);
@@ -261,7 +260,7 @@ void execption_handlerer(struct interrupt_frame *frame) {
     dump_code_bytes(frame->rip, frame->cs, proc);
 
     if (exit_process && proc) {
-        panic_active = 0;
+        __atomic_store_n(&panic_active, 0, __ATOMIC_SEQ_CST);
         sys_exit_impl(139); // 128 + SIGSEGV (11) = 139
         schedule_yield();
         return;

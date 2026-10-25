@@ -18,7 +18,7 @@
 #define MAX_THREADS 256
 #define MAX_CPUS    256
 #define KERNEL_STACK_SIZE 65536
-#define IDLE_STACK_SIZE 8192
+#define IDLE_STACK_SIZE KERNEL_STACK_SIZE
 #define STACK_CANARY 0xDEAD10CCDEAD10CCULL
 
 int g_stack_guard_broken = 0;
@@ -45,6 +45,8 @@ process_t *tasks[MAX_TASKS];
 static uint64_t next_pid = 1;
 static uint64_t next_tid = 1;
 
+static thread_t *prev_held_threads[MAX_CPUS] = {NULL};
+static bool cpu_has_current[MAX_CPUS] = {false};
 static page_table_t *last_pml4[MAX_CPUS] = {NULL};
 static spinlock_t sched_lock = SPINLOCK_INIT;
 static bool scheduler_ready = false;
@@ -217,6 +219,13 @@ void scheduler_init(void) {
         idle->threads[i] = t;
     }
 
+    for (int i = 0; i < MAX_CPUS; i++) {
+        current_tasks[i] = 0;
+        current_threads[i] = (uint64_t)i;
+        cpu_has_current[i] = false;
+        prev_held_threads[i] = NULL;
+    }
+
     tasks[0] = idle;
     __atomic_store_n(&scheduler_ready, true, __ATOMIC_RELEASE);
 }
@@ -356,10 +365,17 @@ thread_t *get_current_thread(void) {
     return p->threads[current_threads[cpu]];
 }
 
+static void release_prev_held(int cpu, thread_t *except) {
+    thread_t *prev = prev_held_threads[cpu];
+    if (!prev || prev == except) return;
+    prev_held_threads[cpu] = NULL;
+    prev->switch_held = false;
+    if (prev->state == TASK_RUNNING) prev->state = TASK_WAITING;
+}
+
 void schedule(struct interrupt_frame *frame) {
     if (!frame || !scheduler_ready) return;
 
-    // ВАЖНО: Используем новую быструю функцию
     struct cpu_local_data *local = get_cpu_local_data();
     int cpu = local->cpu_id;
 
@@ -369,9 +385,13 @@ void schedule(struct interrupt_frame *frame) {
     process_t *curr_proc = tasks[current_tasks[cpu]];
     thread_t  *curr_thr  = NULL;
 
-    // 1. Сохраняем состояние потока, который уходит с этого ядра
-    if (curr_proc && current_threads[cpu] < MAX_THREADS) {
+    if (cpu_has_current[cpu] && curr_proc && current_threads[cpu] < MAX_THREADS) {
         curr_thr = curr_proc->threads[current_threads[cpu]];
+    }
+
+    release_prev_held(cpu, curr_thr);
+
+    if (curr_thr) {
         if (curr_thr && curr_thr->regs) {
             bool user_saved = (curr_thr->regs->cs & 3) == 3;
             bool frame_kernel = (frame->cs & 3) == 0;
@@ -393,11 +413,7 @@ void schedule(struct interrupt_frame *frame) {
             }
 
             curr_thr->fs_base = rdmsr(IA32_FS_BASE);
-            
-            // Если он выполнялся, освобождаем его для других ядер
-            if (curr_thr->state == TASK_RUNNING) {
-                curr_thr->state = TASK_WAITING;
-            }
+            curr_thr->switch_held = true;
         }
     }
 
@@ -407,7 +423,7 @@ void schedule(struct interrupt_frame *frame) {
         if (p && p->state == TASK_DEAD) {
             bool can_free = true;
             for(int j = 0; j < MAX_THREADS; j++) {
-                if(p->threads[j] && p->threads[j]->state == TASK_RUNNING) {
+                if(p->threads[j] && (p->threads[j]->state == TASK_RUNNING || p->threads[j]->switch_held)) {
                     can_free = false;
                     break;
                 }
@@ -435,8 +451,7 @@ void schedule(struct interrupt_frame *frame) {
             thread_t *thr = p->threads[t];
             if (!thr) continue;
             
-            // БЕРЕМ ТОЛЬКО WAITING, чтобы ядра не выхватывали поток друг у друга!
-            if (thr->state == TASK_WAITING) {
+            if (thr->state == TASK_WAITING && !thr->switch_held) {
                 current_tasks[cpu]   = idx;
                 current_threads[cpu] = t;
                 thr->state = TASK_RUNNING;
@@ -446,23 +461,39 @@ void schedule(struct interrupt_frame *frame) {
         }
     }
 
-    // 4. Если ничего не нашли, прыгаем в персональный Idle-поток этого ядра
+    if (!found && curr_thr && curr_thr->regs && curr_thr->state == TASK_RUNNING &&
+        curr_proc && curr_proc->state != TASK_DEAD) {
+        current_tasks[cpu]   = start_task;
+        current_threads[cpu] = start_thr;
+        found = true;
+    }
+
     if (!found) {
         current_tasks[cpu]   = 0;
-        current_threads[cpu] = cpu; 
+        current_threads[cpu] = cpu;
     }
 
     process_t *proc = tasks[current_tasks[cpu]];
     if (!proc) {
+        if (curr_thr) curr_thr->switch_held = false;
         spin_unlock_irqrestore(&sched_lock, flags);
         return;
     }
 
     thread_t *thr = proc->threads[current_threads[cpu]];
     if (!thr || !thr->regs) {
+        if (curr_thr) curr_thr->switch_held = false;
         spin_unlock_irqrestore(&sched_lock, flags);
         return;
     }
+
+    if (curr_thr && curr_thr != thr) {
+        prev_held_threads[cpu] = curr_thr;
+    } else if (curr_thr) {
+        curr_thr->switch_held = false;
+        prev_held_threads[cpu] = NULL;
+    }
+    cpu_has_current[cpu] = true;
 
     if (!proc->fd_table && !proc->is_kernel_process) {
         proc->fd_table = malloc_alloc(sizeof(process_fd_table_t));
