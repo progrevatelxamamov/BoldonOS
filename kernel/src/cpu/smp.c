@@ -1,312 +1,225 @@
-#include "syscall/syscall.h"
-#include <kernel.h>
-#include <bootloader.h>
+#include <cpu/smp.h>
 #include <cpu/apic.h>
 #include <cpu/acpi.h>
+#include <bootloader.h>
+#include <kernel.h>
 #include <desc/gdt.h>
 #include <desc/idt.h>
-#include <io.h>
-#include <mm/vmm.h>
-#include <mm/pmm.h>
-#include <mm/malloc.h>
-#include <memory.h>
 #include <gconsole.h>
+#include <io.h>
+#include <memory.h>
 #include <scheduler/scheduler.h>
+#include <syscall/syscall.h>
+#include <stddef.h>
+#include <stdint.h>
 #include <stdbool.h>
 
-#define AP_TRAMP_PHYS   0x7000
-#define AP_PARAM_CR3    0x7FE0
-#define AP_PARAM_RSP    0x7FE8
-#define AP_PARAM_ENTRY  0x7FF0
-#define AP_PARAM_ARG    0x7FF8
-#define MAX_CPUS        256
+#define SMP_TIMER_VECTOR 32
+#define SMP_TIMER_HZ 1000
+#define SMP_AP_STACK_SIZE 16384
+#define SMP_AP_TIMEOUT_MS 1000
 
-extern char ap_trampoline_start[];
-extern char ap_trampoline_end[];
-
-volatile uint32_t ap_cores_booted = 1;
-static uint64_t g_hhdm_offset     = 0;
-
-/* APIC ID → logical ID */
-static int     apic_to_logical[256];
-static uint8_t logical_to_apic[MAX_CPUS];
-static int     num_logical = 0;
-
-int cpu_get_logical_id(void) {
-    uint32_t ebx;
-    __asm__ volatile("cpuid" : "=b"(ebx) : "a"(1) : "ecx", "edx");
-    return apic_to_logical[(ebx >> 24) & 0xFF];
-}
-
-static int register_cpu(uint8_t apic_id) {
-    if (apic_to_logical[apic_id] >= 0) return apic_to_logical[apic_id];
-    if (num_logical >= MAX_CPUS) return -1;
-    int id = num_logical++;
-    apic_to_logical[apic_id] = id;
-    logical_to_apic[id]      = apic_id;
-    return id;
-}
-
-/* ── LAPIC ── */
-static volatile uint32_t *get_lapic_base(void) {
-    uint64_t phys = rdmsr(IA32_APIC_BASE_MSR) & 0xFFFFF000ULL;
-    if (!phys) phys = 0xFEE00000ULL;
-    return (volatile uint32_t *)(phys + g_hhdm_offset);
-}
-
-static inline void lapic_write(uint32_t reg, uint32_t val) {
-    APIC_REG(reg, get_lapic_base()) = val;
-}
-
-static inline uint32_t lapic_read(uint32_t reg) {
-    return APIC_REG(reg, get_lapic_base());
-}
-
-static void lapic_wait_icr(void) {
-    for (int i = 0; i < 100000; i++) {
-        if ((lapic_read(0x300) & (1u << 12)) == 0) return;
-        __asm__ volatile("pause");
-    }
-}
-
-static void lapic_send_init(uint8_t apic_id) {
-    lapic_wait_icr();
-    lapic_write(0x310, (uint32_t)apic_id << 24);
-    lapic_write(0x300, 0x0000C500);   /* INIT + Assert + Level */
-    lapic_wait_icr();
-}
-
-static void lapic_send_sipi(uint8_t apic_id, uint8_t vector) {
-    lapic_wait_icr();
-    lapic_write(0x310, (uint32_t)apic_id << 24);
-    lapic_write(0x300, 0x00004600u | vector);
-    lapic_wait_icr();
-}
-
-/* ── Трамплин ── */
-static void copy_trampoline(void) {
-    size_t sz = (size_t)(ap_trampoline_end - ap_trampoline_start);
-    if (sz > 0xFE0) return;
-    memcpy((void *)(AP_TRAMP_PHYS + g_hhdm_offset), ap_trampoline_start, sz);
-    __sync_synchronize();
-}
-
-#define AP_TRAMP_PHYS     0x7000
-#define AP_PARAM_CR4      0x7FD8
-#define AP_PARAM_CR3      0x7FE0
-#define AP_PARAM_RSP      0x7FE8
-#define AP_PARAM_ENTRY    0x7FF0
-#define AP_PARAM_ARG      0x7FF8
-
-static void fill_params(uint64_t cr4, uint64_t cr3, uint64_t rsp,
-                        uint64_t entry, uint64_t arg)
-{
-    uint8_t *b = (uint8_t *)g_hhdm_offset;
-    *(volatile uint64_t *)(b + AP_PARAM_CR4)   = cr4;
-    *(volatile uint64_t *)(b + AP_PARAM_CR3)   = cr3;
-    *(volatile uint64_t *)(b + AP_PARAM_RSP)   = rsp;
-    *(volatile uint64_t *)(b + AP_PARAM_ENTRY) = entry;
-    *(volatile uint64_t *)(b + AP_PARAM_ARG)   = arg;
-    __sync_synchronize();
-}
-
-#define IA32_GS_BASE        0xC0000101
+#define IA32_GS_BASE 0xC0000101
 #define IA32_KERNEL_GS_BASE 0xC0000102
 
-void percpu_init(int logical_id) {
-    extern struct cpu_local_data cpu_locals[]; // Из scheduler.c
-    
-    cpu_locals[logical_id].self = &cpu_locals[logical_id];
-    cpu_locals[logical_id].cpu_id = logical_id;
-    
-    // Загружаем адрес структуры в MSR GS_BASE
-    wrmsr(IA32_GS_BASE, (uint64_t)&cpu_locals[logical_id]);
-    wrmsr(IA32_KERNEL_GS_BASE, 0);
+#define SMP_STATE_OFFLINE 0
+#define SMP_STATE_STARTING 1
+#define SMP_STATE_ONLINE 2
+#define SMP_STATE_FAILED 3
+
+struct smp_cpu {
+    uint32_t apic_id;
+    uint32_t state;
+    struct limine_mp_info *info;
+};
+
+static struct smp_cpu smp_cpus[SMP_MAX_CPUS];
+static uint32_t smp_num_cpus = 0;
+
+static uint8_t smp_ap_stacks[SMP_MAX_CPUS][SMP_AP_STACK_SIZE] __attribute__((aligned(16)));
+
+volatile uint32_t ap_cores_booted = 0;
+
+extern void smp_ap_entry(struct limine_mp_info *info);
+
+_Static_assert(offsetof(struct limine_mp_info, extra_argument) == 24, "limine_mp_info layout");
+
+static uint32_t smp_this_apic_id(void) {
+    uint32_t eax, ebx, ecx, edx;
+    cpuid(1, &eax, &ebx, &ecx, &edx);
+    return (ebx >> 24) & 0xFF;
 }
 
-#define LAPIC_TPR            0x0080  // Task Priority Register
-#define LAPIC_SVR            0x00F0  // Spurious Interrupt Vector Register
-#define LAPIC_LVT_TIMER      0x0320  // Local Vector Table (Timer)
-#define LAPIC_TIMER_INITCNT  0x0380  // Initial Count Register
-#define LAPIC_TIMER_DIV      0x03E0  // Divide Configuration Register
-extern uint64_t g_ticks_per_ms; 
+static int smp_logical_from_apic(uint32_t apic_id) {
+    for (uint32_t i = 0; i < smp_num_cpus; i++) {
+        if (smp_cpus[i].apic_id == apic_id) return (int)i;
+    }
+    return -1;
+}
 
-static void ap_entry(uint64_t logical_id) {
-    /*
-     * CR3 НЕ ТРОГАЕМ!
-     * Трамплин загрузил ap_cr3 = BSP CR3 = 0x7f401000.
-     * Этот PML4 содержит валидный higher-half маппинг.
-     *
-     * Предыдущая ошибка: чтение g_hhdm_offset через копию PML4
-     * (0x7bb65000) → RSVD #PF → triple fault.
-     */
+int cpu_get_logical_id(void) {
+    int id = smp_logical_from_apic(smp_this_apic_id());
+    return id >= 0 ? id : 0;
+}
 
-    // Сбрасываем Task Priority, чтобы принимать ВСЕ прерывания (TPR = 0)
-    lapic_write(LAPIC_TPR, 0);
+uint32_t smp_cpu_count(void) {
+    return smp_num_cpus;
+}
 
-    // Включаем APIC (Бит 8 = 1) и задаем Spurious Vector = 0xFF (255)
-    lapic_write(LAPIC_SVR, lapic_read(LAPIC_SVR) | 0x1FF);
+uint32_t smp_online_count(void) {
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < smp_num_cpus; i++) {
+        if (__atomic_load_n(&smp_cpus[i].state, __ATOMIC_ACQUIRE) == SMP_STATE_ONLINE) n++;
+    }
+    return n;
+}
 
-    // Настраиваем делитель (Divide by 16)
-    lapic_write(LAPIC_TIMER_DIV, 0x3);
+uint32_t smp_apic_id(int logical_id) {
+    if (logical_id < 0 || (uint32_t)logical_id >= smp_num_cpus) return 0xFFFFFFFFu;
+    return smp_cpus[logical_id].apic_id;
+}
 
-    // Настраиваем LVT Timer: 
-    // Вектор = 32 (0x20)
-    // Бит 17 = 1 (Periodic Mode - периодический режим)
-    // Бит 16 = 0 (Unmasked - разблокировано)
-    lapic_write(LAPIC_LVT_TIMER, 32 | 0x20000);
+bool smp_cpu_online(int logical_id) {
+    if (logical_id < 0 || (uint32_t)logical_id >= smp_num_cpus) return false;
+    return __atomic_load_n(&smp_cpus[logical_id].state, __ATOMIC_ACQUIRE) == SMP_STATE_ONLINE;
+}
 
-    lapic_write(LAPIC_TIMER_INITCNT, g_ticks_per_ms);
+static void percpu_init(int logical_id) {
+    struct cpu_local_data *local = &cpu_locals[logical_id];
+    memset(local, 0, sizeof(*local));
+    local->self = local;
+    local->cpu_id = logical_id;
+    local->kernel_rsp = (uint64_t)smp_ap_stacks[logical_id] + SMP_AP_STACK_SIZE;
+    wrmsr(IA32_GS_BASE, 0);
+    wrmsr(IA32_KERNEL_GS_BASE, (uint64_t)local);
+}
 
-    /* GDT + TSS */
-    gdt_init_cpu((int)logical_id);
-
-    /* IDT */
-    idt_reload();
-
-    /* SHEDULER */
-    percpu_init(logical_id);
-
-    /* SYSCALL */
-    syscall_init();
-
-    vmm_switch_address_space((uint64_t)get_kernel_pml4() - get_bootinfo().hhdm->offset);
-
-    /* Готово */
+static void smp_set_online(int logical_id) {
+    __atomic_store_n(&smp_cpus[logical_id].state, SMP_STATE_ONLINE, __ATOMIC_RELEASE);
     __atomic_add_fetch(&ap_cores_booted, 1, __ATOMIC_SEQ_CST);
+}
+
+void smp_ap_main(struct limine_mp_info *info) {
+    int logical_id = smp_logical_from_apic(info->lapic_id);
+    if (logical_id < 0) {
+        for (;;) {
+            __asm__ volatile("cli; hlt");
+        }
+    }
+
+    enable_sse();
+    gdt_init_cpu(logical_id);
+    idt_reload();
+    percpu_init(logical_id);
+    syscall_init();
+    apic_init_cpu(SMP_TIMER_VECTOR, SMP_TIMER_HZ);
+
+    smp_set_online(logical_id);
 
     console_print_string("[SMP] AP logical=");
-    console_print_num(logical_id);
-    console_print_string(" alive\n");
+    console_print_num((uint64_t)logical_id);
+    console_print_string(" apic=");
+    console_print_num(info->lapic_id);
+    console_print_string(" online\n");
 
-    __asm__ volatile ("int $23");
+    while (!scheduler_is_ready()) {
+        __asm__ volatile("pause");
+    }
 
-    while (1) {
+    apic_timer_unmask_cpu();
+
+    for (;;) {
         __asm__ volatile("sti; hlt");
     }
 }
 
+static bool smp_wait_online(int logical_id) {
+    for (uint32_t t = 0; t < SMP_AP_TIMEOUT_MS; t++) {
+        if (__atomic_load_n(&smp_cpus[logical_id].state, __ATOMIC_ACQUIRE) == SMP_STATE_ONLINE) {
+            return true;
+        }
+        hpet_sleep_ms(1);
+        for (int i = 0; i < 10000; i++) {
+            __asm__ volatile("pause");
+        }
+    }
+    return __atomic_load_n(&smp_cpus[logical_id].state, __ATOMIC_ACQUIRE) == SMP_STATE_ONLINE;
+}
+
+static void smp_register(struct limine_mp_info *info) {
+    if (smp_num_cpus >= SMP_MAX_CPUS) return;
+    if (smp_logical_from_apic(info->lapic_id) >= 0) return;
+    smp_cpus[smp_num_cpus].apic_id = info->lapic_id;
+    smp_cpus[smp_num_cpus].state = SMP_STATE_OFFLINE;
+    smp_cpus[smp_num_cpus].info = info;
+    smp_num_cpus++;
+}
+
+static void smp_init_single(void) {
+    smp_num_cpus = 1;
+    smp_cpus[0].apic_id = smp_this_apic_id();
+    smp_cpus[0].state = SMP_STATE_STARTING;
+    smp_cpus[0].info = NULL;
+    percpu_init(0);
+    smp_set_online(0);
+    console_print_string("[SMP] MP response missing, running on 1 CPU\n");
+}
+
 void smp_init(void) {
-    g_hhdm_offset = get_bootinfo().hhdm->offset;
+    struct limine_mp_response *mp = get_bootinfo().mp;
 
-    for (int i = 0; i < 256; i++) apic_to_logical[i] = -1;
-
-    struct MADT *madt = (struct MADT *)acpi_find_table("APIC");
-    if (!madt) {
-        console_print_string("[SMP] No MADT\n");
+    if (!mp || !mp->cpus || mp->cpu_count == 0) {
+        smp_init_single();
         return;
     }
 
-    /* BSP */
-    uint32_t ebx;
-    __asm__ volatile("cpuid" : "=b"(ebx) : "a"(1) : "ecx", "edx");
-    uint8_t bsp_apic = (ebx >> 24) & 0xFF;
-    int bsp_logical = register_cpu(bsp_apic);
-    if (bsp_logical < 0) return;
-
-    console_print_string("[SMP] BSP APIC ID = ");
-    console_print_num(bsp_apic);
-    console_print_string("\n");
-
-    percpu_init(bsp_logical);
-
-    /* Identity-map 1-го МБ */
-    for (uint64_t a = 0; a < 0x100000; a += 0x1000) {
-        vmm_map_page(get_kernel_pml4(), a, a,
-                     PTE_PRESENT | PTE_WRITABLE);
-        vmm_map_page(get_kernel_pml4(), a, g_hhdm_offset + a,
-                     PTE_PRESENT | PTE_WRITABLE);
-    }
-
-    /* Читаем CR3 BSP — это ОРИГИНАЛЬНЫЙ PML4 ядра */
-    uint64_t cr3, cr4;
-    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
-    __asm__ volatile("mov %%cr4, %0" : "=r"(cr4));
-    cr3 &= ~0xFFFULL;
-
-    /* Сброс TLB после identity-map */
-    __asm__ volatile("mov %0, %%cr3" :: "r"(cr3) : "memory");
-
-    console_print_string("[SMP] BSP CR3 = ");
-    console_print_hex(cr3);
-    console_print_string("\n");
-
-    /*
-     * AP CR3 = BSP CR3. БЕЗ КОПИРОВАНИЯ!
-     *
-     * Если CR3 < 4 ГБ — передаём напрямую (наш случай: 0x7f401000).
-     * Если CR3 >= 4 ГБ — нужно будет делать deep copy всех уровней
-     * page table, а не только PML4. Но это отдельная задача.
-     */
-    uint64_t ap_cr3 = cr3;
-
-    if (cr3 >= 0x100000000ULL) {
-        console_print_string("[SMP] WARNING: CR3 > 4GB, AP boot may fail!\n");
-        /* TODO: deep copy PML4 + PDPT + PD + PT для higher-half */
-    }
-
-    copy_trampoline();
-
-    /* Запуск AP */
-    uint8_t *p   = (uint8_t *)madt + sizeof(struct MADT);
-    uint8_t *end = (uint8_t *)madt + madt->header.Length;
-
-    while (p < end) {
-        struct MADT_entry *e = (struct MADT_entry *)p;
-        if (e->length < sizeof(struct MADT_entry)) break;
-
-        if (e->type == MADT_TYPE_LAPIC) {
-            struct MADT_lapic *la = (struct MADT_lapic *)e;
-
-            if ((la->flags & MADT_LAPIC_ENABLED) &&
-                 la->apic_id != bsp_apic)
-            {
-                int lid = register_cpu(la->apic_id);
-                if (lid < 0) { p += e->length; continue; }
-
-                void *stk = malloc_alloc(16384);
-                if (!stk) { p += e->length; continue; }
-                uint64_t stk_top = ((uint64_t)stk + 16384) & ~(uint64_t)0xF;
-
-                uint32_t prev = ap_cores_booted;
-
-                fill_params(cr4, cr3, stk_top, (uint64_t)ap_entry, (uint64_t)lid);
-
-                console_print_string("[SMP] Starting AP ");
-                console_print_num(la->apic_id);
-                console_print_string(" (logical=");
-                console_print_num(lid);
-                console_print_string(")...\n");
-
-                lapic_send_init(la->apic_id);
-                hpet_sleep_ms(10);
-
-                lapic_send_sipi(la->apic_id, AP_TRAMP_PHYS >> 12);
-
-                bool ok = false;
-                for (int t = 0; t < 100; t++) {
-                    if (ap_cores_booted > prev) { ok = true; break; }
-                    hpet_sleep_ms(1);
-                }
-                if (!ok) {
-                    lapic_send_sipi(la->apic_id, AP_TRAMP_PHYS >> 12);
-                    for (int t = 0; t < 200; t++) {
-                        if (ap_cores_booted > prev) { ok = true; break; }
-                        hpet_sleep_ms(1);
-                    }
-                }
-                if (!ok) {
-                    console_print_string("[SMP] AP ");
-                    console_print_num(la->apic_id);
-                    console_print_string(" TIMEOUT\n");
-                }
-                hpet_sleep_ms(5);
-            }
+    for (uint64_t i = 0; i < mp->cpu_count; i++) {
+        if (mp->cpus[i] && mp->cpus[i]->lapic_id == mp->bsp_lapic_id) {
+            smp_register(mp->cpus[i]);
+            break;
         }
-        p += e->length;
+    }
+    for (uint64_t i = 0; i < mp->cpu_count; i++) {
+        if (mp->cpus[i]) smp_register(mp->cpus[i]);
     }
 
-    console_print_string("[SMP] Cores: ");
-    console_print_num(ap_cores_booted);
+    if (smp_num_cpus == 0) {
+        smp_init_single();
+        return;
+    }
+
+    percpu_init(0);
+    smp_set_online(0);
+
+    console_print_string("[SMP] CPUs detected: ");
+    console_print_num(smp_num_cpus);
+    console_print_string(" BSP apic=");
+    console_print_num(mp->bsp_lapic_id);
+    console_print_string("\n");
+
+    for (uint32_t id = 1; id < smp_num_cpus; id++) {
+        struct limine_mp_info *info = smp_cpus[id].info;
+        if (!info) continue;
+
+        __atomic_store_n(&smp_cpus[id].state, SMP_STATE_STARTING, __ATOMIC_RELEASE);
+        info->extra_argument = (uint64_t)smp_ap_stacks[id] + SMP_AP_STACK_SIZE;
+
+        limine_goto_address entry = smp_ap_entry;
+        __atomic_store(&info->goto_address, &entry, __ATOMIC_SEQ_CST);
+
+        if (!smp_wait_online((int)id)) {
+            __atomic_store_n(&smp_cpus[id].state, SMP_STATE_FAILED, __ATOMIC_RELEASE);
+            console_print_string("[SMP] AP logical=");
+            console_print_num(id);
+            console_print_string(" apic=");
+            console_print_num(smp_cpus[id].apic_id);
+            console_print_string(" timeout\n");
+        }
+    }
+
+    console_print_string("[SMP] online: ");
+    console_print_num(smp_online_count());
+    console_print_string("/");
+    console_print_num(smp_num_cpus);
     console_print_string("\n");
 }
