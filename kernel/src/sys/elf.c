@@ -290,8 +290,13 @@ int sys_execve(const char *pathname, char *const argv[], char *const envp[])
     if (argc > 255) argc = 255;
     if (envc > 255) envc = 255;
 
-    uint64_t str_ptrs[256];
-    uint64_t env_ptrs[256];
+    uint64_t *str_ptrs = malloc_alloc(256 * sizeof(uint64_t));
+    uint64_t *env_ptrs = malloc_alloc(256 * sizeof(uint64_t));
+    if (!str_ptrs || !env_ptrs) {
+        if (str_ptrs) malloc_free(str_ptrs);
+        if (env_ptrs) malloc_free(env_ptrs);
+        malloc_free(phdrs); vfs_close(f); errno = ENOMEM; return -1;
+    }
 
     for (int i = 0; i < 256; i++) { str_ptrs[i] = 0; env_ptrs[i] = 0; }
 
@@ -371,7 +376,10 @@ int sys_execve(const char *pathname, char *const argv[], char *const envp[])
     final_rsp &= ~0xFULL; 
 
     process_t *p = get_current_process();
-    if (!p) { malloc_free(phdrs); vfs_close(f); errno = ESRCH; return -1; }
+    if (!p) {
+        malloc_free(str_ptrs); malloc_free(env_ptrs);
+        malloc_free(phdrs); vfs_close(f); errno = ESRCH; return -1;
+    }
 
     if (f->node) {
         if (f->node->mode & 04000 /* SUID */) {
@@ -389,7 +397,10 @@ int sys_execve(const char *pathname, char *const argv[], char *const envp[])
     p->is_kernel_process = false;
 
     thread_t *thr = p->threads[0];
-    if (!thr) { malloc_free(phdrs); vfs_close(f); errno = ESRCH; return -1; }
+    if (!thr) {
+        malloc_free(str_ptrs); malloc_free(env_ptrs);
+        malloc_free(phdrs); vfs_close(f); errno = ESRCH; return -1;
+    }
 
     __asm__ volatile("cli");
     thr->regs->rip    = has_interp ? interp_entry : entry_point;
@@ -452,8 +463,6 @@ int sys_execve(const char *pathname, char *const argv[], char *const envp[])
     // console_print_string("\n");
     
     wrmsr(IA32_FS_BASE, 0);
-    wrmsr(IA32_GS_BASE, 0);
-    wrmsr(IA32_KERNEL_GS_BASE, (uint64_t)get_current_local_data());
 
     uint64_t user_ds = USER_DATA | 3;
     uint64_t user_cs = USER_CODE | 3;
@@ -473,6 +482,12 @@ int sys_execve(const char *pathname, char *const argv[], char *const envp[])
         thr->fs_base = 0;
         wrmsr(IA32_FS_BASE, 0);
     }
+
+    malloc_free(str_ptrs);
+    malloc_free(env_ptrs);
+
+    wrmsr(IA32_GS_BASE, 0);
+    wrmsr(IA32_KERNEL_GS_BASE, (uint64_t)get_current_local_data());
 
     __asm__ volatile (
         "cli\n\t"
