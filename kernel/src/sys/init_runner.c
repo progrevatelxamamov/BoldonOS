@@ -56,6 +56,7 @@ void launch_init_process(void) {
 
     if (!p->fd_table) {
         p->fd_table = malloc_alloc(sizeof(process_fd_table_t));
+        if (!p->fd_table) return;
         memset(p->fd_table, 0, sizeof(process_fd_table_t));
     }
 

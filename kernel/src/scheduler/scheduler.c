@@ -18,6 +18,8 @@
 #define MAX_CPUS    256
 #define KERNEL_STACK_SIZE 16384
 #define IA32_FS_BASE 0xC0000100
+#define IA32_GS_BASE 0xC0000101
+#define IA32_KERNEL_GS_BASE 0xC0000102
 
 struct cpu_local_data cpu_locals[MAX_CPUS];
 
@@ -33,7 +35,9 @@ static spinlock_t sched_lock = SPINLOCK_INIT;
 static bool scheduler_ready = false;
 
 struct cpu_local_data* get_current_local_data(void) {
-    return &cpu_locals[get_cpu_id()];
+    int cpu = get_cpu_id();
+    if (cpu < 0 || cpu >= MAX_CPUS) cpu = 0;
+    return &cpu_locals[cpu];
 }
 
 static char *kstrdup(const char *s) {
@@ -307,7 +311,7 @@ void task_wake_thread(thread_t *t) {
 process_t *get_current_process(void) {
     if (!scheduler_ready) return NULL;
     int cpu = get_cpu_id();
-    if (cpu >= MAX_CPUS || current_tasks[cpu] >= MAX_TASKS) return NULL;
+    if (cpu < 0 || cpu >= MAX_CPUS || current_tasks[cpu] >= MAX_TASKS) return NULL;
     return tasks[current_tasks[cpu]];
 }
 
@@ -417,7 +421,7 @@ void schedule(struct interrupt_frame *frame) {
 
     if (!proc->fd_table && !proc->is_kernel_process) {
         proc->fd_table = malloc_alloc(sizeof(process_fd_table_t));
-        memset(proc->fd_table, 0, sizeof(process_fd_table_t));
+        if (proc->fd_table) memset(proc->fd_table, 0, sizeof(process_fd_table_t));
     }
 
     cpu_locals[cpu].kernel_rsp = thr->kernel_stack_top;
@@ -426,6 +430,8 @@ void schedule(struct interrupt_frame *frame) {
     local->current_thread = thr;
     local->kernel_rsp = thr->kernel_stack_top;
     wrmsr(IA32_FS_BASE, thr->fs_base);
+    wrmsr(IA32_GS_BASE, (uint64_t)&cpu_locals[cpu]);
+    wrmsr(IA32_KERNEL_GS_BASE, 0);
 
     *frame = *thr->regs;
     void *fpu_ptr = thread_get_fpu_state(thr);

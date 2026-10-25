@@ -116,93 +116,128 @@ uint64_t page_fault_handler(struct interrupt_frame *frame) {
 
 extern uint64_t sys_exit_impl(uint64_t);
 
+static volatile int panic_active = 0;
+
+static void dump_code_bytes(uint64_t rip, uint64_t cs, process_t *proc) {
+    uint64_t page = rip & ~0xFFFULL;
+    uint64_t phys = 0;
+
+    if (cs & 3) {
+        if (proc && proc->pml4) phys = vmm_get_phys(proc->pml4, page);
+    } else {
+        phys = vmm_get_phys(get_kernel_pml4(), page);
+    }
+
+    if (!phys) {
+        console_print_string("\nCODE: <unmapped>\n");
+        return;
+    }
+
+    uint8_t *code = (uint8_t *)(phys + get_bootinfo().hhdm->offset);
+    uint64_t off = rip & 0xFFFULL;
+    uint64_t start = (off >= 8) ? (off - 8) : 0;
+    uint64_t end = start + 24;
+    if (end > 4096) end = 4096;
+
+    console_print_string("\nCODE:");
+    for (uint64_t i = start; i < end; i++) {
+        if (i == off) console_print_string(" >>");
+        console_print_hex(code[i]);
+        console_print_string(" ");
+    }
+    console_print_string("\n");
+}
+
 void execption_handlerer(struct interrupt_frame *frame) {
-    if (frame->isr_number <= 31) {
-        if (frame->isr_number == 22 || frame->isr_number == 23) {
-            return;
+    if (frame->isr_number > 31) return;
+    if (frame->isr_number == 22 || frame->isr_number == 23) return;
+
+    if (frame->isr_number == 14) {
+        if (page_fault_handler(frame) == 0) return;
+    }
+
+    process_t *proc = get_current_process();
+    bool kernel_proc = proc && proc->is_kernel_process;
+    bool user_mode = (frame->cs & 3) == 3;
+    bool exit_process = user_mode || !kernel_proc;
+
+    if (panic_active) {
+        console_print_string("\n[PANIC] nested exception vector=");
+        console_print_num(frame->isr_number);
+        console_print_string(" rip=");
+        console_print_hex(frame->rip);
+        console_print_string("\n");
+        while (1) {
+            __asm__ volatile ("cli; hlt");
         }
+    }
+    panic_active = 1;
 
-        if (frame->isr_number == 14) {
-            if (page_fault_handler(frame) == 0) {
-                return;
-            }
-        }
+    uint64_t fs  = rdmsr(0xC0000100);
+    uint64_t gs  = rdmsr(0xC0000101);
+    uint64_t kgs = rdmsr(0xC0000102);
 
-        bool is_user_mode = (frame->cs & 3) == 3 || !get_current_process()->is_kernel_process;
+    uint64_t fault_addr;
+    __asm__ volatile ("mov %%cr2, %0" : "=r"(fault_addr));
 
-        uint64_t fs = rdmsr(0xC0000100);
+    uint64_t cr3;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
 
-        uint64_t fault_addr;
-        __asm__ volatile ("mov %%cr2, %0" : "=r"(fault_addr));
+    uint64_t omaigat;
+    __asm__ volatile("mov %%cr4, %0" : "=r"(omaigat));
 
-        uint64_t cr3;
-        __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
-
-        uint64_t omaigat;
-        __asm__ volatile ("mov %%cr4, %0" : "=r"(omaigat));
-
-        thread_t *thr = get_current_thread();
-        int thr_index = -1;
-        for (uint64_t i = 0; i < 512; i++) {
-            if (thr == get_current_process()->threads[i]) {
+    thread_t *thr = get_current_thread();
+    int thr_index = -1;
+    if (proc) {
+        for (uint64_t i = 0; i < 256; i++) {
+            if (thr == proc->threads[i]) {
                 thr_index = i;
                 break;
             }
         }
+    }
 
-        if (get_current_process()->is_kernel_process) console_print_string("\nKernel panic!\nExecption: ");
-        if (!get_current_process()->is_kernel_process) console_print_string("\nUser panic!\nExecption: ");
-        console_print_string(exception_names[frame->isr_number]);
-        console_print_string("\nRIP:"); console_print_hex(frame->rip);
-        console_print_string("\nCR2:"); console_print_hex(fault_addr);
-        console_print_string("\nCR4:"); console_print_hex(omaigat);
-        console_print_string("\nERR:"); console_print_hex(frame->error_code);
-        console_print_string("\nRAX:"); console_print_hex(frame->rax);
-        console_print_string("\nRBX:"); console_print_hex(frame->rbx);
-        console_print_string("\nRCX:"); console_print_hex(frame->rcx);
-        console_print_string("\nRDX:"); console_print_hex(frame->rdx);
-        console_print_string("\nRSI:"); console_print_hex(frame->rsi);
-        console_print_string("\nRDI:"); console_print_hex(frame->rdi);
-        console_print_string("\nRBP:"); console_print_hex(frame->rbp);
-        console_print_string("\nRSP:"); console_print_hex(frame->rsp);
-        console_print_string("\nFS_BASE:"); console_print_hex(fs);
-        console_print_string("\nCR3:");    console_print_hex(cr3);
-        console_print_string("\nCS:");  console_print_hex(frame->cs);
-        console_print_string("\nSS:");  console_print_hex(frame->ss);
-        console_print_string("\nRFLAGS:"); console_print_hex(frame->rflags);
-        console_print_string("\nProcess name: "); console_print_string(get_current_process()->name);
-        if ( thr_index != -1) console_print_string("\nThread num: "); console_print_num(thr_index);
-        console_print_string("\nCpu num: "); console_print_num(get_cpu_id());
-        console_print_string("\nCODE @RIP-16:\n");
-        uint64_t rip = frame->rip;
-        uint64_t start = rip & ~0xFULL;
-        uint64_t phys = 0;
-        if (frame->cs & 3) {
-            process_t *p = get_current_process();
-            if (p && p->pml4) phys = vmm_get_phys(p->pml4, start);
-        } else {
-            phys = vmm_get_phys(get_kernel_pml4(), start);
-        }
-        if (phys) {
-            uint8_t *code = (uint8_t *)(phys + get_bootinfo().hhdm->offset);
-            for (int i = 0; i < 16; i++) {
-                console_print_hex(code[i]);
-                console_print_string(" ");
-            }
-        }
+    if (kernel_proc) console_print_string("\nKernel panic!\nExecption: ");
+    else console_print_string("\nUser panic!\nExecption: ");
+    console_print_string(exception_names[frame->isr_number]);
+    console_print_string("\nMode:"); console_print_string(user_mode ? "user" : "kernel");
+    console_print_string("\nRIP:"); console_print_hex(frame->rip);
+    console_print_string("\nCR2:"); console_print_hex(fault_addr);
+    console_print_string("\nCR4:"); console_print_hex(omaigat);
+    console_print_string("\nERR:"); console_print_hex(frame->error_code);
+    console_print_string("\nRAX:"); console_print_hex(frame->rax);
+    console_print_string("\nRBX:"); console_print_hex(frame->rbx);
+    console_print_string("\nRCX:"); console_print_hex(frame->rcx);
+    console_print_string("\nRDX:"); console_print_hex(frame->rdx);
+    console_print_string("\nRSI:"); console_print_hex(frame->rsi);
+    console_print_string("\nRDI:"); console_print_hex(frame->rdi);
+    console_print_string("\nRBP:"); console_print_hex(frame->rbp);
+    console_print_string("\nRSP:"); console_print_hex(frame->rsp);
+    console_print_string("\nFS_BASE:"); console_print_hex(fs);
+    console_print_string("\nGS_BASE:"); console_print_hex(gs);
+    console_print_string("\nKERNEL_GS_BASE:"); console_print_hex(kgs);
+    console_print_string("\nCR3:");    console_print_hex(cr3);
+    console_print_string("\nCS:");  console_print_hex(frame->cs);
+    console_print_string("\nSS:");  console_print_hex(frame->ss);
+    console_print_string("\nRFLAGS:"); console_print_hex(frame->rflags);
+    console_print_string("\nProcess name: ");
+    if (proc && proc->name) console_print_string(proc->name);
+    else console_print_string("<null>");
+    if ( thr_index != -1) console_print_string("\nThread num: "); console_print_num(thr_index);
+    console_print_string("\nCpu num: "); console_print_num(get_cpu_id());
+    dump_code_bytes(frame->rip, frame->cs, proc);
 
-        if (is_user_mode) {
-            process_t *proc = get_current_process();
-            sys_exit_impl(139); // 128 + SIGSEGV (11) = 139
-            schedule_yield();
-            return;
-        }
+    if (exit_process && proc) {
+        panic_active = 0;
+        sys_exit_impl(139); // 128 + SIGSEGV (11) = 139
+        schedule_yield();
+        return;
+    }
 
-        console_print_string("\n");
-        console_print_string("\nHalted.");
-        while (1) {
-            __asm__ volatile ( "cli; hlt" );
-        }
+    console_print_string("\n");
+    console_print_string("\nHalted.");
+    while (1) {
+        __asm__ volatile ( "cli; hlt" );
     }
 }
 

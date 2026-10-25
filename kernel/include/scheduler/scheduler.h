@@ -103,17 +103,15 @@ _Static_assert(offsetof(struct cpu_local_data, cpu_id) == 0x08, "cpu_local_data:
 _Static_assert(offsetof(struct cpu_local_data, kernel_rsp) == 0x10, "cpu_local_data: kernel_rsp must stay at 0x10");
 _Static_assert(offsetof(struct cpu_local_data, user_rsp) == 0x18, "cpu_local_data: user_rsp must stay at 0x18");
 
+struct cpu_local_data* get_current_local_data(void);
+
 static inline struct cpu_local_data* get_cpu_local_data(void) {
-    struct cpu_local_data *ptr;
-    __asm__ volatile("mov %%gs:0, %0" : "=r"(ptr));
-    return ptr;
+    return get_current_local_data();
 }
 
 static inline int get_cpu_local_data_id(void) {
-    return get_cpu_local_data()->cpu_id;
+    return get_current_local_data()->cpu_id;
 }
-
-struct cpu_local_data* get_current_local_data(void);
 extern uint64_t current_task;
 extern uint64_t current_thread;
 

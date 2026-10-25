@@ -418,6 +418,7 @@ uint64_t sys_mmap_impl(uint64_t addr, uint64_t len, uint64_t prot,
                        uint64_t flags, uint64_t fd, uint64_t offset) {
     process_t *p = get_current_process();
     if (!p || len == 0) return (uint64_t)-EINVAL;
+    if (!p->pml4) return (uint64_t)-ENOMEM;
 
     if (p->mmap_base == 0) {
         p->mmap_base = 0x5000000000ULL;

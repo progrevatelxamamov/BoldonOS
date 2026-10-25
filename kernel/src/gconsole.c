@@ -419,6 +419,8 @@ void console_print_char(char c) {
 }
 
 void console_print_string(const char *str) {
+    if (!str) return;
+
     uint64_t flags;
     spin_lock_irqsave(&spik, &flags);
     while (*str) {

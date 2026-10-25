@@ -121,7 +121,7 @@ void percpu_init(int logical_id) {
     
     // Загружаем адрес структуры в MSR GS_BASE
     wrmsr(IA32_GS_BASE, (uint64_t)&cpu_locals[logical_id]);
-    wrmsr(IA32_KERNEL_GS_BASE, (uint64_t)&cpu_locals[logical_id]);
+    wrmsr(IA32_KERNEL_GS_BASE, 0);
 }
 
 #define LAPIC_TPR            0x0080  // Task Priority Register
@@ -164,13 +164,13 @@ static void ap_entry(uint64_t logical_id) {
     /* IDT */
     idt_reload();
 
+    /* SHEDULER */
+    percpu_init(logical_id);
+
     /* SYSCALL */
     syscall_init();
 
     vmm_switch_address_space((uint64_t)get_kernel_pml4() - get_bootinfo().hhdm->offset);
-
-    /* SHEDULER */
-    percpu_init(logical_id);
 
     /* Готово */
     __atomic_add_fetch(&ap_cores_booted, 1, __ATOMIC_SEQ_CST);
