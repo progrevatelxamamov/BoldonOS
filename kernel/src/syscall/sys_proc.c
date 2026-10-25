@@ -354,20 +354,24 @@ uint64_t sys_clone_impl(uint64_t flags, uint64_t child_stack,
 
         thread_t *t = malloc_alloc(sizeof(thread_t));
         struct interrupt_frame *regs = malloc_alloc(sizeof(struct interrupt_frame));
+        struct interrupt_frame *kframe = malloc_alloc(sizeof(struct interrupt_frame));
         void *kstack = malloc_alloc(KERNEL_STACK_SIZE);
-        if (!t || !regs || !kstack) {
+        if (!t || !regs || !kframe || !kstack) {
             if (t) malloc_free(t);
             if (regs) malloc_free(regs);
+            if (kframe) malloc_free(kframe);
             if (kstack) malloc_free(kstack);
             return (uint64_t)-ENOMEM;
         }
 
         memset(t, 0, sizeof(thread_t));
+        memset(kframe, 0, sizeof(struct interrupt_frame));
         *regs = *curr_thr->regs;
         regs->rax = 0;
         if (child_stack != 0) regs->rsp = child_stack;
 
         t->regs = regs;
+        t->syscall_frame = kframe;
         t->kernel_stack = kstack;
         t->kernel_stack_top = (uint64_t)kstack + KERNEL_STACK_SIZE;
         *(uint64_t *)kstack = 0xDEAD10CCDEAD10CCULL;
@@ -395,21 +399,25 @@ uint64_t sys_clone_impl(uint64_t flags, uint64_t child_stack,
 
     thread_t *t = malloc_alloc(sizeof(thread_t));
     struct interrupt_frame *regs = malloc_alloc(sizeof(struct interrupt_frame));
+    struct interrupt_frame *kframe = malloc_alloc(sizeof(struct interrupt_frame));
     void *kstack = malloc_alloc(KERNEL_STACK_SIZE);
-    if (!t || !regs || !kstack) {
+    if (!t || !regs || !kframe || !kstack) {
         if (child) malloc_free(child);
         if (t) malloc_free(t);
         if (regs) malloc_free(regs);
+        if (kframe) malloc_free(kframe);
         if (kstack) malloc_free(kstack);
         return (uint64_t)-ENOMEM;
     }
 
     memset(t, 0, sizeof(thread_t));
+    memset(kframe, 0, sizeof(struct interrupt_frame));
     *regs = *curr_thr->regs;
     regs->rax = 0;
     if (child_stack != 0) regs->rsp = child_stack;
 
     t->regs = regs;
+    t->syscall_frame = kframe;
     t->kernel_stack = kstack;
     t->kernel_stack_top = (uint64_t)kstack + KERNEL_STACK_SIZE;
     *(uint64_t *)kstack = 0xDEAD10CCDEAD10CCULL;
@@ -430,6 +438,7 @@ uint64_t sys_clone_impl(uint64_t flags, uint64_t child_stack,
         if (!child->pml4) {
             malloc_free(kstack);
             malloc_free(regs);
+            malloc_free(kframe);
             malloc_free(t);
             malloc_free(child);
             return (uint64_t)-ENOMEM;
