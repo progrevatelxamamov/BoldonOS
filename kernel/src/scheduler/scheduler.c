@@ -16,7 +16,21 @@
 #define MAX_TASKS   512
 #define MAX_THREADS 256
 #define MAX_CPUS    256
-#define KERNEL_STACK_SIZE 16384
+#define KERNEL_STACK_SIZE 65536
+#define IDLE_STACK_SIZE 8192
+#define STACK_CANARY 0xDEAD10CCDEAD10CCULL
+
+int g_stack_guard_broken = 0;
+
+bool thread_stack_guard_ok(thread_t *t) {
+    if (!t || !t->kernel_stack) return true;
+    uint64_t *canary = (uint64_t *)t->kernel_stack;
+    if (*canary != STACK_CANARY) {
+        g_stack_guard_broken = 1;
+        return false;
+    }
+    return true;
+}
 #define IA32_FS_BASE 0xC0000100
 #define IA32_GS_BASE 0xC0000101
 #define IA32_KERNEL_GS_BASE 0xC0000102
@@ -54,6 +68,7 @@ static char *kstrdup(const char *s) {
 static void thread_free(thread_t *t) {
     if (!t) return;
     if (t->regs) malloc_free(t->regs);
+    if (t->syscall_frame) malloc_free(t->syscall_frame);
     if (t->stack_base && !t->is_kernel) malloc_free(t->stack_base);
     if (t->kernel_stack) malloc_free(t->kernel_stack);
     malloc_free(t);
@@ -76,6 +91,10 @@ static thread_t *build_thread_arg(void *addr, void *stack, uint64_t stack_size,
     if (!regs) { malloc_free(t); return NULL; }
     memset(regs, 0, sizeof(struct interrupt_frame));
 
+    struct interrupt_frame *kframe = malloc_alloc(sizeof(struct interrupt_frame));
+    if (!kframe) { malloc_free(regs); malloc_free(t); return NULL; }
+    memset(kframe, 0, sizeof(struct interrupt_frame));
+
     void *kstack = malloc_alloc(KERNEL_STACK_SIZE);
     if (!kstack) {
         malloc_free(regs);
@@ -85,6 +104,9 @@ static thread_t *build_thread_arg(void *addr, void *stack, uint64_t stack_size,
 
     uint64_t rsp_top = ((uint64_t)stack + stack_size) & ~0xFULL;
 
+    *(uint64_t *)kstack = STACK_CANARY;
+    if (stack) *(uint64_t *)stack = STACK_CANARY;
+
     regs->rsp    = rsp_top;
     regs->rip    = (uint64_t)addr;
     regs->rflags = 0x202;
@@ -93,6 +115,7 @@ static thread_t *build_thread_arg(void *addr, void *stack, uint64_t stack_size,
     regs->rdi    = arg;
 
     t->regs         = regs;
+    t->syscall_frame = kframe;
     t->stack_base   = stack;
     t->stack_size   = stack_size;
     t->kernel_stack = kstack;
@@ -136,10 +159,10 @@ process_t* create_task_kernel_arg(void *addr, uint64_t arg, const char *name) {
     if (!proc) return NULL;
     memset(proc, 0, sizeof(process_t));
 
-    void *stack = malloc_alloc(16384);
+    void *stack = malloc_alloc(KERNEL_STACK_SIZE);
     if (!stack) { malloc_free(proc); return NULL; }
 
-    thread_t *t = build_thread_arg(addr, stack, 16384, KERNEL_CS, KERNEL_DS, arg);
+    thread_t *t = build_thread_arg(addr, stack, KERNEL_STACK_SIZE, KERNEL_CS, KERNEL_DS, arg);
     if (!t) {
         malloc_free(stack);
         malloc_free(proc);
@@ -177,8 +200,10 @@ void scheduler_init(void) {
 
     // Создаем Idle-поток для каждого ядра, чтобы никому не было скучно
     for (int i = 0; i < MAX_CPUS; i++) {
-        void *stack = malloc_alloc(16384);
-        thread_t *t = build_thread((void*)idle_task, stack, 16384, KERNEL_CS, KERNEL_DS);
+        void *stack = malloc_alloc(IDLE_STACK_SIZE);
+        if (!stack) break;
+        thread_t *t = build_thread((void*)idle_task, stack, IDLE_STACK_SIZE, KERNEL_CS, KERNEL_DS);
+        if (!t) { malloc_free(stack); break; }
         t->is_kernel = true;
         t->state = TASK_RUNNING; // Держим RUNNING, чтобы нормальный шедулер их не брал
         idle->threads[i] = t;
@@ -340,7 +365,19 @@ void schedule(struct interrupt_frame *frame) {
     if (curr_proc && current_threads[cpu] < MAX_THREADS) {
         curr_thr = curr_proc->threads[current_threads[cpu]];
         if (curr_thr && curr_thr->regs) {
-            *curr_thr->regs = *frame;
+            bool user_saved = (curr_thr->regs->cs & 3) == 3;
+            bool frame_kernel = (frame->cs & 3) == 0;
+
+            if (user_saved && frame_kernel) {
+                struct interrupt_frame keep = *curr_thr->regs;
+                uint64_t ret_rax = frame->rax;
+                if (curr_thr->syscall_frame) *curr_thr->syscall_frame = *frame;
+                *curr_thr->regs = keep;
+                curr_thr->regs->rax = ret_rax;
+            } else {
+                *curr_thr->regs = *frame;
+                if (curr_thr->syscall_frame) curr_thr->syscall_frame->rip = 0;
+            }
             
             void *fpu_ptr = thread_get_fpu_state(curr_thr);
             if (fpu_ptr) {
@@ -424,6 +461,10 @@ void schedule(struct interrupt_frame *frame) {
         if (proc->fd_table) memset(proc->fd_table, 0, sizeof(process_fd_table_t));
     }
 
+    if (!thread_stack_guard_ok(curr_thr)) {
+        console_print_string("\n[STACK] kernel stack guard broken\n");
+    }
+
     cpu_locals[cpu].kernel_rsp = thr->kernel_stack_top;
 
     local->current_proc = proc;
@@ -433,7 +474,13 @@ void schedule(struct interrupt_frame *frame) {
     wrmsr(IA32_GS_BASE, (uint64_t)&cpu_locals[cpu]);
     wrmsr(IA32_KERNEL_GS_BASE, 0);
 
-    *frame = *thr->regs;
+    struct interrupt_frame *restore = thr->regs;
+    if (thr->syscall_frame && thr->syscall_frame->rip != 0) {
+        restore = thr->syscall_frame;
+        thr->syscall_frame->rip = 0;
+    }
+
+    *frame = *restore;
     void *fpu_ptr = thread_get_fpu_state(thr);
     if (fpu_ptr) {
         __asm__ volatile("fxrstor64 (%0)" :: "r"(fpu_ptr) : "memory");

@@ -10,6 +10,7 @@
 #include <scheduler/scheduler.h>
 #include <inout/ps2.h>
 #include <io.h>
+#include <memory.h>
 
 static const char *exception_names[32] = {
     "Divide-by-zero Error",
@@ -148,6 +149,17 @@ static void dump_code_bytes(uint64_t rip, uint64_t cs, process_t *proc) {
     console_print_string("\n");
 }
 
+static void dump_frame_raw(struct interrupt_frame *frame) {
+    uint64_t w[22];
+    memcpy(w, frame, sizeof(w));
+    console_print_string("\nFRAME:");
+    for (int i = 0; i < 22; i++) {
+        console_print_string(" ");
+        console_print_hex(w[i]);
+    }
+    console_print_string("\n");
+}
+
 void execption_handlerer(struct interrupt_frame *frame) {
     if (frame->isr_number > 31) return;
     if (frame->isr_number == 22 || frame->isr_number == 23) return;
@@ -225,6 +237,27 @@ void execption_handlerer(struct interrupt_frame *frame) {
     else console_print_string("<null>");
     if ( thr_index != -1) console_print_string("\nThread num: "); console_print_num(thr_index);
     console_print_string("\nCpu num: "); console_print_num(get_cpu_id());
+    console_print_string("\nStack guard: ");
+    if (thr && thr->kernel_stack) {
+        if (thread_stack_guard_ok(thr)) console_print_string("OK");
+        else console_print_string("BROKEN");
+    } else {
+        console_print_string("N/A");
+    }
+    if (thr && thr->regs) {
+        console_print_string("\nSaved regs rip: "); console_print_hex(thr->regs->rip);
+        console_print_string(" cs: "); console_print_hex(thr->regs->cs);
+        console_print_string(" rsp: "); console_print_hex(thr->regs->rsp);
+        console_print_string(" rflags: "); console_print_hex(thr->regs->rflags);
+    }
+    if (thr && thr->kernel_stack) {
+        uint64_t rsp_now;
+        __asm__ volatile("mov %%rsp, %0" : "=r"(rsp_now));
+        console_print_string("\nKstack: "); console_print_hex(thr->kernel_stack);
+        console_print_string(" - "); console_print_hex(thr->kernel_stack_top);
+        console_print_string("\nCur rsp: "); console_print_hex(rsp_now);
+    }
+    dump_frame_raw(frame);
     dump_code_bytes(frame->rip, frame->cs, proc);
 
     if (exit_process && proc) {
@@ -243,7 +276,9 @@ void execption_handlerer(struct interrupt_frame *frame) {
 
 uint64_t g_ticks_ms;
 
-void exception_handler(struct interrupt_frame *frame) {  
+void exception_handler(struct interrupt_frame *frame) {
+    wrmsr(0xC0000101, (uint64_t)get_current_local_data());
+    wrmsr(0xC0000102, 0);
     // console_print_string("!");
     // console_print_hex(frame->rip);
     // console_print_string(";");

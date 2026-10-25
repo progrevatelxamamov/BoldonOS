@@ -3,6 +3,7 @@
 #include <io.h>
 #include <mm/vmm.h>
 #include <bootloader.h>
+#include <kernel.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -10,6 +11,14 @@
 uint32_t *all_apic_bases[APIC_MAX_CPUS] = {0};
 int       this_cpu_apic_index = -1;
 uint64_t g_ticks_per_ms = 0; 
+
+static uint32_t *apic_local_base(void) {
+    uint64_t phys = rdmsr(IA32_APIC_BASE_MSR) & 0xFFFFF000ULL;
+    if (!phys) phys = 0xFEE00000ULL;
+    bootloader_t bi = get_bootinfo();
+    uint64_t offset = bi.hhdm ? bi.hhdm->offset : 0;
+    return (uint32_t *)(phys + offset);
+}
 
 bool check_apic(void) {
     uint32_t eax, ebx, ecx, edx;
@@ -27,10 +36,11 @@ void smp_broadcast_ipi(uint8_t vector) {
     // Бит 14 = 1 (Assert)
     
     // Ждём, пока LAPIC освободится
-    while (APIC_REG(0x300, all_apic_bases[get_cpu_id()]) & (1 << 12)) {
+    uint32_t *base = apic_local_base();
+    while (APIC_REG(0x300, base) & (1 << 12)) {
         __asm__ volatile("pause");
     }
-    APIC_REG(0x300, all_apic_bases[get_cpu_id()]) = icr_low;
+    APIC_REG(0x300, base) = icr_low;
 }
 
 // Отправить IPI конкретному логическому ядру
@@ -38,12 +48,13 @@ void smp_send_ipi(int logical_id, uint8_t vector) {
     extern uint8_t logical_to_apic[]; // Из smp.c
     uint8_t apic_id = logical_to_apic[logical_id];
     
-    while (APIC_REG(0x300, all_apic_bases[get_cpu_id()]) & (1 << 12)) {
+    uint32_t *base = apic_local_base();
+    while (APIC_REG(0x300, base) & (1 << 12)) {
         __asm__ volatile("pause");
     }
-    
-    APIC_REG(0x310, all_apic_bases[get_cpu_id()]) = ((uint32_t)apic_id) << 24;
-    APIC_REG(0x300, all_apic_bases[get_cpu_id()]) = 0x4000 | vector;
+
+    APIC_REG(0x310, base) = ((uint32_t)apic_id) << 24;
+    APIC_REG(0x300, base) = 0x4000 | vector;
 }
 
 uint32_t apic_calibrate(volatile uint32_t *apic_base) {
@@ -65,7 +76,8 @@ uint32_t apic_calibrate(volatile uint32_t *apic_base) {
 static void apic_timer_setup(volatile uint32_t *apic_base, uint8_t vector, uint32_t target_hz) {
     uint32_t ticks_per_ms = apic_calibrate(apic_base);
     g_ticks_per_ms = ticks_per_ms;
-    
+    if (target_hz == 0) target_hz = 100;
+
     uint32_t initial_count = (ticks_per_ms * 1000u) / target_hz;
     if (initial_count == 0) initial_count = 1;
 
@@ -135,8 +147,7 @@ int enable_apic(uint32_t *apic_base, uint8_t timer_vector, uint32_t timer_hz) {
 }
 
 void apic_send_eoi(void) {
-    if (this_cpu_apic_index < 0) return;
-    uint32_t *base = all_apic_bases[this_cpu_apic_index];
+    uint32_t *base = apic_local_base();
     if (!base) return;
 
     APIC_REG(APIC_EOI_REG, base) = 0;

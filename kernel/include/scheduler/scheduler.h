@@ -105,6 +105,9 @@ _Static_assert(offsetof(struct cpu_local_data, user_rsp) == 0x18, "cpu_local_dat
 
 struct cpu_local_data* get_current_local_data(void);
 
+bool thread_stack_guard_ok(thread_t *t);
+extern int g_stack_guard_broken;
+
 static inline struct cpu_local_data* get_cpu_local_data(void) {
     return get_current_local_data();
 }
