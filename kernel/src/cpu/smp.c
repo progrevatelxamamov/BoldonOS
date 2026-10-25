@@ -90,8 +90,8 @@ static void percpu_init(int logical_id) {
     local->self = local;
     local->cpu_id = logical_id;
     local->kernel_rsp = (uint64_t)smp_ap_stacks[logical_id] + SMP_AP_STACK_SIZE;
-    wrmsr(IA32_GS_BASE, 0);
-    wrmsr(IA32_KERNEL_GS_BASE, (uint64_t)local);
+    wrmsr(IA32_GS_BASE, (uint64_t)local);
+    wrmsr(IA32_KERNEL_GS_BASE, 0);
 }
 
 static void smp_set_online(int logical_id) {

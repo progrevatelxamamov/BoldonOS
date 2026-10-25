@@ -191,7 +191,8 @@ void syscall_init(void) {
     wrmsr(IA32_LSTAR_MSR, (uint64_t)syscall_entry_stub);
     wrmsr(IA32_FMASK_MSR, 0x200 | 0x400);
 
-    wrmsr(IA32_KERNEL_GS_BASE, (uint64_t)get_current_local_data());
+    wrmsr(IA32_GS_BASE, (uint64_t)get_current_local_data());
+    wrmsr(IA32_KERNEL_GS_BASE, 0);
 }
 
 uint64_t osdev_syscall_handler(uint64_t num,

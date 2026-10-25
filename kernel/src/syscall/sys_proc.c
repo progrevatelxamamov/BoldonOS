@@ -370,6 +370,7 @@ uint64_t sys_clone_impl(uint64_t flags, uint64_t child_stack,
         t->regs = regs;
         t->kernel_stack = kstack;
         t->kernel_stack_top = (uint64_t)kstack + KERNEL_STACK_SIZE;
+        *(uint64_t *)kstack = 0xDEAD10CCDEAD10CCULL;
         t->state = TASK_WAITING;
         t->is_kernel = false;
         t->fs_base = (flags & CLONE_SETTLS) ? tls : curr_thr->fs_base;
@@ -411,6 +412,7 @@ uint64_t sys_clone_impl(uint64_t flags, uint64_t child_stack,
     t->regs = regs;
     t->kernel_stack = kstack;
     t->kernel_stack_top = (uint64_t)kstack + KERNEL_STACK_SIZE;
+    *(uint64_t *)kstack = 0xDEAD10CCDEAD10CCULL;
     t->state = TASK_WAITING;
     t->is_kernel = false;
     t->fs_base = curr_thr->fs_base;
