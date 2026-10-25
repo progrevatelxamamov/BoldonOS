@@ -510,7 +510,6 @@ void schedule(struct interrupt_frame *frame) {
     local->current_thread = thr;
     local->kernel_rsp = thr->kernel_stack_top;
     wrmsr(IA32_FS_BASE, thr->fs_base);
-    wrmsr(IA32_KERNEL_GS_BASE, (uint64_t)&cpu_locals[cpu]);
 
     struct interrupt_frame *restore = thr->regs;
     if (thr->syscall_frame && thr->syscall_frame->rip != 0) {
