@@ -153,9 +153,11 @@ int sys_execve(const char *pathname, char *const argv[], char *const envp[])
     if (ehdr.e_phentsize != sizeof(Elf64_Phdr)) { vfs_close(f); errno = ENOEXEC; return -1; }
     if (ehdr.e_phnum == 0) { vfs_close(f); errno = ENOEXEC; return -1; }
 
+    void *pml4_phys = pmm_alloc_page_and_clear();
+    if (!pml4_phys) { vfs_close(f); errno = ENOMEM; return -1; }
+
     page_table_t *new_pml4 = (page_table_t *)
-        ((uint64_t)pmm_alloc_page_and_clear() + get_bootinfo().hhdm->offset);
-    if (!new_pml4) { vfs_close(f); errno = ENOMEM; return -1; }
+        ((uint64_t)pml4_phys + get_bootinfo().hhdm->offset);
 
     page_table_t *old_pml4 = get_kernel_pml4();
     for (int i = 256; i < 512; i++) new_pml4->entries[i] = old_pml4->entries[i];

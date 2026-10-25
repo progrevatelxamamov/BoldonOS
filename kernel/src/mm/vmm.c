@@ -27,6 +27,8 @@ void vmm_init(void) {
 }
 
 void vmm_map_page(page_table_t *pml4, uint64_t phys, uint64_t virt, uint64_t flags) {
+    if (!pml4) return;
+
     uint64_t pml4_indx = pml4_index(virt);
     uint64_t pdpt_indx = pdpt_index(virt);
     uint64_t pd_indx   = pd_index(virt);
@@ -43,6 +45,7 @@ void vmm_map_page(page_table_t *pml4, uint64_t phys, uint64_t virt, uint64_t fla
 
     if (pml4->entries[pml4_indx] == 0) {
         void* page = pmm_alloc_page_and_clear();
+        if (!page) return;
         pml4->entries[pml4_indx] = pte_create((uint64_t)page, dir_flags);
     } else {
         pml4->entries[pml4_indx] |= dir_flags;
@@ -51,6 +54,7 @@ void vmm_map_page(page_table_t *pml4, uint64_t phys, uint64_t virt, uint64_t fla
 
     if (pdpt->entries[pdpt_indx] == 0) {
         void* page = pmm_alloc_page_and_clear();
+        if (!page) return;
         pdpt->entries[pdpt_indx] = pte_create((uint64_t)page, dir_flags);
     } else {
         pdpt->entries[pdpt_indx] |= dir_flags;
@@ -59,6 +63,7 @@ void vmm_map_page(page_table_t *pml4, uint64_t phys, uint64_t virt, uint64_t fla
 
     if (pd->entries[pd_indx] == 0) {
         void* page = pmm_alloc_page_and_clear();
+        if (!page) return;
         pd->entries[pd_indx] = pte_create((uint64_t)page, dir_flags);
     } else {
         pd->entries[pd_indx] |= dir_flags;
@@ -98,6 +103,8 @@ void vmm_unmap_page(page_table_t *pml4, uint64_t virt) {
 }
 
 bool vmm_is_mapped(page_table_t *pml4, uint64_t virt) {
+    if (!pml4) return false;
+
     uint64_t pml4_indx = pml4_index(virt);
     uint64_t pdpt_indx = pdpt_index(virt);
     uint64_t pd_indx = pd_index(virt);
@@ -120,6 +127,8 @@ bool vmm_is_mapped(page_table_t *pml4, uint64_t virt) {
 }
 
 uint64_t vmm_get_phys(page_table_t *pml4, uint64_t virt) {
+    if (!pml4) return 0;
+
     uint64_t pml4_indx = pml4_index(virt);
     uint64_t pdpt_indx = pdpt_index(virt);
     uint64_t pd_indx = pd_index(virt);

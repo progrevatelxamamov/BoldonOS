@@ -207,6 +207,7 @@ uint64_t sys_execve_impl(uint64_t a1, uint64_t a2, uint64_t a3) {
 uint64_t sys_brk_impl(uint64_t brk) {
     process_t *p = get_current_process();
     if (!p) return (uint64_t)-ENOMEM;
+    if (!p->pml4) return (uint64_t)-ENOMEM;
 
     if (brk == 0 || brk < p->brk_start) return p->brk_current;
 
@@ -278,6 +279,7 @@ uint64_t sys_prlimit64_impl(uint64_t pid, uint64_t resource,
                             uint64_t new_limit, uint64_t old_limit) {
     (void)pid; (void)resource; (void)new_limit;
     if (old_limit) {
+        if (!user_range_ok(old_limit, sizeof(struct linux_rlimit))) return (uint64_t)-EFAULT;
         struct linux_rlimit *rl = (struct linux_rlimit *)old_limit;
         rl->rlim_cur = 8 * 1024 * 1024; /* 8MB stack limit */
         rl->rlim_max = 8 * 1024 * 1024;
