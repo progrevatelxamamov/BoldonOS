@@ -252,7 +252,7 @@ void execption_handlerer(struct interrupt_frame *frame) {
     if (thr && thr->kernel_stack) {
         uint64_t rsp_now;
         __asm__ volatile("mov %%rsp, %0" : "=r"(rsp_now));
-        console_print_string("\nKstack: "); console_print_hex(thr->kernel_stack);
+        console_print_string("\nKstack: "); console_print_hex((uint64_t)thr->kernel_stack);
         console_print_string(" - "); console_print_hex(thr->kernel_stack_top);
         console_print_string("\nCur rsp: "); console_print_hex(rsp_now);
     }

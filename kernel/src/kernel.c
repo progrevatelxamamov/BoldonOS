@@ -174,7 +174,7 @@ void kstart(bootloader_t blinfo) {
 
     inout_init();
     ps2_init();
-    gui_init();
+    //gui_init();
 
     //wifi_start_boot_task(); 
 
