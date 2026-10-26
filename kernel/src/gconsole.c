@@ -59,6 +59,7 @@ static uint64_t bb_height = 0;
 static uint64_t bb_pitch_pixels = 0;
 static bool backbuffer_ready = false;
 static volatile uint32_t framebuffer_users = 0;
+static process_t *framebuffer_owner = NULL;
 
 static ansi_state_t g_ansi_state = ANSI_STATE_NORMAL;
 static int g_ansi_args[16] = {0};
@@ -229,14 +230,18 @@ void gconsole_init_backbuffer(void) {
 }
 
 void gconsole_acquire_framebuffer(void) {
-    __sync_add_and_fetch(&framebuffer_users, 1);
+    if (__sync_fetch_and_add(&framebuffer_users, 1) == 0)
+        framebuffer_owner = get_current_process();
 }
 
 void gconsole_release_framebuffer(void) {
     uint32_t users = framebuffer_users;
     while (users != 0) {
         if (__sync_bool_compare_and_swap(&framebuffer_users, users, users - 1)) {
-            if (users == 1) gconsole_flush();
+            if (users == 1) {
+                framebuffer_owner = NULL;
+                gconsole_flush();
+            }
             return;
         }
         users = framebuffer_users;
@@ -245,6 +250,10 @@ void gconsole_release_framebuffer(void) {
 
 bool gconsole_framebuffer_acquired(void) {
     return framebuffer_users != 0;
+}
+
+process_t *gconsole_framebuffer_owner(void) {
+    return framebuffer_owner;
 }
 
 void gconsole_flush(void) {

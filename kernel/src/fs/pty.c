@@ -148,6 +148,17 @@ static int pty_slave_read(vfs_file_t *file, void *buf, uint64_t count) {
     if (count == 0) return 0;
 
     while (1) {
+        if (p->id == 0 && gconsole_framebuffer_acquired()) {
+            process_t *owner = gconsole_framebuffer_owner();
+            if (owner && get_current_process() != owner) {
+                if (file->flags & (VFS_O_NONBLOCK | 0x800)) {
+                    return -EAGAIN;
+                }
+                schedule_yield();
+                continue;
+            }
+        }
+
         uint32_t avail = (p->in.head >= p->in.tail) ?
                          (p->in.head - p->in.tail) :
                          (PTY_BUF_SIZE - p->in.tail + p->in.head);
@@ -170,12 +181,14 @@ static int pty_slave_write(vfs_file_t *file, const void *buf, uint64_t count) {
     pty_t *p = (pty_t *)file->node->fs_data;
     if (!p) return -EINVAL;
 
-    const char *s = (const char *)buf;
-    for (uint64_t i = 0; i < count; i++) {
-        if (s[i] == 127 || s[i] == '\b') {
-            console_print_string("\b \b");
-        } else {
-            console_print_char(s[i]);
+    if (p->id == 0) {
+        const char *s = (const char *)buf;
+        for (uint64_t i = 0; i < count; i++) {
+            if (s[i] == 127 || s[i] == '\b') {
+                console_print_string("\b \b");
+            } else {
+                console_print_char(s[i]);
+            }
         }
     }
     ring_write(&p->out, (const uint8_t *)buf, count);
@@ -530,6 +543,13 @@ int pty_alloc(int *master_fd, int *slave_fd, process_fd_table_t *table) {
 }
 
 void pty_feed_input(char c) {
+    static bool graphics_active = false;
+    bool now_active = gconsole_framebuffer_acquired();
+    if (now_active != graphics_active) {
+        graphics_active = now_active;
+        memset(&ptys[0].in, 0, sizeof(pty_ring_t));
+    }
+
     for (int i = 0; i < MAX_PTYS; i++) {
         if (ptys[i].used) {
             uint8_t val = (uint8_t)c;
