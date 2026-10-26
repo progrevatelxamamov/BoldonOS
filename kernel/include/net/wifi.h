@@ -56,6 +56,8 @@ typedef struct wifi_device {
     uint8_t speed;
     uint8_t ep_in;
     uint8_t ep_out;
+    uint8_t ep_out_q[4];
+    uint8_t ep_out_count;
     uint8_t ep_int;
     uint16_t mps;
 
@@ -78,6 +80,10 @@ const wifi_driver_info_t *wifi_match_driver(uint16_t vid, uint16_t pid);
 int  wifi_probe_register(xhci_controller_t *hc, uint8_t slot_id, uint8_t speed,
                          uint16_t vid, uint16_t pid,
                          uint8_t ep_in, uint8_t ep_out, uint8_t ep_int, uint16_t mps);
+int  wifi_probe_register_eps(xhci_controller_t *hc, uint8_t slot_id, uint8_t speed,
+                             uint16_t vid, uint16_t pid,
+                             uint8_t ep_in, const uint8_t *ep_outs, uint8_t ep_out_count,
+                             uint8_t ep_int, uint16_t mps);
 
 void wifi_probe_unregister(xhci_controller_t *hc, uint8_t slot_id);
 

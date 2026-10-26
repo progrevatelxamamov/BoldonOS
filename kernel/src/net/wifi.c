@@ -5,6 +5,7 @@
 #include <memory.h>
 #include <gconsole.h>
 #include <scheduler/scheduler.h>
+#include <cpu/time.h>
 #include <string.h>
 
 #include "lwip/netif.h"
@@ -52,6 +53,17 @@ int wifi_probe_register(xhci_controller_t *hc, uint8_t slot_id, uint8_t speed,
                         uint16_t vid, uint16_t pid,
                         uint8_t ep_in, uint8_t ep_out, uint8_t ep_int, uint16_t mps)
 {
+    uint8_t outs[1];
+    outs[0] = ep_out;
+    return wifi_probe_register_eps(hc, slot_id, speed, vid, pid,
+                                   ep_in, outs, 1, ep_int, mps);
+}
+
+int wifi_probe_register_eps(xhci_controller_t *hc, uint8_t slot_id, uint8_t speed,
+                            uint16_t vid, uint16_t pid,
+                            uint8_t ep_in, const uint8_t *ep_outs, uint8_t ep_out_count,
+                            uint8_t ep_int, uint16_t mps)
+{
     const wifi_driver_info_t *drv = wifi_match_driver(vid, pid);
     if (!drv) {
         console_print_string("[Wi-Fi] No driver for VID:PID\n");
@@ -83,7 +95,10 @@ int wifi_probe_register(xhci_controller_t *hc, uint8_t slot_id, uint8_t speed,
     dev->slot_id = slot_id;
     dev->speed = speed;
     dev->ep_in = ep_in;
-    dev->ep_out = ep_out;
+    dev->ep_out = ep_out_count ? ep_outs[0] : 0;
+    dev->ep_out_count = ep_out_count;
+    for (int i = 0; i < ep_out_count && i < 4; i++)
+        dev->ep_out_q[i] = ep_outs[i];
     dev->ep_int = ep_int;
     dev->mps = mps;
     dev->ops = drv->ops;
@@ -196,9 +211,14 @@ void wifi_rx_ethernet_frame(wifi_device_t *dev, const void *buf, size_t len) {
 
 /* ========== BOOT ALL (после дисков) ========== */
 
+static void wifi_msleep(uint32_t ms) {
+    uint64_t end = get_monotonic_ms() + ms;
+    while (get_monotonic_ms() < end)
+        schedule_yield();
+}
+
 void wifi_boot_all(void) {
     if (g_wifi_booted) return;
-    g_wifi_booted = true;
 
     console_print_string("[Wi-Fi] Boot: loading modules & firmware...\n");
 
@@ -214,10 +234,8 @@ void wifi_boot_all(void) {
         if (dev->fw_path[0])
             fw = firmware_load_file(dev->fw_path, &fw_len);
 
-        /* Альтернативный путь Linux layout */
-        if (!fw && dev->fw_path[0]) {
-            /* если C:/ не вышло — пробуй без префикса, по желанию */
-        }
+        if (dev->fw_path[0] && !fw)
+            continue;
 
         int r = dev->ops->init(dev, fw, fw_len);
         if (fw) malloc_free(fw);
@@ -250,13 +268,20 @@ void wifi_boot_all(void) {
 
 static void wifi_boot_task(void *arg) {
     (void)arg;
-    /* На всякий случай небольшая уступка CPU — диски уже должны быть */
-    for (int i = 0; i < 10; i++) schedule_yield();
-    wifi_boot_all();
-    /* задача может умереть или спать forever */
+    for (int attempt = 0; attempt < 120; attempt++) {
+        wifi_boot_all();
+        bool pending = false;
+        for (wifi_device_t *dev = g_devices; dev; dev = dev->next) {
+            if (dev->state == WIFI_STATE_PROBED) pending = true;
+        }
+        if (!pending) break;
+        wifi_msleep(500);
+    }
     for (;;) schedule_yield();
 }
 
 void wifi_start_boot_task(void) {
+    if (g_wifi_booted) return;
+    g_wifi_booted = true;
     create_task_kernel_arg((void *)wifi_boot_task, 0, "wifi-boot");
 }
