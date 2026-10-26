@@ -139,6 +139,7 @@
 #define SYS_EVENTFD2    290
 #define SYS_PRLIMIT64   302
 #define SYS_MEMFD_CREATE 319
+#define SYS_STATX       332
 
 void syscall_init(void);
 uint64_t syscall_handler(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6);

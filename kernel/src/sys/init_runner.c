@@ -12,9 +12,13 @@ static void pty_input_task(void) {
     memset(prev_down, 0, sizeof(prev_down));
 
     while (1) {
+        int kbd_mode = pty_console_kbd_mode();
         for (int k = 0; k < KEY_MAX; k++) {
             bool now = g_keyboard.down[k];
-            if (now && !prev_down[k]) {
+            if (kbd_mode == PTY_KBD_MEDIUMRAW || kbd_mode == PTY_KBD_RAW) {
+                if (now != prev_down[k] && k < KEY_EXT_BASE)
+                    pty_feed_scancode((uint8_t)(now ? k : (k | 0x80)));
+            } else if (kbd_mode != PTY_KBD_OFF && now && !prev_down[k]) {
                 bool shift = g_keyboard.shift_pressed;
                 bool caps  = g_keyboard.caps_lock;
                 bool ctrl  = g_keyboard.down[KEY_RCTRL] || g_keyboard.down[KEY_LCTRL];

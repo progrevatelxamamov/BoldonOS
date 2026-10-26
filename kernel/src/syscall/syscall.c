@@ -49,6 +49,7 @@ extern uint64_t sys_writev_impl(uint64_t, uint64_t, uint64_t);
 extern uint64_t sys_stat_impl(uint64_t, uint64_t);
 extern uint64_t sys_fstat_impl(uint64_t, uint64_t);
 extern uint64_t sys_newfstatat_impl(uint64_t, uint64_t, uint64_t, uint64_t);
+extern uint64_t sys_statx_impl(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
 extern uint64_t sys_poll_impl(uint64_t, uint64_t, uint64_t);
 extern uint64_t sys_fcntl_impl(uint64_t, uint64_t, uint64_t);
 extern uint64_t sys_lseek_impl(uint64_t, uint64_t, uint64_t);
@@ -231,6 +232,7 @@ uint64_t osdev_syscall_handler(uint64_t num,
         return sys_open(p->fd_table, (const char *)a2, (uint32_t)flags);
     }
     case SYS_NEWFSTATAT:  return sys_newfstatat_impl(a1, a2, a3, a4);
+    case SYS_STATX:       return sys_statx_impl(a1, a2, a3, a4, a5);
     case SYS_FACCESSAT:   return sys_access_impl(a2, a3);
     case SYS_GETCWD:      return sys_getcwd_impl(a1, a2);
     case SYS_CHDIR:       return sys_chdir_impl(a1);

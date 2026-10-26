@@ -30,6 +30,16 @@ static vfs_node_t *make_pty_node(const char *name, vfs_file_ops_t *ops, pty_t *p
 #define TIOCGPTN    0x80045430
 #define TIOCSPTLCK  0x40045431
 
+#define KDGETLED    0x4B31
+#define KDSETLED    0x4B32
+#define KDGKBENT    0x4B46
+
+struct kbentry {
+    unsigned char kb_table;
+    unsigned char kb_index;
+    unsigned short kb_value;
+};
+
 #define KDSETMODE   0x4B3A
 #define KDGETMODE   0x4B3B
 #define KDGKBTYPE   0x4B33
@@ -281,6 +291,26 @@ static int pty_close(vfs_file_t *file) {
     return 0;
 }
 
+static uint16_t pty_kbd_value(uint32_t map, uint32_t index) {
+    if (index >= KEY_MAX) return 0;
+    if (map & 0xA) return 0;
+    char normal = keymap_normal[index];
+    bool letter = keymap_caps[index] != 0;
+    if (map & 4) {
+        if (!letter) return 0;
+        return (uint16_t)(0x900 | (uint8_t)(normal - 'a' + 1));
+    }
+    if (letter) {
+        char c = (map & 1) ? keymap_caps[index] : normal;
+        return (uint16_t)(0xB00 | (uint8_t)c);
+    }
+    if (index == KEY_BACKSPACE) return 0x97F;
+    if (index == KEY_ENTER || index == KEY_KP_ENTER) return 0x90D;
+    if (!normal) return 0;
+    char c = ((map & 1) && keymap_shift[index]) ? keymap_shift[index] : normal;
+    return (uint16_t)(uint8_t)c;
+}
+
 static int pty_ioctl(vfs_file_t *file, uint64_t request, void *arg) {
     if (!file || !file->node) return -EINVAL;
     pty_t *p = (pty_t *)file->node->fs_data;
@@ -302,6 +332,43 @@ static int pty_ioctl(vfs_file_t *file, uint64_t request, void *arg) {
 
     if (request == KDGKBTYPE) {
         if (arg) *(char *)arg = 0x02;
+        return 0;
+    }
+
+    if (request == KDGKBMODE) {
+        if (!arg) return -EFAULT;
+        if (!p) return -EINVAL;
+        *(int *)arg = p->kbd_mode;
+        return 0;
+    }
+
+    if (request == KDSKBMODE) {
+        if (!p) return -EINVAL;
+        int mode = (int)(uint64_t)arg;
+        if (mode < PTY_KBD_RAW || mode > PTY_KBD_OFF) return -EINVAL;
+        p->kbd_mode = mode;
+        return 0;
+    }
+
+    if (request == KDGETLED) {
+        if (!arg) return -EFAULT;
+        unsigned char leds = 0;
+        if (g_keyboard.scroll_lock) leds |= 0x01;
+        if (g_keyboard.num_lock) leds |= 0x02;
+        if (g_keyboard.caps_lock) leds |= 0x04;
+        *(unsigned char *)arg = leds;
+        return 0;
+    }
+
+    if (request == KDSETLED) {
+        return 0;
+    }
+
+    if (request == KDGKBENT) {
+        if (!arg) return -EFAULT;
+        if (!p) return -EINVAL;
+        struct kbentry *entry = (struct kbentry *)arg;
+        entry->kb_value = pty_kbd_value(entry->kb_table, entry->kb_index);
         return 0;
     }
 
@@ -421,6 +488,7 @@ void pty_init(void) {
         ptys[i].id = i;
         ptys[i].winsize_row = r;
         ptys[i].winsize_col = c;
+        ptys[i].kbd_mode = PTY_KBD_XLATE;
         pty_set_default_termios(&ptys[i].termios);
     }
 
@@ -542,22 +610,39 @@ int pty_alloc(int *master_fd, int *slave_fd, process_fd_table_t *table) {
     return 0;
 }
 
-void pty_feed_input(char c) {
+static void pty_input_mode_sync(void) {
     static bool graphics_active = false;
     bool now_active = gconsole_framebuffer_acquired();
     if (now_active != graphics_active) {
         graphics_active = now_active;
         memset(&ptys[0].in, 0, sizeof(pty_ring_t));
+        if (!now_active) ptys[0].kbd_mode = PTY_KBD_XLATE;
     }
+}
 
+static void pty_feed_byte(uint8_t val) {
     for (int i = 0; i < MAX_PTYS; i++) {
         if (ptys[i].used) {
-            uint8_t val = (uint8_t)c;
-            if (c == '\r') val = '\n';
             ring_write(&ptys[i].in, &val, 1);
             return;
         }
     }
+}
+
+void pty_feed_input(char c) {
+    pty_input_mode_sync();
+    uint8_t val = (uint8_t)c;
+    if (c == '\r') val = '\n';
+    pty_feed_byte(val);
+}
+
+void pty_feed_scancode(uint8_t byte) {
+    pty_input_mode_sync();
+    pty_feed_byte(byte);
+}
+
+int pty_console_kbd_mode(void) {
+    return ptys[0].kbd_mode;
 }
 
 void pty_poll_output(void) {}
