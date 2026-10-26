@@ -299,6 +299,10 @@ int vfs_close(vfs_file_t *file) {
 int64_t vfs_lseek(vfs_file_t *file, int64_t offset, int whence) {
     if (!file || !file->node) return -1;
 
+    if (file->node->file_ops && file->node->file_ops->lseek) {
+        return (int64_t)file->node->file_ops->lseek(file, offset, whence);
+    }
+
     int64_t new_offset = file->offset;
     if (whence == VFS_SEEK_SET) new_offset = offset;
     else if (whence == VFS_SEEK_CUR) new_offset += offset;
@@ -307,9 +311,6 @@ int64_t vfs_lseek(vfs_file_t *file, int64_t offset, int whence) {
     if (new_offset < 0) return -1;
 
     file->offset = (uint64_t)new_offset;
-    if (file->node->file_ops && file->node->file_ops->lseek) {
-        file->node->file_ops->lseek(file, offset, whence);
-    }
     return new_offset;
 }
 

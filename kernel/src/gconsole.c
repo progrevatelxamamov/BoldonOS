@@ -58,6 +58,7 @@ static uint64_t bb_width = 0;
 static uint64_t bb_height = 0;
 static uint64_t bb_pitch_pixels = 0;
 static bool backbuffer_ready = false;
+static volatile uint32_t framebuffer_users = 0;
 
 static ansi_state_t g_ansi_state = ANSI_STATE_NORMAL;
 static int g_ansi_args[16] = {0};
@@ -227,7 +228,27 @@ void gconsole_init_backbuffer(void) {
     backbuffer_ready = true;
 }
 
+void gconsole_acquire_framebuffer(void) {
+    __sync_add_and_fetch(&framebuffer_users, 1);
+}
+
+void gconsole_release_framebuffer(void) {
+    uint32_t users = framebuffer_users;
+    while (users != 0) {
+        if (__sync_bool_compare_and_swap(&framebuffer_users, users, users - 1)) {
+            if (users == 1) gconsole_flush();
+            return;
+        }
+        users = framebuffer_users;
+    }
+}
+
+bool gconsole_framebuffer_acquired(void) {
+    return framebuffer_users != 0;
+}
+
 void gconsole_flush(void) {
+    if (framebuffer_users != 0) return;
     if (!backbuffer_ready || !base_framebuffer) return;
     struct limine_framebuffer *fb = base_framebuffer->framebuffers[base_framebuffer_index];
     uint64_t total_bytes = bb_height * fb->pitch;
@@ -235,6 +256,7 @@ void gconsole_flush(void) {
 }
 
 void gconsole_flush_region(uint64_t y_start, uint64_t y_end) {
+    if (framebuffer_users != 0) return;
     if (!backbuffer_ready || !base_framebuffer) return;
     if (y_end > bb_height) y_end = bb_height;
     if (y_start >= y_end) return;
@@ -307,7 +329,7 @@ void draw_pixel(struct limine_framebuffer_response *fb, uint64_t fbindex, rgb_t 
     uint32_t raw_color = fb_pixel(f, color);
     if (backbuffer_ready && backbuffer) {
         backbuffer[y * bb_pitch_pixels + x] = raw_color;
-    } else {
+    } else if (framebuffer_users == 0) {
         volatile uint32_t *fb_ptr = (volatile uint32_t *)f->address;
         fb_ptr[y * (f->pitch / 4) + x] = raw_color;
     }
@@ -332,7 +354,7 @@ void fill_rect(struct limine_framebuffer_response *fb, uint64_t fbindex, rgb_t c
                 backbuffer[line_offset + x] = raw_color;
             }
         }
-    } else {
+    } else if (framebuffer_users == 0) {
         volatile uint32_t *fb_ptr = (volatile uint32_t *)f->address;
         for (uint64_t y = start_y; y < end_y; y++) {
             uint64_t line_offset = y * pitch_pixels;
@@ -367,7 +389,7 @@ void draw_char(struct limine_framebuffer_response *fb_resp, uint64_t fbindex, ui
                 }
             }
         }
-    } else {
+    } else if (framebuffer_users == 0) {
         volatile uint32_t *fb_ptr = (volatile uint32_t *)fb->address;
         for (int row = 0; row < 16; row++) {
             unsigned char row_data = font_8x16[offset + row];

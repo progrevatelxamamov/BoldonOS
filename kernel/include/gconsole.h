@@ -2,6 +2,7 @@
 #define GCONSOLE_H
 
 #include <stdint.h>
+#include <stdbool.h>
 #include <limine.h>
 
 typedef struct rgb_struct {
@@ -31,5 +32,8 @@ void console_print_num(uint64_t n);
 void gconsole_init_backbuffer(void);
 void gconsole_flush(void);
 void gconsole_flush_region(uint64_t y_start, uint64_t y_end);
+void gconsole_acquire_framebuffer(void);
+void gconsole_release_framebuffer(void);
+bool gconsole_framebuffer_acquired(void);
 
 #endif

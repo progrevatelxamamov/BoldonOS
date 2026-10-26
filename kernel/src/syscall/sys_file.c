@@ -441,7 +441,7 @@ uint64_t sys_mmap_impl(uint64_t addr, uint64_t len, uint64_t prot,
         vfs_file_t *f = p->fd_table->fds[(int)fd];
         if (f->node && f->node->file_ops && f->node->file_ops->mmap) {
             void* res = f->node->file_ops->mmap(f, (void *)virt_addr, len, (int)prot, (int)flags, (uint64_t)offset);
-            if (res == NULL) return virt_addr;
+            if (res == NULL || res == (void *)-1) return (uint64_t)-ENOMEM;
             return (uint64_t)res;
         }
     }
@@ -483,6 +483,24 @@ uint64_t sys_ioctl_impl(uint64_t a1, uint64_t a2, uint64_t a3) {
         return (uint64_t)-EBADF;
 
     vfs_file_t *file = p->fd_table->fds[fd];
+
+    if (file && file->node && file->node->type == VFS_TYPE_CHAR_DEV && a2 == 0x4B3A) {
+        if (a3 == 2) {
+            gconsole_acquire_framebuffer();
+            return 0;
+        }
+        if (a3 == 0) {
+            gconsole_release_framebuffer();
+            return 0;
+        }
+        return (uint64_t)-EINVAL;
+    }
+
+    if (file && file->node && file->node->type == VFS_TYPE_CHAR_DEV && a2 == 0x4B3B) {
+        if (!a3 || !user_range_ok(a3, sizeof(int))) return (uint64_t)-EFAULT;
+        *(int *)a3 = gconsole_framebuffer_acquired() ? 2 : 0;
+        return 0;
+    }
 
     if (file && file->node && file->node->file_ops && file->node->file_ops->ioctl) {
         int res = file->node->file_ops->ioctl(file, a2, (void *)a3);
