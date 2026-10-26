@@ -512,12 +512,15 @@ void schedule(struct interrupt_frame *frame) {
     wrmsr(IA32_FS_BASE, thr->fs_base);
 
     struct interrupt_frame *restore = thr->regs;
-    if (thr->syscall_frame && thr->syscall_frame->rip != 0) {
+    bool restore_syscall = thr->syscall_frame && thr->syscall_frame->rip != 0;
+    if (restore_syscall) {
         restore = thr->syscall_frame;
-        thr->syscall_frame->rip = 0;
     }
 
     *frame = *restore;
+    if (restore_syscall) {
+        thr->syscall_frame->rip = 0;
+    }
     void *fpu_ptr = thread_get_fpu_state(thr);
     if (fpu_ptr) {
         __asm__ volatile("fxrstor64 (%0)" :: "r"(fpu_ptr) : "memory");
