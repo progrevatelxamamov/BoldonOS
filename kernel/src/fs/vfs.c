@@ -255,6 +255,13 @@ vfs_file_t *vfs_open(const char *path, uint32_t flags) {
     file->offset = (flags & VFS_O_APPEND) ? node->size : 0;
     file->refcount = 1;
 
+    if (file->node->file_ops && file->node->file_ops->open) {
+        if (file->node->file_ops->open(file) < 0) {
+            malloc_free(file);
+            return NULL;
+        }
+    }
+
     if ((flags & VFS_O_TRUNC) && node->size > 0 && node->file_ops && node->file_ops->write) {
         node->size = 0;
     }

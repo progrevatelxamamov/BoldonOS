@@ -1,5 +1,6 @@
 #include <net/unix_socket.h>
 #include <net/socket.h>
+#include <fs/vfs.h>
 #include <errno.h>
 #include <mm/malloc.h>
 #include <memory.h>
@@ -17,8 +18,10 @@
 #define SO_RCVBUF  8
 
 typedef struct unix_socket_internal {
-    bool in_use;    /* ФЛАГ ЗАНЯТОСТИ СЛОТА */
+    bool in_use;
     bool bound;
+    bool path_node_created;
+    bool peer_closed;
     bool listening;
     struct sockaddr_un addr;
     uint8_t rx_buffer[8192];
@@ -34,10 +37,39 @@ typedef struct unix_socket_internal {
 #define MAX_UNIX 128
 static unix_intern_t unix_pool[MAX_UNIX];
 
+static bool unix_create_path_node(const char *path) {
+    vfs_file_t *file = vfs_open(path, VFS_O_RDWR | VFS_O_CREAT);
+    if (!file) return false;
+    vfs_close(file);
+    return true;
+}
+
 static int un_bind(socket_t *sock, const struct sockaddr *addr, socklen_t addrlen) {
     unix_intern_t *u = (unix_intern_t *)sock->private_data;
     if (!u) return -EINVAL;
+    if (u->bound) return -EINVAL;
+    if (!addr || addrlen < sizeof(sa_family_t)) return -EINVAL;
+
     memcpy(&u->addr, addr, addrlen < sizeof(struct sockaddr_un) ? addrlen : sizeof(struct sockaddr_un));
+    u->addr.sun_path[sizeof(u->addr.sun_path) - 1] = '\0';
+
+    if (u->addr.sun_path[0] != '\0') {
+        for (int i = 0; i < MAX_UNIX; i++) {
+            if (&unix_pool[i] != u && unix_pool[i].in_use && unix_pool[i].bound &&
+                strcmp(unix_pool[i].addr.sun_path, u->addr.sun_path) == 0) {
+                memset(&u->addr, 0, sizeof(u->addr));
+                return -EADDRINUSE;
+            }
+        }
+
+        if (vfs_resolve_path(u->addr.sun_path)) {
+            memset(&u->addr, 0, sizeof(u->addr));
+            return -EADDRINUSE;
+        }
+
+        u->path_node_created = unix_create_path_node(u->addr.sun_path);
+    }
+
     u->bound = true;
     return 0;
 }
@@ -105,6 +137,7 @@ static int un_send(socket_t *sock, const void *buf, size_t len, int flags) {
     (void)flags;
     unix_intern_t *u = (unix_intern_t *)sock->private_data;
     if (!u) return -EINVAL;
+    if (u->peer_closed) return -EPIPE;
     unix_intern_t *target = u->peer ? u->peer : u;
     const uint8_t *b = (const uint8_t *)buf;
 
@@ -123,9 +156,10 @@ static int un_recv(socket_t *sock, void *buf, size_t len, int flags) {
     unix_intern_t *u = (unix_intern_t *)sock->private_data;
     if (!u) return -EINVAL;
 
-    if (u->rx_head == u->rx_tail) {
-        if (flags & 0x4000) return -EAGAIN; // O_NONBLOCK
-        while (u->rx_head == u->rx_tail) schedule_yield();
+    while (u->rx_head == u->rx_tail) {
+        if (u->peer_closed) return 0;
+        if (flags & 0x4000) return -EAGAIN;
+        schedule_yield();
     }
 
     uint8_t *b = (uint8_t *)buf;
@@ -149,8 +183,8 @@ static short un_poll(socket_t *sock, short events) {
     unix_intern_t *u = (unix_intern_t *)sock->private_data;
     if (!u) return 0;
     short revents = 0;
-    if ((events & 1) && (u->rx_head != u->rx_tail || (u->listening && u->accept_head != u->accept_tail))) {
-        revents |= 1; // POLLIN
+    if ((events & 1) && (u->rx_head != u->rx_tail || u->peer_closed || (u->listening && u->accept_head != u->accept_tail))) {
+        revents |= 1;
     }
     if (events & 4) revents |= 4; // POLLOUT
     return revents;
@@ -191,10 +225,26 @@ static int un_setsockopt(socket_t *sock, int level, int optname, const void *opt
 static int un_close(socket_t *sock) {
     if (!sock || !sock->private_data) return 0;
     unix_intern_t *u = (unix_intern_t *)sock->private_data;
+
+    char path[sizeof(u->addr.sun_path)];
+    memcpy(path, u->addr.sun_path, sizeof(path));
+    path[sizeof(path) - 1] = '\0';
+    bool remove_path = u->path_node_created && path[0] != '\0';
+
+    if (u->peer) {
+        u->peer->peer_closed = true;
+        u->peer->peer = NULL;
+    }
+
     u->in_use = false;
     u->bound = false;
+    u->path_node_created = false;
     u->listening = false;
     u->peer = NULL;
+
+    if (remove_path) {
+        vfs_unlink(path);
+    }
     return 0;
 }
 

@@ -129,6 +129,9 @@ extern uint64_t sys_getrusage_impl(uint64_t, uint64_t);
 extern uint64_t sys_rmdir_impl(uint64_t);
 extern uint64_t sys_rt_sigsuspend_impl(uint64_t);
 extern uint64_t sys_nanosleep_impl(uint64_t, uint64_t);
+extern uint64_t sys_alarm_impl(uint64_t);
+extern uint64_t sys_getitimer_impl(uint64_t, uint64_t);
+extern uint64_t sys_setitimer_impl(uint64_t, uint64_t, uint64_t);
 extern uint64_t sys_link_impl(uint64_t, uint64_t);
 extern uint64_t sys_fchmod_impl(uint64_t, uint64_t);
 
@@ -323,6 +326,9 @@ uint64_t osdev_syscall_handler(uint64_t num,
     case SYS_RMDIR: return sys_rmdir_impl(a1);
     case 130: return sys_rt_sigsuspend_impl(a1);
     case SYS_NANOSLEEP: return sys_nanosleep_impl(a1, a2);
+    case SYS_GETITIMER: return sys_getitimer_impl(a1, a2);
+    case SYS_ALARM: return sys_alarm_impl(a1);
+    case SYS_SETITIMER: return sys_setitimer_impl(a1, a2, a3);
     case 86: return sys_link_impl(a1, a2);   /* SYS_LINK */
     case 91: return sys_fchmod_impl(a1, a2); /* SYS_FCHMOD */
     case 41: return sys_socket_impl(a1, a2, a3);      /* SYS_SOCKET */

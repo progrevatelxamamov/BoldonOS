@@ -92,8 +92,11 @@ typedef struct pty_ring {
 typedef struct pty {
     int id;
     bool used;
+    bool dynamic;
     bool master_open;
     bool slave_open;
+    int master_refs;
+    int slave_refs;
     vfs_node_t *master_node;
     vfs_node_t *slave_node;
     pty_ring_t in;

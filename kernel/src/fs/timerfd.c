@@ -20,8 +20,9 @@ typedef struct {
 
 static timerfd_t g_tfd[TIMERFD_MAX];
 
-static uint64_t now_ns(void) {
-    return get_unix_time() * 1000000000ULL;
+static uint64_t now_ns(timerfd_t *t) {
+    if (t && t->clockid == 1) return get_monotonic_ms() * 1000000ULL;
+    return get_unix_time_ms() * 1000000ULL;
 }
 
 static int timerfd_read(vfs_file_t *file, void *buf, uint64_t count);
@@ -44,7 +45,7 @@ static timerfd_t *timerfd_from_fd(int fd, process_t *p) {
 
 static void timerfd_update(timerfd_t *t) {
     if (!t->active) return;
-    uint64_t now = now_ns();
+    uint64_t now = now_ns(t);
     while (now >= t->next_expiry_ns) {
         t->counter++;
         if (t->interval_ns == 0) {
@@ -148,8 +149,8 @@ int sys_timerfd_settime_impl(int fd, int flags,
 
     if (old_val) {
         uint64_t rem = 0;
-        if (t->active && t->next_expiry_ns > now_ns())
-            rem = t->next_expiry_ns - now_ns();
+        if (t->active && t->next_expiry_ns > now_ns(t))
+            rem = t->next_expiry_ns - now_ns(t);
         ns_to_ts(rem, &old_val->it_value);
         ns_to_ts(t->interval_ns, &old_val->it_interval);
     }
@@ -163,7 +164,7 @@ int sys_timerfd_settime_impl(int fd, int flags,
     } else {
         t->active = true;
         if (flags & 1) t->next_expiry_ns = val_ns;
-        else           t->next_expiry_ns = now_ns() + val_ns;
+        else           t->next_expiry_ns = now_ns(t) + val_ns;
     }
     return 0;
 }
@@ -175,8 +176,8 @@ int sys_timerfd_gettime_impl(int fd, struct itimerspec_k *cur) {
     if (!cur) return -EINVAL;
 
     uint64_t rem = 0;
-    if (t->active && t->next_expiry_ns > now_ns())
-        rem = t->next_expiry_ns - now_ns();
+    if (t->active && t->next_expiry_ns > now_ns(t))
+        rem = t->next_expiry_ns - now_ns(t);
     ns_to_ts(rem, &cur->it_value);
     ns_to_ts(t->interval_ns, &cur->it_interval);
     return 0;
