@@ -36,4 +36,7 @@ void gconsole_acquire_framebuffer(void);
 void gconsole_release_framebuffer(void);
 bool gconsole_framebuffer_acquired(void);
 
+struct process;
+struct process *gconsole_framebuffer_owner(void);
+
 #endif
