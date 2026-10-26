@@ -22,29 +22,36 @@ void ps2kbd_init(void) {
     }
 }
 
+static bool ps2kbd_send_with_ack(uint8_t value) {
+    for (int attempt = 0; attempt < 4; attempt++) {
+        if (!ps2_write_kbd(value)) return false;
+        for (int responses = 0; responses < 8; responses++) {
+            uint8_t response;
+            if (!ps2_read_kbd_byte_timeout(&response)) return false;
+            if (response == 0xFA) return true;
+            if (response == 0xFE) break;
+            ps2kbd_feed(response);
+        }
+    }
+    return false;
+}
+
 void ps2kbd_set_leds(uint8_t leds) {
     if (!ps2_kbd_present) return;
 
     uint64_t flags;
     __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
 
-    if (ps2_write_kbd(0xED)) {
-        if (ps2_read_byte() == 0xFA) {
-            if (ps2_write_kbd(leds)) {
-                (void)ps2_read_byte();
-            }
-        } else {
-            ps2_kbd_present = false;
-        }
-    } else {
-        ps2_kbd_present = false;
-    }
+    ps2_flush_input();
+    if (ps2kbd_send_with_ack(0xED))
+        (void)ps2kbd_send_with_ack(leds);
 
     __asm__ volatile("pushq %0; popfq" :: "r"(flags) : "memory", "cc");
 }
 
 static int translate(uint8_t sc, bool *is_release) {
     *is_release = (sc & 0x80) != 0;
+    if (sc == 0xAA || sc == 0xFA || sc == 0xEE || sc == 0xFC) return -1;
     uint8_t code = sc & 0x7F;
 
     if (extended) {
@@ -71,7 +78,6 @@ static int translate(uint8_t sc, bool *is_release) {
         }
     }
 
-    if (code == 0xAA || code == 0xFA) return -1;
     if (code >= 0x80) return -1;
     return (int)code;
 }

@@ -23,6 +23,11 @@ void gui_server(void) {
     gconsole_flush_region(old_y, old_y + 25);
 
     while (1) {
+        if (gconsole_framebuffer_acquired()) {
+            schedule_yield();
+            continue;
+        }
+
         int current_x = g_mouse.x;
         int current_y = g_mouse.y;
 

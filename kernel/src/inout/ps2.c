@@ -22,16 +22,18 @@
 #define CMD_DISABLE_MOUSE   0xA7
 #define CMD_ENABLE_MOUSE    0xA8
 
-static void wait_write(void) {
+static bool wait_write(void) {
     for (int i = 0; i < 100000; i++)
         if ((inb(PS2_STATUS) & STATUS_INPUT_FULL) == 0)
-            return;
+            return true;
+    return false;
 }
 
-static void wait_read(void) {
+static bool wait_read(void) {
     for (int i = 0; i < 100000; i++)
         if (inb(PS2_STATUS) & STATUS_OUTPUT_FULL)
-            return;
+            return true;
+    return false;
 }
 
 static void flush_output(void) {
@@ -57,7 +59,8 @@ static void write_data(uint8_t val) {
 }
 
 bool ps2_write_kbd(uint8_t val) {
-    write_data(val);
+    if (!wait_write()) return false;
+    outb(PS2_DATA, val);
     return true;
 }
 
@@ -65,6 +68,32 @@ bool ps2_write_mouse(uint8_t val) {
     write_cmd(CMD_WRITE_MOUSE);
     write_data(val);
     return true;
+}
+
+bool ps2_read_kbd_byte_timeout(uint8_t *out) {
+    if (!out) return false;
+    for (int i = 0; i < 200000; i++) {
+        uint8_t status = inb(PS2_STATUS);
+        if ((status & STATUS_OUTPUT_FULL) == 0) continue;
+        uint8_t byte = inb(PS2_DATA);
+        if (status & STATUS_MOUSE_DATA) {
+            ps2mouse_feed(byte);
+            continue;
+        }
+        *out = byte;
+        return true;
+    }
+    return false;
+}
+
+void ps2_flush_input(void) {
+    for (int i = 0; i < 32; i++) {
+        uint8_t status = inb(PS2_STATUS);
+        if ((status & STATUS_OUTPUT_FULL) == 0) break;
+        uint8_t byte = inb(PS2_DATA);
+        if (status & STATUS_MOUSE_DATA) ps2mouse_feed(byte);
+        else ps2kbd_feed(byte);
+    }
 }
 
 

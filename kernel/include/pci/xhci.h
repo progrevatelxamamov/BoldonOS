@@ -52,6 +52,7 @@ typedef struct {
     volatile uint32_t evt_lock;
     volatile uint32_t cmd_lock;
     volatile uint32_t ep_lock[MAX_XHCI_SLOTS][32];
+    volatile uint32_t ep0_lock[MAX_XHCI_SLOTS];
     uint8_t  bus;
     uint8_t  slot;
     uint8_t  func;
@@ -165,6 +166,14 @@ typedef struct {
     struct block_device *bd;
 } usb_msd_t;
 
+struct hid_field {
+    uint16_t bit_offset;
+    uint16_t bit_size;
+    int32_t  logical_min;
+    int32_t  logical_max;
+    bool     present;
+};
+
 struct usb_hid {
     xhci_controller_t *hc;
     uint8_t  slot_id;
@@ -181,14 +190,48 @@ struct usb_hid {
     uint64_t report_phys;
     uint8_t *report;
     uint8_t  report_size;
-    uint8_t  prev_keys[6];
+    volatile uint16_t report_len;
+    uint8_t  prev_keys[16];
+    uint8_t  prev_key_count;
     uint8_t  prev_modifiers;
     uint8_t  prev_buttons;
     volatile uint8_t pending;
     volatile uint8_t halted;
-    bool leds_failed;
-    uint8_t report_id;
     volatile uint8_t report_ready;
+    bool     boot_protocol_active;
+    bool     report_protocol_active;
+    bool     has_input_report_id;
+    uint8_t  input_report_id;
+    struct hid_field mouse_buttons;
+    uint8_t  mouse_button_count;
+    struct hid_field mouse_x;
+    struct hid_field mouse_y;
+    struct hid_field mouse_wheel;
+    uint8_t  mouse_report_id;
+    uint16_t mouse_report_bits;
+    bool     mouse_layout_valid;
+    struct hid_field kbd_modifiers;
+    struct hid_field kbd_keys;
+    uint8_t  kbd_key_count;
+    uint8_t  kbd_report_id;
+    uint16_t kbd_report_bits;
+    bool     kbd_layout_valid;
+    struct hid_field led_num;
+    struct hid_field led_caps;
+    struct hid_field led_scroll;
+    uint8_t  desc_led_report_id;
+    uint16_t desc_led_report_len;
+    bool     desc_led_layout_valid;
+    uint8_t  led_report_id;
+    uint16_t led_report_len;
+    bool     led_layout_known;
+    uint8_t  led_probe_stage;
+    volatile uint8_t led_pending;
+    volatile uint8_t led_value;
+    uint8_t  led_sent_value;
+    bool     led_sent_valid;
+    uint32_t led_retry_delay;
+    uint8_t  led_failure_count;
 };
 
 #define TRB_NORMAL               1
