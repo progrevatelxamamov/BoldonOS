@@ -57,6 +57,7 @@ struct vfs_mount;
 typedef struct {
     int (*read)(struct vfs_file *file, void *buf, uint64_t count);
     int (*write)(struct vfs_file *file, const void *buf, uint64_t count);
+    int (*open)(struct vfs_file *file);
     int (*close)(struct vfs_file *file);
     uint64_t (*lseek)(struct vfs_file *file, int64_t offset, int whence);
     int (*ioctl)(struct vfs_file *file, uint64_t request, void *arg);

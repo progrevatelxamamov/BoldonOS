@@ -186,7 +186,7 @@ uint64_t sys_epoll_wait_impl(int epfd, struct epoll_event *events, int maxevents
     process_t *curr = get_current_process();
     if (!curr || !curr->fd_table) return (uint64_t)-EINVAL;
 
-    uint64_t start = get_unix_time();
+    uint64_t start = get_monotonic_ms();
 
     while (1) {
         int ready_count = 0;
@@ -216,7 +216,7 @@ uint64_t sys_epoll_wait_impl(int epfd, struct epoll_event *events, int maxevents
         if (ready_count > 0) return (uint64_t)ready_count;
 
         if (timeout == 0) return 0;
-        if (timeout > 0 && (get_unix_time() - start) * 1000 >= (uint64_t)timeout)
+        if (timeout > 0 && get_monotonic_ms() - start >= (uint64_t)timeout)
             return 0;
 
         schedule_yield();

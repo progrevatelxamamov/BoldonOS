@@ -551,11 +551,14 @@ uint64_t sys_futex_impl(uint64_t uaddr, uint64_t op, uint64_t val,
 
 uint64_t sys_gettimeofday_impl(uint64_t tv_ptr, uint64_t tz_ptr) {
     if (tv_ptr) {
+        if (!user_range_ok(tv_ptr, sizeof(struct timeval))) return (uint64_t)-EFAULT;
         struct timeval *tv = (struct timeval *)tv_ptr;
-        tv->tv_sec = get_unix_time();
-        tv->tv_usec = 0;
+        uint64_t unix_ms = get_unix_time_ms();
+        tv->tv_sec = (int64_t)(unix_ms / 1000ULL);
+        tv->tv_usec = (int64_t)((unix_ms % 1000ULL) * 1000ULL);
     }
     if (tz_ptr) {
+        if (!user_range_ok(tz_ptr, sizeof(struct timezone))) return (uint64_t)-EFAULT;
         struct timezone *tz = (struct timezone *)tz_ptr;
         tz->tz_minuteswest = 0;
         tz->tz_dsttime = 0;
@@ -650,13 +653,21 @@ struct linux_timespec {
 };
 
 uint64_t sys_clock_gettime_impl(uint64_t clock_id, uint64_t tp_ptr) {
-    (void)clock_id;
     if (!tp_ptr || !user_range_ok(tp_ptr, sizeof(struct linux_timespec)))
         return (uint64_t)-EFAULT;
 
+    uint64_t now_ms;
+    if (clock_id == 0 || clock_id == 5) {
+        now_ms = get_unix_time_ms();
+    } else if (clock_id == 1 || clock_id == 2 || clock_id == 3 || clock_id == 4 || clock_id == 6 || clock_id == 7) {
+        now_ms = get_monotonic_ms();
+    } else {
+        return (uint64_t)-EINVAL;
+    }
+
     struct linux_timespec *ts = (struct linux_timespec *)tp_ptr;
-    ts->tv_sec = (int64_t)get_unix_time();
-    ts->tv_nsec = 0;
+    ts->tv_sec = (int64_t)(now_ms / 1000ULL);
+    ts->tv_nsec = (int64_t)((now_ms % 1000ULL) * 1000000ULL);
     return 0;
 }
 
@@ -744,7 +755,116 @@ uint64_t sys_getrusage_impl(uint64_t who, uint64_t usage_ptr) {
 uint64_t sys_rt_sigsuspend_impl(uint64_t mask_ptr) {
     (void)mask_ptr;
     schedule_yield();
-    return (uint64_t)-0; // 0 invalid! -EINTR valid!
+    return (uint64_t)-EINTR;
+}
+
+struct linux_itimerval {
+    struct timeval it_interval;
+    struct timeval it_value;
+};
+
+static void alarm_refresh(process_t *p, uint64_t now_ms) {
+    if (!p || p->alarm_deadline_ms == 0 || p->alarm_deadline_ms > now_ms) return;
+
+    p->sigpending |= (1ULL << 14);
+    if (p->alarm_interval_ms == 0) {
+        p->alarm_deadline_ms = 0;
+        return;
+    }
+
+    uint64_t periods = (now_ms - p->alarm_deadline_ms) / p->alarm_interval_ms + 1;
+    p->alarm_deadline_ms += periods * p->alarm_interval_ms;
+}
+
+static uint64_t alarm_remaining_ms(process_t *p, uint64_t now_ms) {
+    alarm_refresh(p, now_ms);
+    if (!p || p->alarm_deadline_ms == 0 || p->alarm_deadline_ms <= now_ms) return 0;
+    return p->alarm_deadline_ms - now_ms;
+}
+
+static void ms_to_timeval(uint64_t ms, struct timeval *tv) {
+    tv->tv_sec = (int64_t)(ms / 1000ULL);
+    tv->tv_usec = (int64_t)((ms % 1000ULL) * 1000ULL);
+}
+
+static uint64_t timeval_to_ms(struct timeval *tv) {
+    if (tv->tv_sec < 0 || tv->tv_usec < 0 || tv->tv_usec >= 1000000) return (uint64_t)-1;
+    return (uint64_t)tv->tv_sec * 1000ULL + (uint64_t)tv->tv_usec / 1000ULL;
+}
+
+uint64_t sys_alarm_impl(uint64_t seconds) {
+    process_t *p = get_current_process();
+    if (!p) return 0;
+
+    uint64_t now_ms = get_monotonic_ms();
+    uint64_t previous_ms = alarm_remaining_ms(p, now_ms);
+    uint64_t previous_sec = (previous_ms + 999ULL) / 1000ULL;
+
+    p->alarm_interval_ms = 0;
+    if (seconds == 0) {
+        p->alarm_deadline_ms = 0;
+    } else {
+        p->alarm_deadline_ms = now_ms + seconds * 1000ULL;
+    }
+
+    return previous_sec;
+}
+
+uint64_t sys_getitimer_impl(uint64_t which, uint64_t value_ptr) {
+    if (!value_ptr || !user_range_ok(value_ptr, sizeof(struct linux_itimerval)))
+        return (uint64_t)-EFAULT;
+    if (which > 2) return (uint64_t)-EINVAL;
+
+    process_t *p = get_current_process();
+    if (!p) return (uint64_t)-ESRCH;
+
+    struct linux_itimerval *value = (struct linux_itimerval *)value_ptr;
+    uint64_t remaining_ms = 0;
+    uint64_t interval_ms = 0;
+    if (which == 0) {
+        uint64_t now_ms = get_monotonic_ms();
+        remaining_ms = alarm_remaining_ms(p, now_ms);
+        interval_ms = p->alarm_interval_ms;
+    }
+
+    ms_to_timeval(interval_ms, &value->it_interval);
+    ms_to_timeval(remaining_ms, &value->it_value);
+    return 0;
+}
+
+uint64_t sys_setitimer_impl(uint64_t which, uint64_t value_ptr, uint64_t old_ptr) {
+    if (!value_ptr || !user_range_ok(value_ptr, sizeof(struct linux_itimerval)))
+        return (uint64_t)-EFAULT;
+    if (old_ptr && !user_range_ok(old_ptr, sizeof(struct linux_itimerval)))
+        return (uint64_t)-EFAULT;
+    if (which > 2) return (uint64_t)-EINVAL;
+
+    process_t *p = get_current_process();
+    if (!p) return (uint64_t)-ESRCH;
+
+    if (old_ptr) {
+        uint64_t old_res = sys_getitimer_impl(which, old_ptr);
+        if (old_res != 0) return old_res;
+    }
+
+    if (which != 0) return 0;
+
+    struct linux_itimerval *value = (struct linux_itimerval *)value_ptr;
+    uint64_t value_ms = timeval_to_ms(&value->it_value);
+    uint64_t interval_ms = timeval_to_ms(&value->it_interval);
+    if (value_ms == (uint64_t)-1 || interval_ms == (uint64_t)-1)
+        return (uint64_t)-EINVAL;
+
+    uint64_t now_ms = get_monotonic_ms();
+    alarm_refresh(p, now_ms);
+    p->alarm_interval_ms = interval_ms;
+    if (value_ms == 0) {
+        p->alarm_deadline_ms = 0;
+    } else {
+        p->alarm_deadline_ms = now_ms + value_ms;
+    }
+
+    return 0;
 }
 
 uint64_t sys_nanosleep_impl(uint64_t req_ptr, uint64_t rem_ptr) {
@@ -761,10 +881,10 @@ uint64_t sys_nanosleep_impl(uint64_t req_ptr, uint64_t rem_ptr) {
         req_ms = 1;
     }
 
-    uint64_t start_time = get_unix_time();
+    uint64_t start_time = get_monotonic_ms();
 
     while (1) {
-        uint64_t elapsed_ms = (get_unix_time() - start_time) * 1000;
+        uint64_t elapsed_ms = get_monotonic_ms() - start_time;
         if (elapsed_ms >= req_ms) {
             break;
         }

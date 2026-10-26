@@ -6,9 +6,12 @@
 #include <gconsole.h>
 #include <inout/inout.h>
 #include <scheduler/scheduler.h>
+#include <scheduler/spinlock.h>
 #include <errno.h>
 
 static vfs_file_ops_t ptmx_ops;
+static vfs_file_ops_t pty_master_ops;
+static vfs_node_t *make_pty_node(const char *name, vfs_file_ops_t *ops, pty_t *p);
 
 #define TCGETS      0x5401
 #define TCSETS      0x5402
@@ -24,6 +27,8 @@ static vfs_file_ops_t ptmx_ops;
 #define TIOCGWINSZ  0x5413
 #define TIOCSWINSZ  0x5414
 #define FIONREAD    0x541B
+#define TIOCGPTN    0x80045430
+#define TIOCSPTLCK  0x40045431
 
 #define KDSETMODE   0x4B3A
 #define KDGETMODE   0x4B3B
@@ -46,6 +51,7 @@ struct vt_stat {
 };
 
 static pty_t ptys[MAX_PTYS];
+static spinlock_t pty_lock = SPINLOCK_INIT;
 
 int pty_poll_events(vfs_file_t *file, short events);
 static uint32_t pty_poll_vfs(struct vfs_file *file, uint32_t mask) { return pty_poll_events(file, (short)mask); }
@@ -107,7 +113,25 @@ static int pty_master_read(vfs_file_t *file, void *buf, uint64_t count) {
     if (!file || !file->node || !buf) return -EFAULT;
     pty_t *p = (pty_t *)file->node->fs_data;
     if (!p) return -EINVAL;
-    return ring_read(&p->out, (uint8_t *)buf, count);
+    if (count == 0) return 0;
+
+    while (1) {
+        uint32_t avail = (p->out.head >= p->out.tail) ?
+                         (p->out.head - p->out.tail) :
+                         (PTY_BUF_SIZE - p->out.tail + p->out.head);
+
+        if (avail > 0) {
+            return ring_read(&p->out, (uint8_t *)buf, count);
+        }
+
+        if (!p->slave_open) return 0;
+
+        if (file->flags & (VFS_O_NONBLOCK | 0x800)) {
+            return -EAGAIN;
+        }
+
+        schedule_yield();
+    }
 }
 
 static int pty_master_write(vfs_file_t *file, const void *buf, uint64_t count) {
@@ -158,12 +182,89 @@ static int pty_slave_write(vfs_file_t *file, const void *buf, uint64_t count) {
     return (int)count;
 }
 
+static void pty_reset_pair(pty_t *p) {
+    memset(&p->in, 0, sizeof(pty_ring_t));
+    memset(&p->out, 0, sizeof(pty_ring_t));
+    pty_get_screen_dimensions(&p->winsize_row, &p->winsize_col);
+    pty_set_default_termios(&p->termios);
+}
+
+static int ptmx_open(vfs_file_t *file) {
+    if (!file) return -EINVAL;
+
+    spin_lock(&pty_lock);
+    pty_t *p = NULL;
+    for (int i = 1; i < MAX_PTYS; i++) {
+        if (!ptys[i].used) {
+            p = &ptys[i];
+            break;
+        }
+    }
+    if (!p) {
+        spin_unlock(&pty_lock);
+        return -ENXIO;
+    }
+
+    p->used = true;
+    p->dynamic = true;
+    p->master_open = true;
+    p->slave_open = false;
+    p->master_refs = 1;
+    p->slave_refs = 0;
+    pty_reset_pair(p);
+    spin_unlock(&pty_lock);
+
+    if (!p->master_node) {
+        p->master_node = make_pty_node("ptmx", &pty_master_ops, p);
+        if (!p->master_node) {
+            spin_lock(&pty_lock);
+            p->used = false;
+            p->dynamic = false;
+            p->master_open = false;
+            p->master_refs = 0;
+            spin_unlock(&pty_lock);
+            return -ENOMEM;
+        }
+    }
+
+    file->node = p->master_node;
+    file->private_data = p;
+    return 0;
+}
+
+static int pty_slave_open(vfs_file_t *file) {
+    if (!file || !file->node || !file->node->fs_data) return -EINVAL;
+    pty_t *p = (pty_t *)file->node->fs_data;
+
+    spin_lock(&pty_lock);
+    p->slave_open = true;
+    p->slave_refs++;
+    spin_unlock(&pty_lock);
+
+    file->private_data = p;
+    return 0;
+}
+
 static int pty_close(vfs_file_t *file) {
     if (!file || !file->node) return 0;
     pty_t *p = (pty_t *)file->node->fs_data;
+    if (!p && file->private_data) p = (pty_t *)file->private_data;
     if (!p) return 0;
-    if (file->node == p->master_node) p->master_open = false;
-    if (file->node == p->slave_node) p->slave_open = false;
+
+    spin_lock(&pty_lock);
+    if (file->node == p->master_node) {
+        if (p->master_refs > 0) p->master_refs--;
+        p->master_open = p->master_refs > 0;
+    } else {
+        if (p->slave_refs > 0) p->slave_refs--;
+        p->slave_open = p->slave_refs > 0;
+    }
+
+    if (p->dynamic && p->master_refs == 0 && p->slave_refs == 0) {
+        p->used = false;
+        p->dynamic = false;
+    }
+    spin_unlock(&pty_lock);
     return 0;
 }
 
@@ -200,6 +301,17 @@ static int pty_ioctl(vfs_file_t *file, uint64_t request, void *arg) {
     }
 
     if (!p) return -EINVAL;
+
+    if (request == TIOCGPTN) {
+        if (!arg) return -EFAULT;
+        *(unsigned int *)arg = (unsigned int)p->id;
+        return 0;
+    }
+
+    if (request == TIOCSPTLCK) {
+        if (!arg) return -EFAULT;
+        return 0;
+    }
 
     if (request == TCGETS || request == TCGETS2 || request == 0x802C542A || request == 0x8030542A) {
         if (!arg) return -EFAULT;
@@ -268,6 +380,7 @@ static vfs_file_ops_t pty_master_ops = {
 static vfs_file_ops_t pty_slave_ops = {
     .read  = pty_slave_read,
     .write = pty_slave_write,
+    .open  = pty_slave_open,
     .close = pty_close,
     .ioctl = pty_ioctl,
     .poll = pty_poll_vfs
@@ -308,6 +421,7 @@ void pty_init(void) {
             name[5] = '0' + (i % 10);
         }
         ptys[i].slave_node = make_pty_node(name, &pty_slave_ops, &ptys[i]);
+        ptys[i].master_node = make_pty_node("ptmx", &pty_master_ops, &ptys[i]);
         devfs_register_device(name, VFS_TYPE_CHAR_DEV, &pty_slave_ops, &ptys[i]);
     }
     devfs_register_device("ptmx", VFS_TYPE_CHAR_DEV, &ptmx_ops, NULL);
@@ -341,26 +455,38 @@ static int pty_find_free(void) {
 int pty_alloc(int *master_fd, int *slave_fd, process_fd_table_t *table) {
     if (!table || !master_fd || !slave_fd) { errno = EINVAL; return -1; }
 
+    spin_lock(&pty_lock);
     int id = pty_find_free();
-    if (id < 0) { errno = ENOMEM; return -1; }
+    if (id < 0) {
+        spin_unlock(&pty_lock);
+        errno = ENOMEM;
+        return -1;
+    }
 
     pty_t *p = &ptys[id];
-    memset(&p->in, 0, sizeof(pty_ring_t));
-    memset(&p->out, 0, sizeof(pty_ring_t));
     p->used = true;
+    p->dynamic = true;
     p->master_open = true;
     p->slave_open = true;
+    p->master_refs = 1;
+    p->slave_refs = 1;
+    pty_reset_pair(p);
+    spin_unlock(&pty_lock);
 
-    pty_get_screen_dimensions(&p->winsize_row, &p->winsize_col);
-    pty_set_default_termios(&p->termios);
-
-    char mname[32] = "ptmx0";
-    char sname[32] = "ptsx0";
-    mname[4] = '0' + (id % 10);
-    sname[4] = '0' + (id % 10);
-
-    p->master_node = make_pty_node(mname, &pty_master_ops, p);
-    p->slave_node  = make_pty_node(sname, &pty_slave_ops, p);
+    if (!p->master_node) p->master_node = make_pty_node("ptmx", &pty_master_ops, p);
+    if (!p->slave_node) p->slave_node = make_pty_node("pts", &pty_slave_ops, p);
+    if (!p->master_node || !p->slave_node) {
+        spin_lock(&pty_lock);
+        p->used = false;
+        p->dynamic = false;
+        p->master_open = false;
+        p->slave_open = false;
+        p->master_refs = 0;
+        p->slave_refs = 0;
+        spin_unlock(&pty_lock);
+        errno = ENOMEM;
+        return -1;
+    }
 
     vfs_file_t *mf = malloc_alloc(sizeof(vfs_file_t));
     vfs_file_t *sf = malloc_alloc(sizeof(vfs_file_t));
@@ -382,7 +508,18 @@ int pty_alloc(int *master_fd, int *slave_fd, process_fd_table_t *table) {
     }
 
     if (mfd < 0 || sfd < 0) {
+        spin_lock(&pty_lock);
         p->used = false;
+        p->dynamic = false;
+        p->master_open = false;
+        p->slave_open = false;
+        p->master_refs = 0;
+        p->slave_refs = 0;
+        spin_unlock(&pty_lock);
+        if (mfd >= 0) table->fds[mfd] = NULL;
+        if (sfd >= 0) table->fds[sfd] = NULL;
+        malloc_free(mf);
+        malloc_free(sf);
         errno = EMFILE;
         return -1;
     }
@@ -405,12 +542,12 @@ void pty_feed_input(char c) {
 
 void pty_poll_output(void) {}
 
-static int ptmx_open_read(vfs_file_t *f, void *b, uint64_t c) { (void)f; (void)b; (void)c; return 0; }
-static int ptmx_open_write(vfs_file_t *f, const void *b, uint64_t c) { (void)f; (void)b; (void)c; return 0; }
-
 static vfs_file_ops_t ptmx_ops = {
-    .read  = ptmx_open_read,
-    .write = ptmx_open_write,
+    .read  = pty_master_read,
+    .write = pty_master_write,
+    .open  = ptmx_open,
+    .close = pty_close,
+    .ioctl = pty_ioctl,
     .poll = pty_poll_vfs
 };
 
@@ -437,18 +574,16 @@ int pty_poll_events(vfs_file_t *file, short events) {
     if (!file || !file->node || !file->node->fs_data) return 0;
     pty_t *p = (pty_t *)file->node->fs_data;
 
-    if (file->node != p->master_node && file->node != p->slave_node) {
-        return 0;
-    }
+    bool is_master = file->node == p->master_node;
 
     short revents = 0;
-    if (events & 4 /* POLLOUT */) revents |= 4;
+    if (events & 4) revents |= 4;
 
-    if (events & 1 /* POLLIN */) {
-        if (file->node == p->slave_node) {
-            if (p->in.head != p->in.tail) revents |= 1;
-        } else if (file->node == p->master_node) {
+    if (events & 1) {
+        if (is_master) {
             if (p->out.head != p->out.tail) revents |= 1;
+        } else {
+            if (p->in.head != p->in.tail) revents |= 1;
         }
     }
     return revents;

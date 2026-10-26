@@ -57,6 +57,8 @@ typedef struct process {
 
     uint64_t sigmask;
     uint64_t sigpending;
+    uint64_t alarm_deadline_ms;
+    uint64_t alarm_interval_ms;
     char cwd[256];
     void *sigactions[64];
     int exit_code;

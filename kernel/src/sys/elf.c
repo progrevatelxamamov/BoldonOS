@@ -396,6 +396,20 @@ int sys_execve(const char *pathname, char *const argv[], char *const envp[])
     p->mmap_base   = 0x5000000000ULL;
     p->is_kernel_process = false;
 
+    const char *base_name = pathname;
+    for (const char *s = pathname; *s; s++) {
+        if (*s == '/') base_name = s + 1;
+    }
+    size_t name_len = 0;
+    while (base_name[name_len] && name_len < 255) name_len++;
+    char *new_name = malloc_alloc(name_len + 1);
+    if (new_name) {
+        memcpy(new_name, base_name, name_len);
+        new_name[name_len] = 0;
+        if (p->name) malloc_free(p->name);
+        p->name = new_name;
+    }
+
     thread_t *thr = p->threads[0];
     if (!thr) {
         malloc_free(str_ptrs); malloc_free(env_ptrs);

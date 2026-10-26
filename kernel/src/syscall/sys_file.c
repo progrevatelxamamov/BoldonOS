@@ -186,7 +186,7 @@ uint64_t sys_poll_impl(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout) {
     if (!p || !p->fd_table) return (uint64_t)-EINVAL;
 
     struct pollfd *fds = (struct pollfd *)fds_ptr;
-    uint64_t start = get_unix_time();
+    uint64_t start = get_monotonic_ms();
 
     while (1) {
         int ready = 0;
@@ -216,7 +216,7 @@ uint64_t sys_poll_impl(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout) {
         }
         if (ready > 0) return (uint64_t)ready;
         if (timeout == 0) return 0;
-        if (timeout != (uint64_t)-1 && (get_unix_time() - start) * 1000 >= timeout)
+        if (timeout != (uint64_t)-1 && get_monotonic_ms() - start >= timeout)
             return 0;
         schedule_yield();
     }
@@ -538,10 +538,13 @@ uint64_t exceptfds_ptr, uint64_t timeout_ptr, uint64_t sigmask_ptr) {
 
     int64_t timeout_ms = -1;
     if (ts) {
+        if (ts->tv_sec < 0 || ts->tv_nsec < 0 || ts->tv_nsec >= 1000000000LL)
+            return (uint64_t)-EINVAL;
         timeout_ms = ts->tv_sec * 1000 + ts->tv_nsec / 1000000;
+        if (timeout_ms == 0 && ts->tv_nsec > 0) timeout_ms = 1;
     }
 
-    uint64_t start = get_unix_time();
+    uint64_t start = get_monotonic_ms();
 
     while (1) {
         int ready = 0;
@@ -593,7 +596,7 @@ uint64_t exceptfds_ptr, uint64_t timeout_ptr, uint64_t sigmask_ptr) {
             return 0;
         }
 
-        if (timeout_ms > 0 && (get_unix_time() - start) * 1000 >= (uint64_t)timeout_ms) {
+        if (timeout_ms > 0 && get_monotonic_ms() - start >= (uint64_t)timeout_ms) {
             if (readfds)  memset(readfds, 0, sizeof(linux_fd_set));
             if (writefds) memset(writefds, 0, sizeof(linux_fd_set));
             return 0;
