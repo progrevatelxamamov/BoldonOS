@@ -5,6 +5,7 @@
 #include "mm/pmm.h"
 #include "scheduler/scheduler.h"
 #include "sys/mman.h"
+#include <scheduler/spinlock.h>
 #include <fs/ext4_vfs.h>
 #include <fs/lwext4/ext4.h>
 #include <fs/lwext4/ext4_blockdev.h>
@@ -34,6 +35,62 @@ static int g_ext4_count = 0;
 static vfs_file_ops_t g_ext4_file_ops;
 static vfs_node_ops_t g_ext4_node_ops;
 static vfs_fs_type_t g_ext4_fs_type;
+
+static spinlock_t ext4_lock_guard = SPINLOCK_INIT;
+static spinlock_t ext4_lock_fallback = SPINLOCK_INIT;
+static thread_t *ext4_lock_owner;
+static uint32_t ext4_lock_depth;
+
+static void ext4_os_lock(void) {
+    thread_t *self = get_current_thread();
+    if (!self) {
+        spin_lock(&ext4_lock_fallback);
+        return;
+    }
+
+    for (;;) {
+        uint64_t flags;
+        spin_lock_irqsave(&ext4_lock_guard, &flags);
+        if (ext4_lock_owner == self) {
+            ext4_lock_depth++;
+            spin_unlock_irqrestore(&ext4_lock_guard, flags);
+            return;
+        }
+        if (!ext4_lock_owner) {
+            ext4_lock_owner = self;
+            ext4_lock_depth = 1;
+            spin_unlock_irqrestore(&ext4_lock_guard, flags);
+            return;
+        }
+        spin_unlock_irqrestore(&ext4_lock_guard, flags);
+        schedule_yield();
+    }
+}
+
+static void ext4_os_unlock(void) {
+    thread_t *self = get_current_thread();
+    if (!self) {
+        spin_unlock(&ext4_lock_fallback);
+        return;
+    }
+
+    uint64_t flags;
+    spin_lock_irqsave(&ext4_lock_guard, &flags);
+    if (ext4_lock_owner == self) {
+        if (ext4_lock_depth > 1) {
+            ext4_lock_depth--;
+        } else {
+            ext4_lock_depth = 0;
+            ext4_lock_owner = NULL;
+        }
+    }
+    spin_unlock_irqrestore(&ext4_lock_guard, flags);
+}
+
+static const struct ext4_lock ext4_os_locks = {
+    ext4_os_lock,
+    ext4_os_unlock
+};
 
 static int boldon_ext4_open(struct ext4_blockdev *bdev) {
     (void)bdev;
@@ -556,6 +613,7 @@ vfs_mount_t *ext4_vfs_mount(const char *device, void *data) {
     if (r != EOK) {
         return NULL;
     }
+    (void)ext4_mount_setup_locks(mount_path, &ext4_os_locks);
 
     vfs_mount_t *mnt = malloc_alloc(sizeof(vfs_mount_t));
     if (!mnt) return NULL;
