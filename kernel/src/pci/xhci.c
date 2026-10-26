@@ -199,8 +199,16 @@ void xhci_poll(xhci_controller_t *hc) {
 
                 struct usb_hid *hid = hc->hid_table[slot][dci];
                 if (hid) {
-                    if (code == 1 || code == 13) hid->report_ready = 1;
-                    else                          hid->halted = 1;
+                    if (code == 1 || code == 13) {
+                        uint32_t residual = evt.status & 0x00FFFFFFu;
+                        if (residual <= hid->report_size)
+                            hid->report_len = (uint16_t)(hid->report_size - residual);
+                        else
+                            hid->report_len = hid->report_size;
+                        hid->report_ready = 1;
+                    } else {
+                        hid->halted = 1;
+                    }
                 }
             }
         } else if (type == TRB_PORT_STATUS_CHANGE) {
@@ -278,6 +286,13 @@ int xhci_control_transfer(xhci_controller_t *hc, uint8_t slot_id,
                           volatile struct xhci_trb *ep0_ring, uint32_t *ep0_enqueue, uint8_t *ep0_cycle,
                           struct usb_setup_packet *setup, uint64_t data_buf_phys, uint16_t transfer_len)
 {
+    if (!hc || !setup || slot_id >= MAX_XHCI_SLOTS) return -1;
+    while (__sync_lock_test_and_set(&hc->ep0_lock[slot_id], 1)) {
+        if (interrupts_enabled()) schedule_yield();
+        else __asm__ volatile("pause");
+    }
+
+    int result = -2;
     uint64_t setup_data;
     memcpy(&setup_data, setup, 8);
 
@@ -287,8 +302,6 @@ int xhci_control_transfer(xhci_controller_t *hc, uint8_t slot_id,
     if (transfer_len == 0)      { trt = 0; status_dir = 1; }
     else if (is_dir_in)         { trt = 3; status_dir = 0; }
     else                        { trt = 2; status_dir = 1; }
-
-    xhci_lock(&hc->ep_lock[slot_id][1]);
 
     uint32_t needed = (transfer_len > 0) ? 3u : 2u;
     uint32_t start  = *ep0_enqueue;
@@ -322,7 +335,6 @@ int xhci_control_transfer(xhci_controller_t *hc, uint8_t slot_id,
 
     __asm__ volatile("mfence" ::: "memory");
     hc->db_regs[slot_id] = 1;
-    xhci_unlock(&hc->ep_lock[slot_id][1]);
 
     struct xhci_trb evt;
     if (xhci_wait_transfer(hc, slot_id, 1, &evt) != 0) {
@@ -333,11 +345,15 @@ int xhci_control_transfer(xhci_controller_t *hc, uint8_t slot_id,
         *ep0_enqueue = trb_start;
         *ep0_cycle   = cyc_start;
         evtq_drain(&hc->transfer_evt_q[slot_id][1]);
-        return -1;
+        result = -1;
+        goto out;
     }
 
     uint8_t code = (evt.status >> 24) & 0xFF;
-    if (code == 1 || code == 13) return 0;
+    if (code == 1 || code == 13) {
+        result = 0;
+        goto out;
+    }
 
     if (code == 6) {
         xhci_reset_endpoint(hc, slot_id, 1);
@@ -347,11 +363,15 @@ int xhci_control_transfer(xhci_controller_t *hc, uint8_t slot_id,
         *ep0_enqueue = trb_start;
         *ep0_cycle   = cyc_start;
         evtq_drain(&hc->transfer_evt_q[slot_id][1]);
-        return -6;
+        result = -6;
+        goto out;
     }
 
     evtq_drain(&hc->transfer_evt_q[slot_id][1]);
-    return -2;
+
+out:
+    __sync_lock_release(&hc->ep0_lock[slot_id]);
+    return result;
 }
 
 int xhci_bulk_transfer(xhci_controller_t *hc, uint8_t slot_id,
@@ -724,21 +744,328 @@ static void emit_modifier(uint16_t kc, bool prev_down, bool cur_down) {
     inout_add_event(ev);
 }
 
+typedef struct {
+    uint32_t usage_page;
+    int32_t  logical_min;
+    int32_t  logical_max;
+    uint32_t report_size;
+    uint32_t report_count;
+    uint32_t report_id;
+} hid_global_state_t;
+
+static int32_t hid_sign_extend(uint32_t value, uint32_t size) {
+    if (size == 0) return 0;
+    uint32_t bits = size * 8;
+    if (bits < 32 && (value & (1u << (bits - 1))))
+        return (int32_t)((int64_t)value - (int64_t)(1ULL << bits));
+    return (int32_t)value;
+}
+
+static int32_t hid_extract_field(const uint8_t *report, uint32_t report_len,
+                                 const struct hid_field *field) {
+    if (!report || !field || !field->present || field->bit_size == 0) return 0;
+    uint32_t bits = field->bit_size;
+    if (bits > 32) bits = 32;
+    uint64_t value = 0;
+    for (uint32_t i = 0; i < bits; i++) {
+        uint32_t bit_index = (uint32_t)field->bit_offset + i;
+        uint32_t byte_index = bit_index >> 3;
+        if (byte_index >= report_len) return 0;
+        if (report[byte_index] & (uint8_t)(1u << (bit_index & 7)))
+            value |= 1ULL << i;
+    }
+    if (field->logical_min < 0 && bits < 32 &&
+        (value & (1ULL << (bits - 1))))
+        value |= ~((1ULL << bits) - 1ULL);
+    return (int32_t)value;
+}
+
+static void hid_set_output_value(uint8_t *report, uint32_t report_len,
+                                 const struct hid_field *field, uint32_t value) {
+    if (!report || !field || !field->present) return;
+    for (uint32_t i = 0; i < field->bit_size; i++) {
+        uint32_t bit_index = (uint32_t)field->bit_offset + i;
+        uint32_t byte_index = bit_index >> 3;
+        if (byte_index >= report_len) return;
+        if ((value >> i) & 1u)
+            report[byte_index] |= (uint8_t)(1u << (bit_index & 7));
+        else
+            report[byte_index] &= (uint8_t)~(1u << (bit_index & 7));
+    }
+}
+
+static void hid_parse_report_descriptor(struct usb_hid *hid, const uint8_t *desc, uint32_t len) {
+    struct hid_field mouse_buttons = {0};
+    struct hid_field mouse_x = {0};
+    struct hid_field mouse_y = {0};
+    struct hid_field mouse_wheel = {0};
+    struct hid_field kbd_modifiers = {0};
+    struct hid_field kbd_keys = {0};
+    struct hid_field led_num = {0};
+    struct hid_field led_caps = {0};
+    struct hid_field led_scroll = {0};
+    uint8_t mouse_button_count = 0;
+    uint8_t kbd_key_count = 0;
+    uint8_t mouse_id = 0;
+    uint8_t kbd_modifiers_id = 0;
+    uint8_t kbd_keys_id = 0;
+    uint8_t led_id = 0;
+    bool mouse_id_known = false;
+    bool led_id_known = false;
+    hid_global_state_t state = {0};
+    hid_global_state_t stack[4];
+    uint32_t stack_depth = 0;
+    uint32_t usages[32];
+    uint32_t usage_count = 0;
+    uint32_t usage_min = 0;
+    uint32_t usage_max = 0;
+    bool have_usage_min = false;
+    bool have_usage_max = false;
+    uint16_t input_bits[256] = {0};
+    uint16_t output_bits[256] = {0};
+    uint16_t feature_bits[256] = {0};
+
+    hid->mouse_layout_valid = false;
+    hid->kbd_layout_valid = false;
+    hid->desc_led_layout_valid = false;
+    hid->has_input_report_id = false;
+    hid->input_report_id = 0;
+
+    for (uint32_t pos = 0; pos < len;) {
+        if (desc[pos] == 0xFE) {
+            if (pos + 2 >= len) break;
+            pos += (uint32_t)desc[pos + 1] + 3;
+            continue;
+        }
+
+        uint8_t prefix = desc[pos++];
+        uint32_t size_code = prefix & 0x03;
+        uint32_t size = size_code == 3 ? 4 : size_code;
+        if (pos + size > len) break;
+        uint32_t value = 0;
+        for (uint32_t i = 0; i < size; i++)
+            value |= (uint32_t)desc[pos + i] << (i * 8);
+        pos += size;
+
+        uint32_t type = (prefix >> 2) & 0x03;
+        uint32_t tag = (prefix >> 4) & 0x0F;
+
+        if (type == 1) {
+            if (tag == 0) {
+                state.usage_page = value;
+            } else if (tag == 1) {
+                state.logical_min = hid_sign_extend(value, size);
+            } else if (tag == 2) {
+                state.logical_max = state.logical_min < 0 ? hid_sign_extend(value, size) : (int32_t)value;
+            } else if (tag == 7) {
+                state.report_size = value;
+            } else if (tag == 8) {
+                state.report_id = value & 0xFF;
+            } else if (tag == 9) {
+                state.report_count = value;
+            } else if (tag == 10) {
+                if (stack_depth < 4) stack[stack_depth++] = state;
+            } else if (tag == 11) {
+                if (stack_depth > 0) state = stack[--stack_depth];
+            }
+            continue;
+        }
+
+        if (type == 2) {
+            if (tag == 0) {
+                if (usage_count < 32) usages[usage_count++] = value;
+            } else if (tag == 1) {
+                usage_min = value;
+                have_usage_min = true;
+            } else if (tag == 2) {
+                usage_max = value;
+                have_usage_max = true;
+            }
+            continue;
+        }
+
+        if (type != 0) continue;
+
+        if (tag == 8 || tag == 9 || tag == 11) {
+            uint16_t *bits = tag == 8 ? input_bits : tag == 9 ? output_bits : feature_bits;
+            uint32_t report_id = state.report_id & 0xFF;
+            uint32_t base_offset = bits[report_id];
+            bool is_constant = (value & 0x01) != 0;
+            bool is_variable = (value & 0x02) != 0;
+            bool is_relative = (value & 0x04) != 0;
+
+            if (tag == 8 && !is_constant && report_id != 0 && !hid->has_input_report_id) {
+                hid->has_input_report_id = true;
+                hid->input_report_id = (uint8_t)report_id;
+            }
+
+            if (!is_constant) {
+                for (uint32_t idx = 0; idx < state.report_count; idx++) {
+                    uint32_t field_page = state.usage_page;
+                    uint32_t usage = 0;
+                    bool have_usage = false;
+                    if (have_usage_min) {
+                        usage = usage_min + idx;
+                        have_usage = !have_usage_max || usage <= usage_max;
+                    } else if (idx < usage_count) {
+                        usage = usages[idx];
+                        have_usage = true;
+                    } else if (usage_count > 0) {
+                        usage = usages[usage_count - 1];
+                        have_usage = true;
+                    }
+                    if (have_usage && usage > 0xFFFF) {
+                        field_page = usage >> 16;
+                        usage &= 0xFFFF;
+                    }
+
+                    struct hid_field field;
+                    field.bit_offset = (uint16_t)(base_offset + idx * state.report_size);
+                    field.bit_size = (uint16_t)state.report_size;
+                    field.logical_min = state.logical_min;
+                    field.logical_max = state.logical_max;
+                    field.present = state.report_size != 0;
+
+                    if (tag == 8 && hid->protocol == 2 && is_variable && have_usage) {
+                        bool report_match = !mouse_id_known || report_id == mouse_id;
+                        if (report_match && field_page == 0x09 && idx == 0 && usage == 1) {
+                            if (!mouse_id_known) {
+                                mouse_id = (uint8_t)report_id;
+                                mouse_id_known = true;
+                            }
+                            mouse_buttons = field;
+                            mouse_button_count = state.report_count > 8 ? 8 : (uint8_t)state.report_count;
+                        } else if (report_match && field_page == 0x01 && is_relative &&
+                                   (usage == 0x30 || usage == 0x31 || usage == 0x38)) {
+                            if (!mouse_id_known) {
+                                mouse_id = (uint8_t)report_id;
+                                mouse_id_known = true;
+                            }
+                            if (report_id == mouse_id) {
+                                if (usage == 0x30) mouse_x = field;
+                                else if (usage == 0x31) mouse_y = field;
+                                else mouse_wheel = field;
+                            }
+                        }
+                    }
+
+                    if (tag == 8 && hid->protocol == 1 && have_usage && field_page == 0x07) {
+                        if (is_variable && state.report_size == 1 && usage >= 0xE0 && usage <= 0xE7) {
+                            if (!kbd_modifiers.present) {
+                                kbd_modifiers = field;
+                                kbd_modifiers_id = (uint8_t)report_id;
+                            }
+                        } else if (!is_variable && idx == 0 && state.report_size >= 4 && state.report_size <= 16) {
+                            kbd_keys = field;
+                            kbd_key_count = state.report_count > 16 ? 16 : (uint8_t)state.report_count;
+                            kbd_keys_id = (uint8_t)report_id;
+                        }
+                    }
+
+                    if (tag == 9 && hid->protocol == 1 && is_variable && have_usage && field_page == 0x08) {
+                        if (!led_id_known) {
+                            led_id = (uint8_t)report_id;
+                            led_id_known = true;
+                        }
+                        if (report_id == led_id) {
+                            if (usage == 1) led_num = field;
+                            else if (usage == 2) led_caps = field;
+                            else if (usage == 3) led_scroll = field;
+                        }
+                    }
+                }
+            }
+
+            uint32_t total_bits = base_offset + state.report_size * state.report_count;
+            bits[report_id] = total_bits > 0xFFFF ? 0xFFFF : (uint16_t)total_bits;
+        }
+
+        usage_count = 0;
+        have_usage_min = false;
+        have_usage_max = false;
+    }
+
+    if (mouse_buttons.present && mouse_x.present && mouse_y.present) {
+        hid->mouse_buttons = mouse_buttons;
+        hid->mouse_button_count = mouse_button_count;
+        hid->mouse_x = mouse_x;
+        hid->mouse_y = mouse_y;
+        hid->mouse_wheel = mouse_wheel;
+        hid->mouse_report_id = mouse_id;
+        hid->mouse_report_bits = input_bits[mouse_id];
+        hid->mouse_layout_valid = true;
+    }
+
+    if (kbd_modifiers.present && kbd_keys.present && kbd_modifiers_id == kbd_keys_id) {
+        hid->kbd_modifiers = kbd_modifiers;
+        hid->kbd_keys = kbd_keys;
+        hid->kbd_key_count = kbd_key_count;
+        hid->kbd_report_id = kbd_keys_id;
+        hid->kbd_report_bits = input_bits[kbd_keys_id];
+        hid->kbd_layout_valid = true;
+    }
+
+    if (led_num.present || led_caps.present || led_scroll.present) {
+        hid->led_num = led_num;
+        hid->led_caps = led_caps;
+        hid->led_scroll = led_scroll;
+        hid->desc_led_report_id = led_id;
+        hid->desc_led_report_len = (uint16_t)(((output_bits[led_id] + 7) / 8) + (led_id ? 1 : 0));
+        if (hid->desc_led_report_len == 0) hid->desc_led_report_len = led_id ? 2 : 1;
+        hid->desc_led_layout_valid = true;
+    }
+}
+
 void handle_keyboard_report(struct usb_hid *hid) {
     uint8_t *r = hid->report;
+    uint32_t report_len = hid->report_len ? hid->report_len : hid->report_size;
+    if (report_len > hid->report_size) report_len = hid->report_size;
 
-    uint8_t offset = 0;
-    if (hid->report_size > 8 || r[0] == 0x01) {
-        if (r[0] == 0x01) {
-            offset = 1;
+    uint8_t cur_keys[16] = {0};
+    uint32_t cur_key_count = 0;
+    uint8_t modifiers = 0;
+    bool parsed = false;
+
+    if (hid->kbd_layout_valid) {
+        uint32_t expected = (uint32_t)((hid->kbd_report_bits + 7) / 8) + (hid->kbd_report_id ? 1 : 0);
+        uint32_t offset = 0;
+        if (hid->kbd_report_id) {
+            if (report_len >= 1 && r[0] == hid->kbd_report_id) offset = 1;
+        }
+        if ((hid->kbd_report_id == 0 || offset == 1) && report_len >= expected) {
+            const uint8_t *payload = r + offset;
+            uint32_t payload_len = report_len - offset;
+            for (uint32_t i = 0; i < 8; i++) {
+                struct hid_field field = hid->kbd_modifiers;
+                field.bit_offset = (uint16_t)(field.bit_offset + i * field.bit_size);
+                if (hid_extract_field(payload, payload_len, &field) != 0)
+                    modifiers |= (uint8_t)(1u << i);
+            }
+            cur_key_count = hid->kbd_key_count;
+            if (cur_key_count > 16) cur_key_count = 16;
+            for (uint32_t i = 0; i < cur_key_count; i++) {
+                struct hid_field field = hid->kbd_keys;
+                field.bit_offset = (uint16_t)(field.bit_offset + i * field.bit_size);
+                int32_t usage = hid_extract_field(payload, payload_len, &field);
+                cur_keys[i] = usage > 0 && usage <= 0xFF ? (uint8_t)usage : 0;
+            }
+            parsed = true;
         }
     }
 
-    uint8_t modifiers = r[offset + 0];
-    uint8_t prev_mod  = hid->prev_modifiers;
+    if (!parsed) {
+        uint32_t offset = 0;
+        if (hid->report_protocol_active && hid->has_input_report_id &&
+            report_len >= 9 && r[0] == hid->input_report_id)
+            offset = 1;
+        if (report_len < offset + 8) return;
+        modifiers = r[offset];
+        cur_key_count = 6;
+        memcpy(cur_keys, &r[offset + 2], 6);
+    }
 
-    bool shift = (modifiers & 0x22) != 0;
-    g_keyboard.shift_pressed = shift;
+    uint8_t prev_mod = hid->prev_modifiers;
+    g_keyboard.shift_pressed = (modifiers & 0x22) != 0;
 
     emit_modifier(KEY_LCTRL,  (prev_mod & 0x01), (modifiers & 0x01));
     emit_modifier(KEY_LSHIFT, (prev_mod & 0x02), (modifiers & 0x02));
@@ -749,15 +1076,12 @@ void handle_keyboard_report(struct usb_hid *hid) {
     emit_modifier(KEY_RALT,   (prev_mod & 0x40), (modifiers & 0x40));
     emit_modifier(KEY_RGUI,   (prev_mod & 0x80), (modifiers & 0x80));
 
-    uint8_t cur_keys[6];
-    memcpy(cur_keys, &r[offset + 2], 6);
-
-    for (int i = 0; i < 6; i++) {
+    for (uint32_t i = 0; i < cur_key_count; i++) {
         uint8_t usage = cur_keys[i];
         if (usage == 0) continue;
 
         bool was_down = false;
-        for (int j = 0; j < 6; j++)
+        for (uint32_t j = 0; j < hid->prev_key_count; j++)
             if (hid->prev_keys[j] == usage) { was_down = true; break; }
 
         if (!was_down) {
@@ -775,12 +1099,12 @@ void handle_keyboard_report(struct usb_hid *hid) {
         }
     }
 
-    for (int i = 0; i < 6; i++) {
+    for (uint32_t i = 0; i < hid->prev_key_count; i++) {
         uint8_t usage = hid->prev_keys[i];
         if (usage == 0) continue;
 
         bool still_down = false;
-        for (int j = 0; j < 6; j++)
+        for (uint32_t j = 0; j < cur_key_count; j++)
             if (cur_keys[j] == usage) { still_down = true; break; }
 
         if (!still_down) {
@@ -798,35 +1122,73 @@ void handle_keyboard_report(struct usb_hid *hid) {
         }
     }
 
-    memcpy(hid->prev_keys, cur_keys, 6);
+    memset(hid->prev_keys, 0, sizeof(hid->prev_keys));
+    memcpy(hid->prev_keys, cur_keys, cur_key_count);
+    hid->prev_key_count = (uint8_t)cur_key_count;
     hid->prev_modifiers = modifiers;
 }
 
 void handle_mouse_report(struct usb_hid *hid) {
     uint8_t *r = hid->report;
-    uint8_t offset = 0;
+    uint32_t report_len = hid->report_len ? hid->report_len : hid->report_size;
+    if (report_len > hid->report_size) report_len = hid->report_size;
 
-    if (hid->report_size > 4 && r[0] != 0 && (r[0] & 0xF8) == 0) {
-        offset = 1;
+    int dx = 0;
+    int dy = 0;
+    int dz = 0;
+    uint8_t buttons = 0;
+    bool parsed = false;
+
+    if (hid->mouse_layout_valid) {
+        uint32_t expected = (uint32_t)((hid->mouse_report_bits + 7) / 8) + (hid->mouse_report_id ? 1 : 0);
+        uint32_t offset = 0;
+        if (hid->mouse_report_id) {
+            if (report_len >= 1 && r[0] == hid->mouse_report_id) offset = 1;
+        }
+        if ((hid->mouse_report_id == 0 || offset == 1) && report_len >= expected) {
+            const uint8_t *payload = r + offset;
+            uint32_t payload_len = report_len - offset;
+            uint32_t button_bits = 0;
+            for (uint32_t i = 0; i < hid->mouse_button_count && i < 8; i++) {
+                struct hid_field field = hid->mouse_buttons;
+                field.bit_offset = (uint16_t)(field.bit_offset + i * field.bit_size);
+                if (hid_extract_field(payload, payload_len, &field) != 0)
+                    button_bits |= 1u << i;
+            }
+            buttons = (uint8_t)button_bits;
+            dx = hid_extract_field(payload, payload_len, &hid->mouse_x);
+            dy = hid_extract_field(payload, payload_len, &hid->mouse_y);
+            dz = hid_extract_field(payload, payload_len, &hid->mouse_wheel);
+            parsed = true;
+        }
     }
 
-    int dx = (int8_t)r[offset + 1];
-    int dy = (int8_t)r[offset + 2];
-    uint8_t buttons = r[offset] & 0x07;
-    uint8_t prev    = hid->prev_buttons;
+    if (!parsed) {
+        uint32_t offset = 0;
+        if (hid->report_protocol_active && hid->has_input_report_id &&
+            report_len >= 5 && r[0] == hid->input_report_id)
+            offset = 1;
+        if (report_len < offset + 3) return;
+        buttons = r[offset];
+        dx = (int8_t)r[offset + 1];
+        dy = (int8_t)r[offset + 2];
+        dz = report_len > offset + 3 ? (int8_t)r[offset + 3] : 0;
+    }
+
+    uint8_t prev = hid->prev_buttons;
 
     g_mouse.leftbtn_pressed   = (buttons & 0x01) != 0;
     g_mouse.rightbtn_pressed  = (buttons & 0x02) != 0;
     g_mouse.centerbtn_pressed = (buttons & 0x04) != 0;
 
-    if (dx != 0 || dy != 0) {
+    if (dx != 0 || dy != 0 || dz != 0) {
         inout_event_t ev;
         memset(&ev, 0, sizeof(ev));
         ev.type = INOUT_EVENT_MOUSE;
         ev.data.mouse.mouse_state = INOUT_MOUSE_MOVE;
         ev.data.mouse.x = dx;
         ev.data.mouse.y = dy;
-        ev.data.mouse.z = (hid->report_size > (uint32_t)(offset + 3)) ? (int8_t)r[offset + 3] : 0;
+        ev.data.mouse.z = dz;
         inout_add_event(ev);
     }
 
@@ -854,10 +1216,110 @@ void handle_mouse_report(struct usb_hid *hid) {
     hid->prev_buttons = buttons;
 }
 
+static int usb_hid_send_led_report(struct usb_hid *hid, uint8_t leds,
+                                   uint8_t report_id, uint16_t report_len, bool use_fields) {
+    if (report_len == 0 || report_len > 64) return -1;
+    uint8_t *led_buf = (uint8_t *)phys_to_virt(hid->report_phys + 1024);
+    memset(led_buf, 0, 64);
+
+    uint32_t payload_offset = 0;
+    if (report_id) {
+        led_buf[0] = report_id;
+        payload_offset = 1;
+    }
+    if (report_len <= payload_offset) return -1;
+
+    if (use_fields) {
+        hid_set_output_value(led_buf + payload_offset, report_len - payload_offset,
+                             &hid->led_num, (leds & 0x01) ? 1 : 0);
+        hid_set_output_value(led_buf + payload_offset, report_len - payload_offset,
+                             &hid->led_caps, (leds & 0x02) ? 1 : 0);
+        hid_set_output_value(led_buf + payload_offset, report_len - payload_offset,
+                             &hid->led_scroll, (leds & 0x04) ? 1 : 0);
+    } else {
+        led_buf[payload_offset] = leds;
+    }
+
+    struct usb_setup_packet sp;
+    memset(&sp, 0, sizeof(sp));
+    sp.bmRequestType = 0x21;
+    sp.bRequest = 0x09;
+    sp.wValue = (uint16_t)(0x0200 | report_id);
+    sp.wIndex = hid->iface_num;
+    sp.wLength = report_len;
+    return xhci_control_transfer(hid->hc, hid->slot_id,
+                                 hid->hc->ep0_ring[hid->slot_id],
+                                 &hid->hc->ep0_enqueue[hid->slot_id],
+                                 &hid->hc->ep0_cycle[hid->slot_id],
+                                 &sp, hid->report_phys + 1024, report_len);
+}
+
+static bool usb_hid_send_current_leds(struct usb_hid *hid, uint8_t leds) {
+    if (hid->led_layout_known) {
+        bool use_fields = hid->desc_led_layout_valid &&
+                          hid->led_report_id == hid->desc_led_report_id &&
+                          hid->led_report_len == hid->desc_led_report_len;
+        int res = usb_hid_send_led_report(hid, leds, hid->led_report_id,
+                                          hid->led_report_len, use_fields);
+        if (res == 0) {
+            hid->led_failure_count = 0;
+            return true;
+        }
+
+        hid->led_failure_count++;
+        if (hid->led_failure_count >= 3) {
+            hid->led_failure_count = 0;
+            if (hid->desc_led_layout_valid &&
+                (hid->led_report_id != hid->desc_led_report_id ||
+                 hid->led_report_len != hid->desc_led_report_len)) {
+                hid->led_report_id = hid->desc_led_report_id;
+                hid->led_report_len = hid->desc_led_report_len;
+            } else if (hid->led_report_id != 0 || hid->led_report_len != 1) {
+                hid->led_report_id = 0;
+                hid->led_report_len = 1;
+            } else {
+                hid->led_layout_known = false;
+                hid->led_probe_stage = 1;
+            }
+        }
+        return false;
+    }
+
+    if (hid->led_probe_stage == 0) {
+        int res = usb_hid_send_led_report(hid, leds, 0, 1, false);
+        if (res == 0) {
+            hid->led_report_id = 0;
+            hid->led_report_len = 1;
+            hid->led_layout_known = true;
+            hid->led_failure_count = 0;
+            return true;
+        }
+        hid->led_probe_stage = 1;
+        return false;
+    }
+
+    int res = usb_hid_send_led_report(hid, leds, 1, 2, false);
+    if (res == 0) {
+        hid->led_report_id = 1;
+        hid->led_report_len = 2;
+        hid->led_layout_known = true;
+        hid->led_failure_count = 0;
+        return true;
+    }
+
+    hid->led_probe_stage = 0;
+    if (hid->desc_led_layout_valid) {
+        hid->led_report_id = hid->desc_led_report_id;
+        hid->led_report_len = hid->desc_led_report_len;
+        hid->led_layout_known = true;
+    }
+    return false;
+}
+
 static void usb_hid_task(void *arg) {
     struct usb_hid *hid = (struct usb_hid *)arg;
     xhci_controller_t *hc = hid->hc;
-    bool first = true;
+    bool transfer_queued = false;
 
     for (;;) {
         if (hid->halted) {
@@ -867,23 +1329,38 @@ static void usb_hid_task(void *arg) {
             hid->cycle = 1;
             hid->halted = 0;
             hid->report_ready = 0;
-            first = true;
+            hid->report_len = 0;
+            transfer_queued = false;
+        }
+
+        if (hid->protocol == 1) {
+            if (hid->led_retry_delay > 0) {
+                hid->led_retry_delay--;
+            } else if (hid->led_pending) {
+                uint8_t desired = hid->led_value;
+                hid->led_pending = 0;
+                bool sent = usb_hid_send_current_leds(hid, desired);
+                if (sent) {
+                    hid->led_sent_value = desired;
+                    hid->led_sent_valid = true;
+                }
+                if (hid->led_value != desired) {
+                    hid->led_pending = 1;
+                } else if (!sent && (!hid->led_sent_valid || hid->led_sent_value != desired)) {
+                    hid->led_pending = 1;
+                    hid->led_retry_delay = 1000;
+                }
+            }
         }
 
         if (hid->report_ready) {
             hid->report_ready = 0;
+            transfer_queued = false;
             if (hid->protocol == 1) handle_keyboard_report(hid);
             else if (hid->protocol == 2) handle_mouse_report(hid);
         }
 
-        if (first || !hid->report_ready) {
-            if (first) {
-                first = false;
-            } else {
-                schedule_yield_safe();
-                if (hid->report_ready) continue;
-            }
-
+        if (!transfer_queued) {
             xhci_lock(&hc->ep_lock[hid->slot_id][hid->dci]);
 
             uint32_t idx = hid->enqueue;
@@ -896,10 +1373,13 @@ static void usb_hid_task(void *arg) {
                 idx = 0;
             }
 
+            memset(hid->report, 0, hid->report_size);
+            hid->report_len = 0;
             hid->ring[idx].param   = hid->report_phys;
             hid->ring[idx].status  = hid->report_size;
             hid->ring[idx].control = (TRB_NORMAL << 10) | (1u << 5) | hid->cycle;
             hid->enqueue++;
+            transfer_queued = true;
 
             __asm__ volatile("mfence" ::: "memory");
             hc->db_regs[hid->slot_id] = hid->dci;
@@ -970,7 +1450,8 @@ static bool xhci_configure_hid_endpoint(xhci_controller_t *hc, struct usb_hid *h
 
 static void init_usb_hid(xhci_controller_t *hc, uint8_t slot_id, uint8_t speed,
                          uint8_t iface_num, uint8_t protocol,
-                         uint8_t ep_in_addr, uint16_t mps, uint8_t interval)
+                         uint8_t ep_in_addr, uint16_t mps, uint8_t interval,
+                         uint16_t report_desc_len)
 {
     struct usb_hid *hid = (struct usb_hid *)malloc_alloc(sizeof(struct usb_hid));
     memset(hid, 0, sizeof(struct usb_hid));
@@ -1004,10 +1485,10 @@ static void init_usb_hid(xhci_controller_t *hc, uint8_t slot_id, uint8_t speed,
     hid->report = (uint8_t *)phys_to_virt(hid->report_phys);
     memset(hid->report, 0, 4096);
 
-    hid->report_id = 0xFF;
-    hid->leds_failed = false;
     hid->halted = 0;
     hid->report_ready = 0;
+    hid->report_len = 0;
+    hid->led_probe_stage = 0;
 
     if (!xhci_configure_hid_endpoint(hc, hid)) {
         pmm_free_pages((void*)hid->ring_phys, 1);
@@ -1016,11 +1497,50 @@ static void init_usb_hid(xhci_controller_t *hc, uint8_t slot_id, uint8_t speed,
         return;
     }
 
+    if (report_desc_len > 0) {
+        uint16_t fetch_len = report_desc_len > 4096 ? 4096 : report_desc_len;
+        uint32_t desc_pages = (fetch_len + 4095) / 4096;
+        uint64_t desc_phys = (uint64_t)pmm_alloc_pages(desc_pages);
+        if (desc_phys) {
+            uint8_t *desc_buf = (uint8_t *)phys_to_virt(desc_phys);
+            memset(desc_buf, 0, desc_pages * 4096);
+
+            struct usb_setup_packet get_desc;
+            memset(&get_desc, 0, sizeof(get_desc));
+            get_desc.bmRequestType = 0x81;
+            get_desc.bRequest = 0x06;
+            get_desc.wValue = 0x2200;
+            get_desc.wIndex = iface_num;
+            get_desc.wLength = fetch_len;
+
+            int dres = xhci_control_transfer(hc, slot_id,
+                                             hc->ep0_ring[slot_id],
+                                             &hc->ep0_enqueue[slot_id],
+                                             &hc->ep0_cycle[slot_id],
+                                             &get_desc, desc_phys, fetch_len);
+            if (dres == 0)
+                hid_parse_report_descriptor(hid, desc_buf, fetch_len);
+            pmm_free_pages((void *)desc_phys, desc_pages);
+        }
+    }
+
+    if (hid->protocol == 2 && hid->mouse_layout_valid) {
+        uint32_t needed = (uint32_t)((hid->mouse_report_bits + 7) / 8) + (hid->mouse_report_id ? 1 : 0);
+        if (needed > hid->report_size && needed <= 64)
+            hid->report_size = (uint8_t)needed;
+    }
+    if (hid->protocol == 1 && hid->kbd_layout_valid) {
+        uint32_t needed = (uint32_t)((hid->kbd_report_bits + 7) / 8) + (hid->kbd_report_id ? 1 : 0);
+        if (needed > hid->report_size && needed <= 64)
+            hid->report_size = (uint8_t)needed;
+    }
+
+    int desired_protocol = hid->protocol == 2 && hid->mouse_layout_valid ? 1 : 0;
     struct usb_setup_packet sp;
     memset(&sp, 0, sizeof(sp));
     sp.bmRequestType = 0x21;
     sp.bRequest = 0x0B;
-    sp.wValue = 0;
+    sp.wValue = (uint16_t)desired_protocol;
     sp.wIndex = iface_num;
     sp.wLength = 0;
 
@@ -1029,7 +1549,34 @@ static void init_usb_hid(xhci_controller_t *hc, uint8_t slot_id, uint8_t speed,
                           &hc->ep0_enqueue[slot_id],
                           &hc->ep0_cycle[slot_id],
                           &sp, 0, 0);
-    (void)pret;
+    if (desired_protocol == 1) {
+        hid->report_protocol_active = pret == 0;
+        if (pret != 0) {
+            sp.wValue = 0;
+            int bret = xhci_control_transfer(hc, slot_id,
+                                             hc->ep0_ring[slot_id],
+                                             &hc->ep0_enqueue[slot_id],
+                                             &hc->ep0_cycle[slot_id],
+                                             &sp, 0, 0);
+            hid->boot_protocol_active = bret == 0;
+            hid->report_protocol_active = !hid->boot_protocol_active;
+        }
+    } else {
+        hid->boot_protocol_active = pret == 0;
+        hid->report_protocol_active = pret != 0;
+    }
+
+    if (hid->protocol == 1) {
+        if (hid->boot_protocol_active) {
+            hid->led_report_id = 0;
+            hid->led_report_len = 1;
+            hid->led_layout_known = true;
+        } else if (hid->desc_led_layout_valid) {
+            hid->led_report_id = hid->desc_led_report_id;
+            hid->led_report_len = hid->desc_led_report_len;
+            hid->led_layout_known = true;
+        }
+    }
 
     hc->hid_table[slot_id][hid->dci] = hid;
 
@@ -1063,40 +1610,9 @@ void xhci_set_keyboard_leds(uint8_t leds) {
         for (int slot = 1; slot < MAX_XHCI_SLOTS; slot++) {
             for (int dci = 0; dci < 32; dci++) {
                 struct usb_hid *hid = hc->hid_table[slot][dci];
-                if (hid && hid->protocol == 1 && !hid->leds_failed) {
-                    uint8_t *led_buf = (uint8_t *)phys_to_virt(hid->report_phys + 1024);
-
-                    if (hid->report_id == 0) {
-                        led_buf[0] = leds;
-                        struct usb_setup_packet sp = { .bmRequestType = 0x21, .bRequest = 0x09, .wValue = 0x0200, .wIndex = hid->iface_num, .wLength = 1 };
-                        int res = xhci_control_transfer(hc, slot, hc->ep0_ring[slot], &hc->ep0_enqueue[slot], &hc->ep0_cycle[slot], &sp, hid->report_phys + 1024, 1);
-                        if (res != 0) hid->report_id = 0xFF;
-                    } else if (hid->report_id == 1) {
-                        led_buf[0] = 0x01;
-                        led_buf[1] = leds;
-                        struct usb_setup_packet sp = { .bmRequestType = 0x21, .bRequest = 0x09, .wValue = 0x0201, .wIndex = hid->iface_num, .wLength = 2 };
-                        int res = xhci_control_transfer(hc, slot, hc->ep0_ring[slot], &hc->ep0_enqueue[slot], &hc->ep0_cycle[slot], &sp, hid->report_phys + 1024, 2);
-                        if (res != 0) hid->report_id = 0xFF;
-                    } else {
-                        led_buf[0] = leds;
-                        struct usb_setup_packet sp0 = { .bmRequestType = 0x21, .bRequest = 0x09, .wValue = 0x0200, .wIndex = hid->iface_num, .wLength = 1 };
-                        int res = xhci_control_transfer(hc, slot, hc->ep0_ring[slot], &hc->ep0_enqueue[slot], &hc->ep0_cycle[slot], &sp0, hid->report_phys + 1024, 1);
-
-                        if (res == 0) {
-                            hid->report_id = 0;
-                        } else {
-                            led_buf[0] = 0x01;
-                            led_buf[1] = leds;
-                            struct usb_setup_packet sp1 = { .bmRequestType = 0x21, .bRequest = 0x09, .wValue = 0x0201, .wIndex = hid->iface_num, .wLength = 2 };
-                            res = xhci_control_transfer(hc, slot, hc->ep0_ring[slot], &hc->ep0_enqueue[slot], &hc->ep0_cycle[slot], &sp1, hid->report_phys + 1024, 2);
-
-                            if (res == 0) {
-                                hid->report_id = 1;
-                            } else {
-                                hid->leds_failed = true;
-                            }
-                        }
-                    }
+                if (hid && hid->protocol == 1) {
+                    hid->led_value = leds;
+                    hid->led_pending = 1;
                 }
             }
         }
@@ -1170,6 +1686,7 @@ void parse_and_configure_device(xhci_controller_t *hc, uint8_t slot_id, uint8_t 
     uint8_t  msd_ep_out = 0, msd_ep_in = 0; uint16_t msd_mps = 512;
     uint8_t  hid_ep_in = 0; uint16_t hid_mps = 8; uint8_t hid_interval = 0;
     uint8_t  hid_proto = 0;
+    uint16_t hid_report_desc_len = 0;
     bool msd_done = false;
 
     // Переменные для USB NET / Wi-Fi
@@ -1190,11 +1707,11 @@ void parse_and_configure_device(xhci_controller_t *hc, uint8_t slot_id, uint8_t 
                 msd_done = true;
                 is_msd = 0; msd_ep_out = 0; msd_ep_in = 0;
             } else if (is_hid && hid_ep_in) {
-                init_usb_hid(hc, slot_id, speed, cur_iface_num, hid_proto, hid_ep_in, hid_mps, hid_interval);
-                is_hid = 0; hid_ep_in = 0;
+                init_usb_hid(hc, slot_id, speed, cur_iface_num, hid_proto, hid_ep_in, hid_mps, hid_interval, hid_report_desc_len);
+                is_hid = 0; hid_ep_in = 0; hid_report_desc_len = 0;
             } else {
                 is_msd = 0; msd_ep_out = 0; msd_ep_in = 0;
-                is_hid = 0; hid_ep_in = 0;
+                is_hid = 0; hid_ep_in = 0; hid_report_desc_len = 0;
             }
 
             struct usb_interface_descriptor *id = (struct usb_interface_descriptor *)&buffer[offset];
@@ -1214,6 +1731,9 @@ void parse_and_configure_device(xhci_controller_t *hc, uint8_t slot_id, uint8_t 
                 is_net = 1;
             }
 
+        } else if (type == 0x21 && is_hid && len >= 9) {
+            hid_report_desc_len = (uint16_t)buffer[offset + 7] |
+                                  ((uint16_t)buffer[offset + 8] << 8);
         } else if (type == 0x05) {
             struct usb_endpoint_descriptor *ep = (struct usb_endpoint_descriptor *)&buffer[offset];
             uint8_t attr = ep->bmAttributes & 0x03;
@@ -1251,7 +1771,7 @@ void parse_and_configure_device(xhci_controller_t *hc, uint8_t slot_id, uint8_t 
         init_usb_mass_storage(hc, slot_id, speed, msd_ep_out, msd_ep_in, msd_mps);
         msd_done = true;
     } else if (is_hid && hid_ep_in) {
-        init_usb_hid(hc, slot_id, speed, cur_iface_num, hid_proto, hid_ep_in, hid_mps, hid_interval);
+        init_usb_hid(hc, slot_id, speed, cur_iface_num, hid_proto, hid_ep_in, hid_mps, hid_interval, hid_report_desc_len);
     }
     
     /* Wi-Fi: только регистрация в подсистеме (FW потом) */
