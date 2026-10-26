@@ -433,6 +433,72 @@ int xhci_bulk_transfer(xhci_controller_t *hc, uint8_t slot_id,
     return -2;
 }
 
+int xhci_bulk_transfer_len(xhci_controller_t *hc, uint8_t slot_id,
+                           volatile struct xhci_trb *ring, uint32_t *enqueue, uint8_t *cycle,
+                           uint8_t db_target, uint64_t data_phys, uint32_t length, uint8_t dir_in,
+                           uint32_t *out_actual)
+{
+    (void)dir_in;
+    if (out_actual) *out_actual = 0;
+    if (length == 0) return 0;
+
+    xhci_lock(&hc->ep_lock[slot_id][db_target]);
+
+    uint32_t idx = *enqueue;
+    if (idx >= COUNT_OF_TRB - 1) {
+        ring[idx].param   = virt_to_phys((void*)ring);
+        ring[idx].status  = 0;
+        ring[idx].control = (TRB_LINK << 10) | (1u << 1) | *cycle;
+        *enqueue = 0;
+        *cycle ^= 1;
+        idx = 0;
+    }
+    uint32_t trb_idx   = idx;
+    uint8_t  cur_cyc   = *cycle;
+
+    ring[trb_idx].param   = data_phys;
+    ring[trb_idx].status  = length & 0x1FFFF;
+    ring[trb_idx].control = (TRB_NORMAL << 10) | (1u << 5) | *cycle;
+    (*enqueue)++;
+
+    evtq_drain(&hc->transfer_evt_q[slot_id][db_target]);
+
+    __asm__ volatile("mfence" ::: "memory");
+    hc->db_regs[slot_id] = db_target;
+
+    xhci_unlock(&hc->ep_lock[slot_id][db_target]);
+
+    struct xhci_trb evt;
+    if (xhci_wait_transfer(hc, slot_id, db_target, &evt) != 0) {
+        xhci_reset_endpoint(hc, slot_id, db_target);
+        *enqueue = trb_idx;
+        *cycle   = cur_cyc;
+        evtq_drain(&hc->transfer_evt_q[slot_id][db_target]);
+        return -1;
+    }
+
+    uint8_t code = (evt.status >> 24) & 0xFF;
+    if (code == 1 || code == 13) {
+        if (out_actual) {
+            uint32_t residual = evt.status & 0xFFFFFF;
+            *out_actual = (residual < length) ? (length - residual) : 0;
+        }
+        return 0;
+    }
+
+    if (code == 6) {
+        xhci_reset_endpoint(hc, slot_id, db_target);
+        xhci_set_tr_dequeue(hc, slot_id, db_target,
+                            virt_to_phys((void*)ring) + trb_idx * sizeof(struct xhci_trb),
+                            cur_cyc);
+        *enqueue = trb_idx;
+        *cycle   = cur_cyc;
+        evtq_drain(&hc->transfer_evt_q[slot_id][db_target]);
+        return -6;
+    }
+    return -2;
+}
+
 int usb_bot_command(xhci_controller_t *hc, usb_msd_t *msd,
                     uint8_t *cdb, uint8_t cdb_len,
                     uint64_t data_phys, uint32_t data_len, uint8_t dir_in)
@@ -589,6 +655,65 @@ int xhci_configure_bulk_endpoints(xhci_controller_t *hc, usb_msd_t *msd,
     trb->param   = input_phys;
     trb->status  = 0;
     trb->control = (TRB_CONFIGURE_ENDPOINT << 10) | ((uint32_t)msd->slot_id << 24) | cyc;
+
+    __asm__ volatile("mfence" ::: "memory");
+    hc->db_regs[0] = 0;
+
+    struct xhci_trb evt;
+    if (xhci_wait_event(hc, 33, &evt) != 0) {
+        pmm_free_pages((void*)input_phys, 1);
+        return -1;
+    }
+    uint8_t code = (evt.status >> 24) & 0xFF;
+    pmm_free_pages((void*)input_phys, 1);
+    if (code != 1) return -2;
+    return 0;
+}
+
+int xhci_configure_endpoints_multi(xhci_controller_t *hc, uint8_t slot_id,
+                                   const uint8_t *out_addrs, const uint64_t *out_rings, int out_count,
+                                   uint8_t in_addr, uint64_t in_ring, uint16_t mps)
+{
+    uint32_t hccparams1 = xhci_read32(hc->cap_regs, 0x10);
+    uint32_t ctx_size = (hccparams1 & (1u << 2)) ? 64 : 32;
+
+    uint8_t dci_in = (in_addr & 0x0F) * 2 + 1;
+    uint8_t max_dci = dci_in;
+
+    uint64_t input_phys = (uint64_t)pmm_alloc_pages(1);
+    uint8_t *input_virt = (uint8_t *)phys_to_virt(input_phys);
+    memset(input_virt, 0, 4096);
+
+    uint32_t *icc = (uint32_t *)input_virt;
+    icc[1] = (1u << 0) | (1u << dci_in);
+
+    for (int i = 0; i < out_count; i++) {
+        uint8_t dci_out = (out_addrs[i] & 0x0F) * 2 + 0;
+        icc[1] |= (1u << dci_out);
+        if (dci_out > max_dci) max_dci = dci_out;
+        uint32_t *ep_ctx = (uint32_t *)(input_virt + ctx_size * (dci_out + 1));
+        ep_ctx[0] = 0;
+        ep_ctx[1] = ((uint32_t)mps << 16) | (2u << 3) | (3u << 1);
+        *(uint64_t *)&ep_ctx[2] = out_rings[i] | 1u;
+        ep_ctx[4] = mps;
+    }
+
+    uint32_t *slot_ctx = (uint32_t *)(input_virt + ctx_size);
+    uint32_t *current_dev_ctx = (uint32_t *)phys_to_virt(((uint64_t *)hc->dcbaa)[slot_id]);
+    memcpy(slot_ctx, current_dev_ctx, ctx_size);
+    slot_ctx[0] = (slot_ctx[0] & ~(0x1Fu << 27)) | ((uint32_t)max_dci << 27);
+
+    uint32_t *ep_in_ctx = (uint32_t *)(input_virt + ctx_size * (dci_in + 1));
+    ep_in_ctx[0] = 0;
+    ep_in_ctx[1] = ((uint32_t)mps << 16) | (6u << 3) | (3u << 1);
+    *(uint64_t *)&ep_in_ctx[2] = in_ring | 1u;
+    ep_in_ctx[4] = mps;
+
+    uint8_t cyc;
+    struct xhci_trb *trb = cmd_ring_enqueue(hc, &cyc);
+    trb->param   = input_phys;
+    trb->status  = 0;
+    trb->control = (TRB_CONFIGURE_ENDPOINT << 10) | ((uint32_t)slot_id << 24) | cyc;
 
     __asm__ volatile("mfence" ::: "memory");
     hc->db_regs[0] = 0;
@@ -1693,6 +1818,8 @@ void parse_and_configure_device(xhci_controller_t *hc, uint8_t slot_id, uint8_t 
     uint8_t  is_net = 0;
     uint8_t  net_ep_out = 0, net_ep_in = 0, net_ep_int = 0;
     uint16_t net_mps = 512;
+    uint8_t  net_ep_outs[4];
+    uint8_t  net_ep_out_count = 0;
 
     uint32_t offset = 0;
     while (offset < total_length) {
@@ -1756,6 +1883,8 @@ void parse_and_configure_device(xhci_controller_t *hc, uint8_t slot_id, uint8_t 
                     net_mps = ep->wMaxPacketSize; 
                 } else { 
                     net_ep_out = ep->bEndpointAddress; 
+                    if (net_ep_out_count < 4)
+                        net_ep_outs[net_ep_out_count++] = ep->bEndpointAddress;
                 }
             } else if (attr == 3 && is_net) {
                 if (ep->bEndpointAddress & 0x80) { 
@@ -1777,8 +1906,9 @@ void parse_and_configure_device(xhci_controller_t *hc, uint8_t slot_id, uint8_t 
     /* Wi-Fi: только регистрация в подсистеме (FW потом) */
     if ((vid == 0x2357 && pid == 0x0107) || (vid == 0x0BDA && pid == 0x818B)) {
         if (net_ep_in && net_ep_out) {
-            wifi_probe_register(hc, slot_id, speed, vid, pid,
-                                net_ep_in, net_ep_out, net_ep_int, net_mps);
+            wifi_probe_register_eps(hc, slot_id, speed, vid, pid,
+                                    net_ep_in, net_ep_outs, net_ep_out_count,
+                                    net_ep_int, net_mps);
         }
     }
     // В противном случае обычный проводной USB-Ethernet

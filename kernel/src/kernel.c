@@ -176,7 +176,8 @@ void kstart(bootloader_t blinfo) {
     ps2_init();
     //gui_init();
 
-    //wifi_start_boot_task(); 
+    extern void wifi_start_boot_task(void);
+    wifi_start_boot_task();
 
     extern void launch_init_process(void);
     create_task_kernel((void *)launch_init_process, "init");
