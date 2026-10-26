@@ -7,6 +7,12 @@
 
 #define MAX_PTYS 16
 #define PTY_BUF_SIZE 4096
+
+#define PTY_KBD_RAW       0
+#define PTY_KBD_XLATE     1
+#define PTY_KBD_MEDIUMRAW 2
+#define PTY_KBD_UNICODE   3
+#define PTY_KBD_OFF       4
 #define NCCS 19
 
 #define IGNBRK  0000001
@@ -104,12 +110,15 @@ typedef struct pty {
     
     uint16_t winsize_row;
     uint16_t winsize_col;
+    int kbd_mode;
     struct termios termios;
 } pty_t;
 
 void pty_init(void);
 int pty_alloc(int *master_fd, int *slave_fd, process_fd_table_t *table);
 void pty_feed_input(char c);
+void pty_feed_scancode(uint8_t byte);
+int pty_console_kbd_mode(void);
 void pty_register_devfs(void);
 int pty_poll_events(vfs_file_t *file, short events);
 void pty_set_size(int pty_id, uint16_t rows, uint16_t cols);

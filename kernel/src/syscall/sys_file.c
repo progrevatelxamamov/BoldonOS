@@ -26,6 +26,39 @@ struct linux_stat {
     int64_t  __unused[3];
 };
 
+struct statx_timestamp {
+    int64_t tv_sec;
+    uint32_t tv_nsec;
+    int32_t __reserved;
+};
+
+struct linux_statx {
+    uint32_t stx_mask;
+    uint32_t stx_blksize;
+    uint64_t stx_attributes;
+    uint32_t stx_nlink;
+    uint32_t stx_uid;
+    uint32_t stx_gid;
+    uint16_t stx_mode;
+    uint16_t __spare0[1];
+    uint64_t stx_ino;
+    uint64_t stx_size;
+    uint64_t stx_blocks;
+    uint64_t stx_attributes_mask;
+    struct statx_timestamp stx_atime;
+    struct statx_timestamp stx_btime;
+    struct statx_timestamp stx_ctime;
+    struct statx_timestamp stx_mtime;
+    uint32_t stx_rdev_major;
+    uint32_t stx_rdev_minor;
+    uint32_t stx_dev_major;
+    uint32_t stx_dev_minor;
+    uint64_t stx_mnt_id;
+    uint32_t stx_dio_mem_align;
+    uint32_t stx_dio_offset_align;
+    uint64_t __spare3[12];
+};
+
 struct linux_winsize {
     unsigned short ws_row;
     unsigned short ws_col;
@@ -306,6 +339,46 @@ uint64_t sys_newfstatat_impl(uint64_t dirfd, uint64_t path,
     vfs_node_t *node = vfs_resolve_path((const char *)path);
     if (!node) return (uint64_t)-ENOENT;
     fill_linux_stat(node, (struct linux_stat *)statbuf);
+    return 0;
+}
+
+uint64_t sys_statx_impl(uint64_t dirfd, uint64_t path, uint64_t flags,
+                        uint64_t mask, uint64_t statxbuf) {
+    process_t *p = get_current_process();
+    if (!p || !p->fd_table) return (uint64_t)-EBADF;
+    if (!statxbuf || !user_range_ok(statxbuf, sizeof(struct linux_statx)))
+        return (uint64_t)-EFAULT;
+    if (flags & ~0x7900ULL) return (uint64_t)-EINVAL;
+    (void)mask;
+
+    vfs_node_t *node = NULL;
+    const char *pathstr = (const char *)path;
+    if ((flags & 0x1000) && (!pathstr || pathstr[0] == 0)) {
+        int fd = (int)dirfd;
+        if (fd < 0 || fd >= VFS_MAX_FD || !p->fd_table->fds[fd])
+            return (uint64_t)-EBADF;
+        node = p->fd_table->fds[fd]->node;
+        if (!node) return (uint64_t)-EBADF;
+    } else {
+        if (!path) return (uint64_t)-EFAULT;
+        node = vfs_resolve_path(pathstr);
+        if (!node) return (uint64_t)-ENOENT;
+    }
+
+    struct linux_stat st;
+    fill_linux_stat(node, &st);
+
+    struct linux_statx *sx = (struct linux_statx *)statxbuf;
+    memset(sx, 0, sizeof(*sx));
+    sx->stx_mask = 0x71F;
+    sx->stx_blksize = 4096;
+    sx->stx_nlink = (uint32_t)st.st_nlink;
+    sx->stx_uid = st.st_uid;
+    sx->stx_gid = st.st_gid;
+    sx->stx_mode = (uint16_t)st.st_mode;
+    sx->stx_ino = st.st_ino;
+    sx->stx_size = (uint64_t)st.st_size;
+    sx->stx_blocks = (uint64_t)st.st_blocks;
     return 0;
 }
 
