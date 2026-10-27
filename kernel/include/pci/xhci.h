@@ -197,6 +197,11 @@ struct usb_hid {
     uint8_t  prev_keys[16];
     uint8_t  prev_key_count;
     uint8_t  prev_modifiers;
+    /* Авторитетный набор клавиш ЭТОГО устройства (внутренние keycodes).
+       Сверяется на каждом репорте, а не только по фронтам: потерянное
+       событие отпускания больше не оставляет Shift «залипшим». */
+    uint8_t  active_keycodes[32];
+    uint8_t  active_keycode_count;
     uint8_t  prev_buttons;
     volatile uint8_t pending;
     volatile uint8_t halted;

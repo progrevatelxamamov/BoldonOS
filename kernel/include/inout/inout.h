@@ -234,4 +234,9 @@ void inout_add_event(inout_event_t ev);
 void inout_call_scheduler(void);
 void update_keyboard_leds(void);
 
+/* Принудительно выставить состояние клавиши (используется USB HID для
+   сверки всего состояния на каждом репорте). Состояние g_keyboard.down[]
+   меняется только здесь, больше никто его не трогает. */
+void inout_set_key_state(uint64_t keycode, bool down);
+
 #endif
