@@ -66,16 +66,47 @@ typedef struct {
 } kbd_event_rec_t;
 
 static kbd_event_rec_t kbd_evt_q[KBD_Q_SIZE];
-static volatile uint32_t kbd_evt_h = 0, kbd_evt_t = 0;
+static volatile uint32_t kbd_evt_h = 0;
+
+/* У клавиатуры ДВА независимых потребителя:
+     /dev/kbd (kbd_ops) и консольный PTY в K_MEDIUMRAW/XLATE (init_runner).
+   Раньше PTY-путь вообще не пользовался этой очередью, а опрашивал
+   g_keyboard.down[] со своей локальной тенью prev_down[] — второй,
+   несинхронизированный конечный автомат. Потеря break в нём (или смена
+   KDSKBMODE) оставляла Shift залипшим в Nano-X, даже после исправления
+   очереди /dev/kbd. Теперь оба читают ОДИН авторитетный поток, но каждый
+   со своим курсором и своей тенью, и оба умеют ресинхронизироваться. */
+enum {
+    KBD_RESYNC_NONE = 0,
+    KBD_RESYNC_MOD_UP,      /* явно отпустить все «обычные» модификаторы */
+    KBD_RESYNC_MOD_DOWN,    /* вернуть DOWN для реально зажатых */
+    KBD_RESYNC_DIFF         /* сличить остальные клавиши с g_keyboard */
+};
+
+typedef struct {
+    volatile uint32_t tail;          /* курсор в kbd_evt_q */
+    bool     sent_down[KEY_MAX];     /* что потребитель уже получил */
+    volatile bool sync_needed;
+    uint8_t  sync_phase;
+    uint32_t sync_cursor;
+} kbd_consumer_t;
+
+/* Модификаторы, состояние которых можно безопасно переслать синтетически.
+   CapsLock / NumLock / ScrollLock сюда НЕ входят: Nano-X (kbd_ttyscan.c)
+   переключает их по событию ОТПУСКАНИЯ, поэтому лишний UP самовольно
+   переключил бы режим. Залипает именно Shift — он в этом списке. */
+static const uint8_t kbd_resync_mods[] = {
+    KEY_LSHIFT, KEY_RSHIFT, KEY_LCTRL, KEY_RCTRL,
+    KEY_LALT,   KEY_RALT,   KEY_LGUI,  KEY_RGUI
+};
+#define KBD_RESYNC_MOD_COUNT ((uint32_t)(sizeof(kbd_resync_mods) / sizeof(kbd_resync_mods[0])))
+
+static kbd_consumer_t dev_consumer;   /* /dev/kbd, /dev/input/event0 */
+static kbd_consumer_t con_consumer;   /* консольный PTY */
 
 /* Остаток байтов текущего события (read(fd, buf, 1) должен работать). */
 static uint8_t  kbd_read_buf[2];
 static uint32_t kbd_read_pos = 0, kbd_read_len = 0;
-
-/* Что потребитель уже получил. Нужно для ресинхронизации после
-   переполнения очереди: заново посылаем UP для «залипших» клавиш. */
-static bool kbd_sent_down[KEY_MAX];
-static bool kbd_sync_needed = false;
 
 /* Один лок на состояние клавиатуры и на очередь событий: irq_save()
    выключает прерывания только на ЭТОМ CPU и от SMP-гонки не спасает. */
@@ -187,10 +218,10 @@ static void input_stream_reset(void) {
     spin_unlock_irqrestore(&input_q_lock, flags);
 
     spin_lock_irqsave(&kbd_state_lock, &flags);
-    kbd_evt_h = kbd_evt_t = 0;
+    kbd_evt_h = 0;
     kbd_read_pos = kbd_read_len = 0;
-    kbd_sync_needed = false;
-    memset(kbd_sent_down, 0, sizeof(kbd_sent_down));
+    memset(&dev_consumer, 0, sizeof(dev_consumer));
+    memset(&con_consumer, 0, sizeof(con_consumer));
     for (int k = 0; k < KEY_MAX; k++) g_keyboard.down[k] = false;
     g_keyboard.caps_lock = false;
     g_keyboard.num_lock = false;
@@ -404,8 +435,9 @@ uint32_t input_poll_events(vfs_file_t *file, uint32_t events) {
         } else {
             uint64_t lf;
             spin_lock_irqsave(&kbd_state_lock, &lf);
-            bool ready = (kbd_evt_h != kbd_evt_t) ||
-                         (kbd_read_pos < kbd_read_len) || kbd_sync_needed;
+            bool ready = (dev_consumer.tail != kbd_evt_h) ||
+                         dev_consumer.sync_needed ||
+                         (kbd_read_pos < kbd_read_len);
             spin_unlock_irqrestore(&kbd_state_lock, lf);
             if (ready) re |= POLLIN;
         }
@@ -482,34 +514,98 @@ static uint8_t kbd_ext_scancode(uint8_t code) {
     }
 }
 
-/* Только под kbd_state_lock. Отпускание НЕ теряется никогда:
-   именно потеря UP для Shift даёт «вечно включённый» модификатор. */
+/* Только под kbd_state_lock. Пометить потребителя на ресинхронизацию.
+   new_tail — куда поставить курсор: отставший потребитель начинает читать
+   ТОЛЬКО свежие события, а состояние восстанавливает из g_keyboard.down[].
+   Фазу выставлять ОБЯЗАТЕЛЬНО: sync_needed при sync_phase == NONE приводит
+   к тому, что ресинк молча сбрасывает флаг, а залипшая тень остаётся. */
+static void kbd_consumer_mark_resync(kbd_consumer_t *c, uint32_t new_tail) {
+    c->tail = new_tail;
+    c->sync_needed = true;
+    c->sync_phase  = KBD_RESYNC_MOD_UP;
+    c->sync_cursor = 0;
+}
+
+/* Только под kbd_state_lock. Очередь общая, но отставание любого из
+   потребителей помечается ресинхронизацией: потерянный UP всё равно
+   будет восстановлен из авторитетного g_keyboard.down[]. Курсор
+   отставшего ставим на next — сразу ПОСЛЕ записываемого события, чтобы
+   потребитель не получил его дважды (ресинк уже учёл новое состояние).
+   ВАЖНО: state уже обновлён в key_state_apply() ДО вызова этой функции. */
 static void kbd_event_push_locked(uint8_t code, bool down) {
     uint32_t next = (kbd_evt_h + 1) % KBD_Q_SIZE;
-    if (next == kbd_evt_t) {
-        if (down) {
-            /* Новое нажатие можно выбросить — состояние всё равно
-               пришлём ресинхронизацией. */
-            kbd_sync_needed = true;
-            return;
-        }
-        /* Освобождаем место. Если в хвосте нажатие — убираем его. */
-        kbd_evt_t = (kbd_evt_t + 1) % KBD_Q_SIZE;
-        kbd_sync_needed = true;
-        next = (kbd_evt_h + 1) % KBD_Q_SIZE;
-    }
+
+    if (next == dev_consumer.tail)
+        kbd_consumer_mark_resync(&dev_consumer, next);
+    if (next == con_consumer.tail)
+        kbd_consumer_mark_resync(&con_consumer, next);
+
     kbd_evt_q[kbd_evt_h].code = code;
     kbd_evt_q[kbd_evt_h].down = down ? 1 : 0;
     kbd_evt_h = next;
 }
 
-/* Сверить то, что знает потребитель, с авторитетным g_keyboard. */
-static void kbd_queue_resync_locked(void) {
-    kbd_sync_needed = false;
-    for (int k = 0; k < KEY_MAX; k++) {
-        bool want = g_keyboard.down[k] ? true : false;
-        if (want != kbd_sent_down[k])
-            kbd_event_push_locked((uint8_t)k, want);
+/* Попросить потребителя заново сличить свою тень с g_keyboard.
+   Вызывается при открытии устройства, смене KDSKBMODE, hotplug. */
+static void kbd_consumer_request_resync(kbd_consumer_t *c) {
+    /* Отбрасываем непрочитанную историю: она устарела (кольцо PTY только
+       что очистили, сменился KDSKBMODE, открыто устройство). Иначе старый
+       UP, доставшийся из очереди ПОСЛЕ корректирующих событий, снова
+       перебил бы правильное состояние и вернул залипший/сброшенный Shift. */
+    kbd_consumer_mark_resync(c, kbd_evt_h);
+}
+
+/* Сверить то, что знает потребитель, с авторитетным g_keyboard.
+   Возвращает true, если в *e положено очередное корректирующее событие.
+   Вызывается порциями, чтобы read(fd, buf, 1) не получал весь массив сразу. */
+static bool kbd_consumer_resync_next_locked(kbd_consumer_t *c, kbd_event_rec_t *e) {
+    if (!c->sync_needed) return false;
+
+    for (;;) {
+        if (c->sync_phase == KBD_RESYNC_MOD_UP) {
+            if (c->sync_cursor < KBD_RESYNC_MOD_COUNT) {
+                /* kbd_resync_mods не содержит Caps/Num/Scroll, поэтому
+                   синтетический UP безопасен и снимает залипший Shift. */
+                e->code = kbd_resync_mods[c->sync_cursor++];
+                e->down = 0;
+                return true;
+            }
+            c->sync_phase = KBD_RESYNC_MOD_DOWN;
+            c->sync_cursor = 0;
+            continue;
+        }
+
+        if (c->sync_phase == KBD_RESYNC_MOD_DOWN) {
+            if (c->sync_cursor < KBD_RESYNC_MOD_COUNT) {
+                uint8_t k = kbd_resync_mods[c->sync_cursor++];
+                if (g_keyboard.down[k]) {
+                    e->code = k;
+                    e->down = 1;
+                    return true;
+                }
+                continue;
+            }
+            c->sync_phase = KBD_RESYNC_DIFF;
+            c->sync_cursor = 0;
+            continue;
+        }
+
+        if (c->sync_phase == KBD_RESYNC_DIFF) {
+            while (c->sync_cursor < KEY_MAX) {
+                uint8_t k = (uint8_t)(c->sync_cursor++);
+                bool want = g_keyboard.down[k] ? true : false;
+                if (want != c->sent_down[k]) {
+                    e->code = k;
+                    e->down = want ? 1 : 0;
+                    return true;
+                }
+            }
+        }
+
+        c->sync_needed = false;
+        c->sync_phase  = KBD_RESYNC_NONE;
+        c->sync_cursor = 0;
+        return false;
     }
 }
 
@@ -525,8 +621,10 @@ static void key_state_apply(uint64_t keycode, bool down) {
 
     bool was = g_keyboard.down[keycode] ? true : false;
     if (was == down) {
-        /* Авто-повтор. Но если состояние испортилось где-то ещё —
-           оно уже совпадает, так что просто синхронизируем флаг Shift. */
+        /* Авто-повтор/подтверждение состояния (USB HID шлёт полный набор
+           клавиш в каждом репорте). ОБЯЗАТЕЛЬНО обновляем производный
+           флаг Shift: если он разошёлся с down[] из-за любого сбоя,
+           здесь он снова становится консистентным. */
         g_keyboard.shift_pressed =
             g_keyboard.down[KEY_LSHIFT] || g_keyboard.down[KEY_RSHIFT];
         spin_unlock_irqrestore(&kbd_state_lock, flags);
@@ -559,6 +657,69 @@ void inout_set_key_state(uint64_t keycode, bool down) {
     key_state_apply(keycode, down);
 }
 
+/* Преобразовать событие (keycode, down) в 1 или 2 байта PS/2 set 1.
+   Возвращает длину. Общая для /dev/kbd и консольного PTY: оба потребителя
+   обязаны кодировать отпускание ОДИНАКОВО, иначе Shift «залипнет» у того,
+   кто получит не тот байт. */
+static uint8_t kbd_event_to_bytes(const kbd_event_rec_t *e, uint8_t out[2]) {
+    uint8_t sc = e->code;
+    if (sc >= KEY_EXT_BASE) {
+        uint8_t ext = kbd_ext_scancode(sc);
+        if (!ext) return 0;
+        out[0] = 0xE0;
+        out[1] = (uint8_t)(ext | (e->down ? 0 : 0x80));
+        return 2;
+    }
+    out[0] = (uint8_t)(sc | (e->down ? 0 : 0x80));
+    return 1;
+}
+
+/* Забрать следующее событие для консольного PTY. Возвращает false, если
+   событий нет. Сначала отдаём корректирующие события ресинхронизации,
+   затем — основную очередь. Тень обновляется здесь же, под локом. */
+bool inout_console_pop_event(uint8_t *code, bool *down) {
+    if (!code || !down) return false;
+    uint64_t flags;
+    spin_lock_irqsave(&kbd_state_lock, &flags);
+
+    kbd_event_rec_t e;
+    if (kbd_consumer_resync_next_locked(&con_consumer, &e)) {
+        con_consumer.sent_down[e.code] = e.down != 0;
+        *code = e.code;
+        *down = e.down != 0;
+        spin_unlock_irqrestore(&kbd_state_lock, flags);
+        return true;
+    }
+    if (con_consumer.tail == kbd_evt_h) {
+        spin_unlock_irqrestore(&kbd_state_lock, flags);
+        return false;
+    }
+    e = kbd_evt_q[con_consumer.tail];
+    con_consumer.tail = (con_consumer.tail + 1) % KBD_Q_SIZE;
+    con_consumer.sent_down[e.code] = e.down != 0;
+    *code = e.code;
+    *down = e.down != 0;
+    spin_unlock_irqrestore(&kbd_state_lock, flags);
+    return true;
+}
+
+/* Конвертация для PTY в формат K_MEDIUMRAW. */
+uint8_t inout_console_scancode_bytes(uint8_t code, bool down, uint8_t out[2]) {
+    kbd_event_rec_t e = { .code = code, .down = down ? 1 : 0 };
+    return kbd_event_to_bytes(&e, out);
+}
+
+/* Попросить оба потребителя перечитать авторитетное состояние. Нужно при
+   смене KDSKBMODE и при (пере)подключении клавиатуры: потребитель мог
+   находиться в режиме OFF/XLATE и «не видеть» часть make/break. */
+void inout_keyboard_request_resync(void) {
+    uint64_t flags;
+    spin_lock_irqsave(&kbd_state_lock, &flags);
+    kbd_consumer_request_resync(&dev_consumer);
+    kbd_consumer_request_resync(&con_consumer);
+    spin_unlock_irqrestore(&kbd_state_lock, flags);
+}
+
 /* При открытии /dev/kbd потребитель считает все клавиши отпущенными.
    Обнуляем его «тень» и просим ресинхронизацию: kbd_dev_read() пришлёт
    DOWN для реально зажатых клавиш. Очередь НЕ очищаем — устройство могут
@@ -567,8 +728,8 @@ static int kbd_open(vfs_file_t *file) {
     (void)file;
     uint64_t flags;
     spin_lock_irqsave(&kbd_state_lock, &flags);
-    memset(kbd_sent_down, 0, sizeof(kbd_sent_down));
-    kbd_sync_needed = true;
+    memset(dev_consumer.sent_down, 0, sizeof(dev_consumer.sent_down));
+    kbd_consumer_request_resync(&dev_consumer);
     spin_unlock_irqrestore(&kbd_state_lock, flags);
     return 0;
 }
@@ -578,18 +739,10 @@ static int kbd_dev_read(void *buf, uint64_t count, uint32_t flags) {
 
     uint8_t *out = (uint8_t *)buf;
     uint64_t got = 0;
-    bool did_resync = false;
 
     for (;;) {
         uint64_t lf;
         spin_lock_irqsave(&kbd_state_lock, &lf);
-
-        /* Ресинхронизация один раз за read(): иначе при переполненной
-           очереди можно было бы бесконечно её перезаполнять. */
-        if (kbd_sync_needed && !did_resync) {
-            kbd_queue_resync_locked();
-            did_resync = true;
-        }
 
         /* Остаток события, не влезший в прошлый read(). */
         while (got < count && kbd_read_pos < kbd_read_len)
@@ -598,22 +751,19 @@ static int kbd_dev_read(void *buf, uint64_t count, uint32_t flags) {
             kbd_read_pos = kbd_read_len = 0;
 
         /* Отдаём столько ЦЕЛЫХ событий, сколько влезает в count. */
-        while (got < count && kbd_evt_t != kbd_evt_h) {
-            kbd_event_rec_t e = kbd_evt_q[kbd_evt_t];
-            kbd_evt_t = (kbd_evt_t + 1) % KBD_Q_SIZE;
-            kbd_sent_down[e.code] = e.down != 0;
-
-            uint8_t sc = e.code;
-            if (sc >= KEY_EXT_BASE) {
-                uint8_t ext = kbd_ext_scancode(sc);
-                if (!ext) continue;
-                kbd_read_buf[0] = 0xE0;
-                kbd_read_buf[1] = (uint8_t)(ext | (e.down ? 0 : 0x80));
-                kbd_read_len = 2;
-            } else {
-                kbd_read_buf[0] = (uint8_t)(sc | (e.down ? 0 : 0x80));
-                kbd_read_len = 1;
+        while (got < count) {
+            kbd_event_rec_t e;
+            bool from_resync = kbd_consumer_resync_next_locked(&dev_consumer, &e);
+            if (!from_resync) {
+                if (dev_consumer.tail == kbd_evt_h) break;
+                e = kbd_evt_q[dev_consumer.tail];
+                dev_consumer.tail = (dev_consumer.tail + 1) % KBD_Q_SIZE;
             }
+            dev_consumer.sent_down[e.code] = e.down != 0;
+
+            uint8_t n = kbd_event_to_bytes(&e, kbd_read_buf);
+            if (n == 0) continue;
+            kbd_read_len = n;
             kbd_read_pos = 0;
 
             while (got < count && kbd_read_pos < kbd_read_len)
@@ -627,6 +777,9 @@ static int kbd_dev_read(void *buf, uint64_t count, uint32_t flags) {
         spin_unlock_irqrestore(&kbd_state_lock, lf);
 
         if (got > 0) return (int)got;
+        /* Если за проход не удалось выдать ни байта, но ресинк ещё идёт
+           (например, все события дали n == 0), не крутимся вечно: следующий
+           read()/poll() продолжит с того же sync_cursor. */
         if (flags & VFS_O_NONBLOCK) return -EAGAIN;
         schedule_yield();
     }

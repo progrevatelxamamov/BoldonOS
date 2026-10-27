@@ -1237,7 +1237,23 @@ void handle_keyboard_report(struct usb_hid *hid) {
             cur_codes[cur_count++] = (uint8_t)kc;
     }
 
-    /* Сначала отпускаем исчезнувшие, затем подтверждаем нажатые. */
+    /* Сначала отпускаем исчезнувшие, затем подтверждаем нажатые.
+       ВАЖНО: репорт клавиатуры — это ПОЛНОЕ состояние её модификаторов.
+       Явно снимаем все 8 модификаторов, которых в репорте нет, даже если
+       этот hid их никогда не нажимал: на реальном железе BIOS часто
+       дублирует USB-клавиатуру через PS/2-эмуляцию (USB legacy support),
+       и залипший там Shift иначе нечему отпустить. inout_set_key_state()
+       сама игнорирует повторные UP, так что нормальная работа не меняется.
+       Допущение: одна физическая клавиатура, что и есть типичный случай. */
+    static const uint8_t hid_mod_codes[8] = {
+        KEY_LCTRL, KEY_LSHIFT, KEY_LALT, KEY_LGUI,
+        KEY_RCTRL, KEY_RSHIFT, KEY_RALT, KEY_RGUI
+    };
+    for (uint32_t i = 0; i < 8; i++) {
+        if (!(modifiers & (uint8_t)(1u << i)))
+            inout_set_key_state(hid_mod_codes[i], false);
+    }
+
     for (uint32_t i = 0; i < hid->active_keycode_count; i++) {
         uint8_t kc = hid->active_keycodes[i];
         bool still = false;
@@ -2123,15 +2139,30 @@ static uint8_t xhci_find_slot_by_port(xhci_controller_t *hc, uint8_t port) {
 static void xhci_disconnect_hid_devices(xhci_controller_t *hc, uint8_t slot_id) {
     struct usb_hid *hids[32];
     int n = 0;
+    bool keyboard_was_disconnected = false;
 
     for (int dci = 0; dci < 32; dci++) {
         struct usb_hid *hid = hc->hid_table[slot_id][dci];
         if (!hid) continue;
+
+        /* Клавиатуру отключили, пока был зажат Shift: репорт «все клавиши
+           отпущены» уже не придёт. Явно снимаем каждый ключ этого
+           устройства, иначе модификатор останется включённым навсегда. */
+        if (hid->protocol == 1) {
+            for (uint32_t i = 0; i < hid->active_keycode_count; i++)
+                inout_set_key_state(hid->active_keycodes[i], false);
+            hid->active_keycode_count = 0;
+            keyboard_was_disconnected = true;
+        }
+
         hid->disconnected = 1;
         hc->hid_table[slot_id][dci] = NULL;
         hids[n++] = hid;
     }
     if (n == 0) return;
+
+    /* Один ресинк на всё отключение, а не на каждый интерфейс. */
+    if (keyboard_was_disconnected) inout_keyboard_request_resync();
 
     for (uint32_t wait = 0; wait < 300000; wait++) {
         bool stopped = true;

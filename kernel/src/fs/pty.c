@@ -347,6 +347,11 @@ static int pty_ioctl(vfs_file_t *file, uint64_t request, void *arg) {
         int mode = (int)(uint64_t)arg;
         if (mode < PTY_KBD_RAW || mode > PTY_KBD_OFF) return -EINVAL;
         p->kbd_mode = mode;
+        /* Потребитель сменил режим (обычно Nano-X ставит K_MEDIUMRAW).
+           Его внутренняя тень модификаторов теперь неизвестна ядру —
+           принудительно пересылаем полное состояние, иначе залипший Shift
+           из предыдущего режима останется навсегда. */
+        inout_keyboard_request_resync();
         return 0;
     }
 
@@ -617,6 +622,9 @@ static void pty_input_mode_sync(void) {
         graphics_active = now_active;
         memset(&ptys[0].in, 0, sizeof(pty_ring_t));
         if (!now_active) ptys[0].kbd_mode = PTY_KBD_XLATE;
+        /* Кольцо только что очищено: все ещё непрочитанные make/break
+           потеряны. Восстанавливаем состояние у потребителей. */
+        inout_keyboard_request_resync();
     }
 }
 
