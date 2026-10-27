@@ -18,9 +18,13 @@
 
 static const wifi_driver_info_t *g_drivers[MAX_WIFI_DRIVERS];
 static int g_driver_count = 0;
+static volatile bool g_drivers_ready = false;
 
 static wifi_device_t *g_devices = NULL;
-static volatile bool g_wifi_booted = false;
+/* Раньше один и тот же флаг означал "таск запущен" и "загрузка выполнена":
+   wifi_start_boot_task() выставлял его, а wifi_boot_all() сразу же
+   выходил — прошивка не загружалась никогда. */
+static volatile bool g_boot_task_started = false;
 
 void wifi_register_driver(const wifi_driver_info_t *info) {
     if (!info || g_driver_count >= MAX_WIFI_DRIVERS) return;
@@ -31,6 +35,11 @@ void wifi_register_driver(const wifi_driver_info_t *info) {
 }
 
 const wifi_driver_info_t *wifi_match_driver(uint16_t vid, uint16_t pid) {
+    /* xHCI может найти адаптер ДО того, как ядро вызвало
+       wifi_subsystem_init(). Регистрируем драйверы лениво, иначе
+       VID:PID просто не найдётся и адаптер "не определяется". */
+    if (!g_drivers_ready) wifi_subsystem_init();
+
     for (int i = 0; i < g_driver_count; i++) {
         if (g_drivers[i]->vid == vid && g_drivers[i]->pid == pid)
             return g_drivers[i];
@@ -41,6 +50,9 @@ const wifi_driver_info_t *wifi_match_driver(uint16_t vid, uint16_t pid) {
 void wifi_subsystem_init(void) {
     /* Драйверы сами зовут wifi_register_driver() из своих wifi_driver_init()
        или мы зовём rtl8192eu_driver_register() отсюда */
+    if (g_drivers_ready) return;
+    g_drivers_ready = true;
+
     extern void rtl8192eu_driver_register(void);
     rtl8192eu_driver_register();
 
@@ -66,7 +78,11 @@ int wifi_probe_register_eps(xhci_controller_t *hc, uint8_t slot_id, uint8_t spee
 {
     const wifi_driver_info_t *drv = wifi_match_driver(vid, pid);
     if (!drv) {
-        console_print_string("[Wi-Fi] No driver for VID:PID\n");
+        console_print_string("[Wi-Fi] No driver for VID=");
+        console_print_hex(vid);
+        console_print_string(" PID=");
+        console_print_hex(pid);
+        console_print_string("\n");
         return -1;
     }
 
@@ -140,15 +156,8 @@ uint8_t *firmware_load_file(const char *path, size_t *out_size) {
     if (out_size) *out_size = 0;
     if (!path || !path[0]) return NULL;
 
-    console_print_string("[FW] Loading ");
-    console_print_string(path);
-    console_print_string("\n");
-
     vfs_file_t *f = vfs_open(path, VFS_O_READ);
-    if (!f) {
-        console_print_string("[FW] not found\n");
-        return NULL;
-    }
+    if (!f) return NULL;
 
     vfs_stat_t st;
     if (vfs_stat(path, &st) < 0 || st.size == 0) {
@@ -217,10 +226,33 @@ static void wifi_msleep(uint32_t ms) {
         schedule_yield();
 }
 
-void wifi_boot_all(void) {
-    if (g_wifi_booted) return;
+/* В разных дистрибутивах fw лежит в разных местах. */
+static const char *wifi_fw_paths[] = {
+    "/lib/firmware/rtlwifi/rtl8192eu_nic.bin",
+    "/lib/firmware/rtl8192eufw.bin",
+    "/lib/firmware/rtl8192eu_nic.bin",
+    "/usr/lib/firmware/rtlwifi/rtl8192eu_nic.bin",
+    NULL
+};
 
-    console_print_string("[Wi-Fi] Boot: loading modules & firmware...\n");
+static uint8_t *wifi_load_firmware(const char *preferred, size_t *out_len) {
+    if (preferred && preferred[0]) {
+        uint8_t *fw = firmware_load_file(preferred, out_len);
+        if (fw) return fw;
+    }
+    for (int i = 0; wifi_fw_paths[i]; i++) {
+        uint8_t *fw = firmware_load_file(wifi_fw_paths[i], out_len);
+        if (fw) return fw;
+    }
+    return NULL;
+}
+
+void wifi_boot_all(void) {
+    static bool boot_logged = false;
+    if (!boot_logged) {
+        console_print_string("[Wi-Fi] Boot: loading modules & firmware...\n");
+        boot_logged = true;
+    }
 
     for (wifi_device_t *dev = g_devices; dev; dev = dev->next) {
         if (dev->state != WIFI_STATE_PROBED) continue;
@@ -230,11 +262,9 @@ void wifi_boot_all(void) {
         }
 
         size_t fw_len = 0;
-        uint8_t *fw = NULL;
-        if (dev->fw_path[0])
-            fw = firmware_load_file(dev->fw_path, &fw_len);
+        uint8_t *fw = wifi_load_firmware(dev->fw_path, &fw_len);
 
-        if (dev->fw_path[0] && !fw)
+        if (!fw)
             continue;
 
         int r = dev->ops->init(dev, fw, fw_len);
@@ -263,25 +293,32 @@ void wifi_boot_all(void) {
         console_print_string(" ready (disconnected)\n");
     }
 
-    console_print_string("[Wi-Fi] Boot done.\n");
+    bool pending = false;
+    for (wifi_device_t *dev = g_devices; dev; dev = dev->next)
+        if (dev->state == WIFI_STATE_PROBED) pending = true;
+
+    static bool done_logged = false;
+    if (!pending && !done_logged) {
+        console_print_string("[Wi-Fi] Boot done.\n");
+        done_logged = true;
+    }
 }
 
 static void wifi_boot_task(void *arg) {
     (void)arg;
-    for (int attempt = 0; attempt < 120; attempt++) {
-        wifi_boot_all();
+    /* Ждём и прошивку, и устройства, подключённые позже (hotplug). */
+    for (;;) {
         bool pending = false;
         for (wifi_device_t *dev = g_devices; dev; dev = dev->next) {
             if (dev->state == WIFI_STATE_PROBED) pending = true;
         }
-        if (!pending) break;
+        if (pending) wifi_boot_all();
         wifi_msleep(500);
     }
-    for (;;) schedule_yield();
 }
 
 void wifi_start_boot_task(void) {
-    if (g_wifi_booted) return;
-    g_wifi_booted = true;
+    if (g_boot_task_started) return;
+    g_boot_task_started = true;
     create_task_kernel_arg((void *)wifi_boot_task, 0, "wifi-boot");
 }

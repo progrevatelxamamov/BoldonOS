@@ -629,23 +629,34 @@ static const wifi_ops_t rtl8192eu_ops = {
     .send_frame = rtl_send,
 };
 
-static const wifi_driver_info_t rtl8192eu_tplink = {
-    .vid = 0x2357,
-    .pid = 0x0107,
-    .name = "TP-Link (RTL8192EU)",
-    .fw_path = "/lib/firmware/rtlwifi/rtl8192eu_nic.bin",
-    .ops = &rtl8192eu_ops,
-};
-
-static const wifi_driver_info_t rtl8192eu_realtek = {
-    .vid = 0x0BDA,
-    .pid = 0x818B,
-    .name = "Realtek RTL8192EU",
-    .fw_path = "/lib/firmware/rtlwifi/rtl8192eu_nic.bin",
-    .ops = &rtl8192eu_ops,
+/* Полный список USB ID RTL8192EU (как в Linux rtl8xxxu): адаптеры
+   TP-Link / D-Link / Mercusys / Realtek часто отличаются только PID. */
+static const wifi_driver_info_t rtl8192eu_devices[] = {
+    { .vid = 0x2357, .pid = 0x0107, .name = "TP-Link TL-WN821N v5/v6 (RTL8192EU)",
+      .fw_path = "/lib/firmware/rtlwifi/rtl8192eu_nic.bin", .ops = &rtl8192eu_ops },
+    { .vid = 0x2357, .pid = 0x0108, .name = "TP-Link TL-WN822N v4 (RTL8192EU)",
+      .fw_path = "/lib/firmware/rtlwifi/rtl8192eu_nic.bin", .ops = &rtl8192eu_ops },
+    { .vid = 0x2357, .pid = 0x0109, .name = "TP-Link (RTL8192EU)",
+      .fw_path = "/lib/firmware/rtlwifi/rtl8192eu_nic.bin", .ops = &rtl8192eu_ops },
+    { .vid = 0x2357, .pid = 0x0126, .name = "TP-Link TL-WN8200ND v2 (RTL8192EU)",
+      .fw_path = "/lib/firmware/rtlwifi/rtl8192eu_nic.bin", .ops = &rtl8192eu_ops },
+    { .vid = 0x0BDA, .pid = 0x818B, .name = "Realtek RTL8192EU",
+      .fw_path = "/lib/firmware/rtlwifi/rtl8192eu_nic.bin", .ops = &rtl8192eu_ops },
+    { .vid = 0x0BDA, .pid = 0x818C, .name = "Realtek RTL8192EU (default ID)",
+      .fw_path = "/lib/firmware/rtlwifi/rtl8192eu_nic.bin", .ops = &rtl8192eu_ops },
+    { .vid = 0x2001, .pid = 0x3319, .name = "D-Link DWA-131 E1 (RTL8192EU)",
+      .fw_path = "/lib/firmware/rtlwifi/rtl8192eu_nic.bin", .ops = &rtl8192eu_ops },
+    { .vid = 0x2001, .pid = 0x3312, .name = "D-Link DWA-131 C1 (RTL8192EU)",
+      .fw_path = "/lib/firmware/rtlwifi/rtl8192eu_nic.bin", .ops = &rtl8192eu_ops },
+    { .vid = 0x2019, .pid = 0xAB33, .name = "RTL8192EU (2019:AB33)",
+      .fw_path = "/lib/firmware/rtlwifi/rtl8192eu_nic.bin", .ops = &rtl8192eu_ops },
+    { .vid = 0x2C4E, .pid = 0x0100, .name = "Mercusys MW300UM (RTL8192EU)",
+      .fw_path = "/lib/firmware/rtlwifi/rtl8192eu_nic.bin", .ops = &rtl8192eu_ops },
+    { .vid = 0x2C4E, .pid = 0x0104, .name = "Mercusys MW300UH (RTL8192EU)",
+      .fw_path = "/lib/firmware/rtlwifi/rtl8192eu_nic.bin", .ops = &rtl8192eu_ops },
 };
 
 void rtl8192eu_driver_register(void) {
-    wifi_register_driver(&rtl8192eu_tplink);
-    wifi_register_driver(&rtl8192eu_realtek);
+    for (size_t i = 0; i < sizeof(rtl8192eu_devices) / sizeof(rtl8192eu_devices[0]); i++)
+        wifi_register_driver(&rtl8192eu_devices[i]);
 }

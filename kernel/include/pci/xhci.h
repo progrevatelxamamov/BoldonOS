@@ -51,6 +51,9 @@ typedef struct {
     uint64_t dcbaa_phys;
     volatile uint32_t evt_lock;
     volatile uint32_t cmd_lock;
+    /* Сериализует всю команду (постановку в кольцо + ожидание события).
+       Без этого несколько задач берут чужие command completion events. */
+    volatile uint32_t cmd_exec_lock;
     volatile uint32_t ep_lock[MAX_XHCI_SLOTS][32];
     volatile uint32_t ep0_lock[MAX_XHCI_SLOTS];
     uint8_t  bus;
@@ -198,6 +201,9 @@ struct usb_hid {
     volatile uint8_t pending;
     volatile uint8_t halted;
     volatile uint8_t report_ready;
+    /* Hotplug: устройство отключено, задача должна освободить ресурсы и уснуть. */
+    volatile uint8_t disconnected;
+    volatile uint8_t stopped;
     bool     boot_protocol_active;
     bool     report_protocol_active;
     bool     has_input_report_id;
@@ -257,8 +263,14 @@ struct usb_hid {
 #define XHCI_PORTSC_PP         (1u << 9)
 #define XHCI_PORTSC_CSC        (1u << 17)
 #define XHCI_PORTSC_PEC        (1u << 18)
+#define XHCI_PORTSC_OCC        (1u << 20)
 #define XHCI_PORTSC_PRC        (1u << 21)
 #define XHCI_PORTSC_PRESERVE_MASK (XHCI_PORTSC_PP)
+/* Write-1-to-clear биты PORTSC. Их обязательно сбрасывать и на
+   отключении, иначе CSC остаётся в 1 и контроллер не пришлёт новое
+   Port Status Change Event при следующем подключении. */
+#define XHCI_PORTSC_CHANGE_MASK (XHCI_PORTSC_CSC | XHCI_PORTSC_PEC | \
+                                 XHCI_PORTSC_OCC | XHCI_PORTSC_PRC)
 
 static const char *usb_get_vendor_name(uint16_t vid) {
     int low = 0;

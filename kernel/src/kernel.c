@@ -142,6 +142,9 @@ void kstart(bootloader_t blinfo) {
     scheduler_init();
     time_init();
     tcpip_init(NULL, NULL);
+    /* Драйверы Wi-Fi должны быть зарегистрированы ДО pci_init():
+       xhci_init() сразу перечисляет порты и ищет VID:PID в реестре. */
+    wifi_subsystem_init();
     pci_init();
 
     partitions_level_init();
