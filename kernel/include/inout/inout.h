@@ -239,4 +239,13 @@ void update_keyboard_leds(void);
    меняется только здесь, больше никто его не трогает. */
 void inout_set_key_state(uint64_t keycode, bool down);
 
+/* Авторитетный поток событий для консольного PTY (K_MEDIUMRAW / XLATE).
+   Раньше init_runner.c сам опрашивал g_keyboard.down[] со своей тенью
+   prev_down[]: это был второй конечный автомат, который терял break и
+   оставлял Shift залипшим в Nano-X. Теперь он читает ту же очередь, что
+   и /dev/kbd, с собственной ресинхронизацией. */
+bool     inout_console_pop_event(uint8_t *code, bool *down);
+uint8_t  inout_console_scancode_bytes(uint8_t code, bool down, uint8_t out[2]);
+void     inout_keyboard_request_resync(void);
+
 #endif

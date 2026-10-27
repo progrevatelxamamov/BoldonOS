@@ -8,11 +8,13 @@
 
 static bool extended = false;
 static bool in_pause  = false;
+static uint8_t pause_bytes = 0;   /* сколько байт уже проглотили в E1-последовательности */
 static bool ps2_kbd_present = false;
 
 void ps2kbd_init(void) {
     extended = false;
     in_pause  = false;
+    pause_bytes = 0;
 
     if (ps2_write_kbd(0xF4)) {
         uint8_t resp = ps2_read_byte();
@@ -51,7 +53,17 @@ void ps2kbd_set_leds(uint8_t leds) {
 
 static int translate(uint8_t sc, bool *is_release) {
     *is_release = (sc & 0x80) != 0;
-    if (sc == 0xAA || sc == 0xFA || sc == 0xEE || sc == 0xFC) return -1;
+
+    /* 0xFA=ACK, 0xEE=Echo, 0xFC=BAT-fail — ответы устройства на команды.
+       ВАЖНО: 0xAA сюда НЕ входит. 0xAA приходит и как "BAT passed" сразу
+       после RESET (один раз, на инициализации), НО в обычном потоке IRQ это
+       break-код ЛЕВОГО SHIFT (0x2A | 0x80). Раньше он отбрасывался вместе
+       с ответами, отпускание Shift терялось и модификатор "залипал" навсегда:
+       один make 0x2A без парного break 0xAA. */
+    if (sc == 0xFA || sc == 0xEE || sc == 0xFC) {
+        extended = false;   /* не даём ответу устройства "залипнуть" префикс */
+        return -1;
+    }
     uint8_t code = sc & 0x7F;
 
     if (extended) {
@@ -78,15 +90,25 @@ static int translate(uint8_t sc, bool *is_release) {
         }
     }
 
-    if (code >= 0x80) return -1;
+    /* code == 0 не бывает (это ложное срабатывание при переполнении).
+       Намеренно НЕ обрезаем code > 0x58: одиночные multimedia/ACPI
+       сканкоды 0x5E..0x7F должны доходить до inout, а ответы устройства
+       (ACK/Echo/BAT-fail) уже отфильтрованы выше по полному байту. */
+    if (code == 0) return -1;
     return (int)code;
 }
 
 void ps2kbd_feed(uint8_t byte) {
     if (byte == 0xE0) { extended = true; return; }
-    if (byte == 0xE1) { in_pause = true; return; }
+    if (byte == 0xE1) { in_pause = true; pause_bytes = 0; return; }
     if (in_pause) {
-        if (byte == 0xC5) in_pause = false;
+        /* Pause/Break даёт E1 1D 45 E1 9D C5. Если хвост C5 потерялся,
+           раньше in_pause оставался TRUE навсегда и клавиатура "умирала":
+           все последующие сканкоды молча глотались. Ограничиваем длину. */
+        if (byte == 0xC5 || ++pause_bytes >= 6) {
+            in_pause = false;
+            pause_bytes = 0;
+        }
         return;
     }
 

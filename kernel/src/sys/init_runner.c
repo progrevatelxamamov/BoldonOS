@@ -8,47 +8,65 @@
 #include <inout/inout.h>
 
 static void pty_input_task(void) {
-    static bool prev_down[KEY_MAX];
-    memset(prev_down, 0, sizeof(prev_down));
-
     while (1) {
-        int kbd_mode = pty_console_kbd_mode();
-        for (int k = 0; k < KEY_MAX; k++) {
-            bool now = g_keyboard.down[k];
+        uint8_t code;
+        bool down;
+
+        /* Берём события из ЕДИНОГО авторитетного потока inout.
+           Раньше здесь был опрос g_keyboard.down[] с локальной тенью
+           prev_down[] — второй конечный автомат модификаторов. Если break
+           терялся (переполнение, смена KDSKBMODE, g_keyboard уже испорчен
+           PS/2-парсером), Nano-X навсегда оставался с залипшим Shift. */
+        /* Не более пачки за проход: при автоповторе поток может быть
+           бесконечным, и задача не должна монополизировать CPU. */
+        int budget = 64;
+        while (budget-- > 0 && inout_console_pop_event(&code, &down)) {
+            int kbd_mode = pty_console_kbd_mode();
+            if (kbd_mode == PTY_KBD_OFF) continue;
+
             if (kbd_mode == PTY_KBD_MEDIUMRAW || kbd_mode == PTY_KBD_RAW) {
-                if (now != prev_down[k] && k < KEY_EXT_BASE)
-                    pty_feed_scancode((uint8_t)(now ? k : (k | 0x80)));
-            } else if (kbd_mode != PTY_KBD_OFF && now && !prev_down[k]) {
-                bool shift = g_keyboard.shift_pressed;
-                bool caps  = g_keyboard.caps_lock;
-                bool ctrl  = g_keyboard.down[KEY_RCTRL] || g_keyboard.down[KEY_LCTRL];
+                uint8_t bytes[2];
+                uint8_t n = inout_console_scancode_bytes(code, down, bytes);
+                for (uint8_t i = 0; i < n; i++)
+                    pty_feed_scancode(bytes[i]);
+                continue;
+            }
 
-                if (k == KEY_ENTER)          pty_feed_input('\n');
-                else if (k == KEY_BACKSPACE) pty_feed_input('\b');
-                else if (k == KEY_TAB)       pty_feed_input('\t');
-                else if (k == KEY_SPACE)     pty_feed_input(' ');
-                else {
-                    char c = 0;
-                    if (keymap_caps[k]) {
-                        bool upper = shift ^ caps;
-                        c = upper ? keymap_caps[k] : keymap_normal[k];
-                    } else if (shift && keymap_shift[k]) {
-                        c = keymap_shift[k];
-                    } else {
-                        c = keymap_normal[k];
-                    }
+            /* XLATE / UNICODE: символ выдаём только на НАЖАТИЕ.
+               code имеет тип uint8_t, а KEY_MAX == 256 — проверка
+               'code >= KEY_MAX' всегда ложна, она не нужна. */
+            if (!down) continue;
 
-                    if (c) {
-                        // Обработка Ctrl+Буква (Ctrl+C = 0x03, Ctrl+D = 0x04, Ctrl+L = 0x0C, и т.д.)
-                        if (ctrl) {
-                            if (c >= 'a' && c <= 'z') c = c - 'a' + 1;
-                            else if (c >= 'A' && c <= 'Z') c = c - 'A' + 1;
-                        }
-                        pty_feed_input(c);
+            bool shift = g_keyboard.shift_pressed;
+            bool caps  = g_keyboard.caps_lock;
+            bool ctrl  = g_keyboard.down[KEY_RCTRL] || g_keyboard.down[KEY_LCTRL];
+
+            if (code == KEY_ENTER)          pty_feed_input('\n');
+            else if (code == KEY_BACKSPACE) pty_feed_input('\b');
+            else if (code == KEY_TAB)       pty_feed_input('\t');
+            else if (code == KEY_SPACE)     pty_feed_input(' ');
+            else {
+                char c = 0;
+                if (keymap_caps[code]) {
+                    /* Ровно та же формула, что и в key_to_ascii():
+                       Shift XOR Caps для БУКВ, но не для ЦИФР. */
+                    bool upper = shift ^ caps;
+                    c = upper ? keymap_caps[code] : keymap_normal[code];
+                } else if (shift && keymap_shift[code]) {
+                    c = keymap_shift[code];
+                } else {
+                    c = keymap_normal[code];
+                }
+
+                if (c) {
+                    // Ctrl+Буква (Ctrl+C = 0x03, Ctrl+D = 0x04, Ctrl+L = 0x0C, ...)
+                    if (ctrl) {
+                        if (c >= 'a' && c <= 'z') c = c - 'a' + 1;
+                        else if (c >= 'A' && c <= 'Z') c = c - 'A' + 1;
                     }
+                    pty_feed_input(c);
                 }
             }
-            prev_down[k] = now;
         }
         schedule_yield();
     }
