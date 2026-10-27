@@ -14,6 +14,7 @@
 #include <scheduler/scheduler.h>
 #include <inout/inout.h>
 #include <cpu/apic.h>
+#include <cpu/time.h>
 #include <net/wifi.h>
 
 extern int init_rtl8192eu_wifi(xhci_controller_t *hc, uint8_t slot_id, uint8_t speed, uint8_t ep_in, uint8_t ep_out, uint16_t mps);
@@ -21,6 +22,9 @@ extern int init_rtl8192eu_wifi(xhci_controller_t *hc, uint8_t slot_id, uint8_t s
 void handle_keyboard_report(struct usb_hid *hid);
 void handle_mouse_report(struct usb_hid *hid);
 void handle_port_connect(xhci_controller_t *hc, uint8_t port);
+void handle_port_disconnect(xhci_controller_t *hc, uint8_t port);
+static void xhci_ack_port_changes(volatile uint8_t *portsc_reg);
+static uint8_t xhci_find_slot_by_port(xhci_controller_t *hc, uint8_t port);
 
 static xhci_controller_t *g_xhci_list[MAX_XHCI_CONTROLLERS];
 static int g_xhci_count = 0;
@@ -198,7 +202,7 @@ void xhci_poll(xhci_controller_t *hc) {
                 evtq_push(&hc->transfer_evt_q[slot][dci], &evt);
 
                 struct usb_hid *hid = hc->hid_table[slot][dci];
-                if (hid) {
+                if (hid && !hid->disconnected) {
                     if (code == 1 || code == 13) {
                         uint32_t residual = evt.status & 0x00FFFFFFu;
                         if (residual <= hid->report_size)
@@ -254,32 +258,61 @@ int xhci_wait_event(xhci_controller_t *hc, uint8_t expected_type, struct xhci_tr
     return xhci_wait_cmd(hc, out_evt);
 }
 
-void xhci_set_tr_dequeue(xhci_controller_t *hc, uint8_t slot_id, uint8_t dci, uint64_t ring_phys, uint8_t cycle) {
+/* Одна команда = один владелец cmd_exec_lock.
+   Раньше несколько задач могли одновременно поставить команды в кольцо и
+   потом забрать чужие Command Completion Events из общей очереди. Из-за этого
+   после переподключения мыши ENABLE_SLOT/ADDRESS_DEVICE получали ответ не от
+   своей команды (вплоть до неверного slot_id). */
+static void xhci_cmd_exec_lock(xhci_controller_t *hc) {
+    while (__sync_lock_test_and_set(&hc->cmd_exec_lock, 1)) {
+        schedule_yield_safe();
+        __asm__ volatile("pause");
+    }
+}
+
+static void xhci_cmd_exec_unlock(xhci_controller_t *hc) {
+    __sync_lock_release(&hc->cmd_exec_lock);
+}
+
+static int xhci_submit_command(xhci_controller_t *hc,
+                               uint64_t param, uint32_t status,
+                               uint32_t control_no_cycle,
+                               struct xhci_trb *out_evt)
+{
+    struct xhci_trb evt;
+    memset(&evt, 0, sizeof(evt));
+
+    xhci_cmd_exec_lock(hc);
+    evtq_drain(&hc->cmd_evt_q);
+
     uint8_t cyc;
     struct xhci_trb *trb = cmd_ring_enqueue(hc, &cyc);
-    trb->param = ring_phys | (cycle & 1);
-    trb->status = 0;
-    trb->control = (TRB_SET_TR_DEQUEUE << 10) | ((uint32_t)dci << 16) | ((uint32_t)slot_id << 24) | cyc;
+    trb->param   = param;
+    trb->status  = status;
+    trb->control = control_no_cycle | cyc;
 
     __asm__ volatile("mfence" ::: "memory");
     hc->db_regs[0] = 0;
 
+    int res = xhci_wait_cmd(hc, &evt);
+    xhci_cmd_exec_unlock(hc);
+
+    if (out_evt) *out_evt = evt;
+    return res;
+}
+
+void xhci_set_tr_dequeue(xhci_controller_t *hc, uint8_t slot_id, uint8_t dci, uint64_t ring_phys, uint8_t cycle) {
     struct xhci_trb evt;
-    xhci_wait_event(hc, 33, &evt);
+    xhci_submit_command(hc, ring_phys | (cycle & 1), 0,
+                        (TRB_SET_TR_DEQUEUE << 10) | ((uint32_t)dci << 16) |
+                        ((uint32_t)slot_id << 24), &evt);
 }
 
 void xhci_reset_endpoint(xhci_controller_t *hc, uint8_t slot_id, uint8_t dci) {
-    uint8_t cyc;
-    struct xhci_trb *trb = cmd_ring_enqueue(hc, &cyc);
-    trb->param = 0;
-    trb->status = 0;
-    trb->control = (TRB_RESET_ENDPOINT << 10) | ((uint32_t)dci << 16) | ((uint32_t)slot_id << 24) | cyc;
-
-    __asm__ volatile("mfence" ::: "memory");
-    hc->db_regs[0] = 0;
-
     struct xhci_trb evt;
-    xhci_wait_event(hc, 33, &evt);
+    xhci_submit_command(hc, 0, 0,
+                        (TRB_RESET_ENDPOINT << 10) | ((uint32_t)dci << 16) |
+                        ((uint32_t)slot_id << 24), &evt);
 }
 
 int xhci_control_transfer(xhci_controller_t *hc, uint8_t slot_id,
@@ -650,17 +683,10 @@ int xhci_configure_bulk_endpoints(xhci_controller_t *hc, usb_msd_t *msd,
     *(uint64_t *)&ep_in_ctx[2] = msd->bulk_in_ring_phys | 1u;
     ep_in_ctx[4] = mps;
 
-    uint8_t cyc;
-    struct xhci_trb *trb = cmd_ring_enqueue(hc, &cyc);
-    trb->param   = input_phys;
-    trb->status  = 0;
-    trb->control = (TRB_CONFIGURE_ENDPOINT << 10) | ((uint32_t)msd->slot_id << 24) | cyc;
-
-    __asm__ volatile("mfence" ::: "memory");
-    hc->db_regs[0] = 0;
-
     struct xhci_trb evt;
-    if (xhci_wait_event(hc, 33, &evt) != 0) {
+    if (xhci_submit_command(hc, input_phys, 0,
+                            (TRB_CONFIGURE_ENDPOINT << 10) |
+                            ((uint32_t)msd->slot_id << 24), &evt) != 0) {
         pmm_free_pages((void*)input_phys, 1);
         return -1;
     }
@@ -709,17 +735,10 @@ int xhci_configure_endpoints_multi(xhci_controller_t *hc, uint8_t slot_id,
     *(uint64_t *)&ep_in_ctx[2] = in_ring | 1u;
     ep_in_ctx[4] = mps;
 
-    uint8_t cyc;
-    struct xhci_trb *trb = cmd_ring_enqueue(hc, &cyc);
-    trb->param   = input_phys;
-    trb->status  = 0;
-    trb->control = (TRB_CONFIGURE_ENDPOINT << 10) | ((uint32_t)slot_id << 24) | cyc;
-
-    __asm__ volatile("mfence" ::: "memory");
-    hc->db_regs[0] = 0;
-
     struct xhci_trb evt;
-    if (xhci_wait_event(hc, 33, &evt) != 0) {
+    if (xhci_submit_command(hc, input_phys, 0,
+                            (TRB_CONFIGURE_ENDPOINT << 10) |
+                            ((uint32_t)slot_id << 24), &evt) != 0) {
         pmm_free_pages((void*)input_phys, 1);
         return -1;
     }
@@ -1447,6 +1466,16 @@ static void usb_hid_task(void *arg) {
     bool transfer_queued = false;
 
     for (;;) {
+        /* Нас отключили: больше не трогаем кольцо/endpoint'ы и отдаём
+           handle_port_disconnect'у возможность освободить память. */
+        if (hid->disconnected) {
+            hid->stopped = 1;
+            for (;;) {
+                task_sleep(get_current_process());
+                schedule_yield_safe();
+            }
+        }
+
         if (hid->halted) {
             xhci_reset_endpoint(hc, hid->slot_id, hid->dci);
             xhci_set_tr_dequeue(hc, hid->slot_id, hid->dci, hid->ring_phys, 1);
@@ -1553,17 +1582,10 @@ static bool xhci_configure_hid_endpoint(xhci_controller_t *hc, struct usb_hid *h
     *(uint64_t *)&ep_ctx[2] = hid->ring_phys | 1u;
     ep_ctx[4] = hid->mps;
 
-    uint8_t cyc;
-    struct xhci_trb *trb = cmd_ring_enqueue(hc, &cyc);
-    trb->param   = input_phys;
-    trb->status  = 0;
-    trb->control = (TRB_CONFIGURE_ENDPOINT << 10) | ((uint32_t)hid->slot_id << 24) | cyc;
-
-    __asm__ volatile("mfence" ::: "memory");
-    hc->db_regs[0] = 0;
-
     struct xhci_trb evt;
-    if (xhci_wait_event(hc, 33, &evt) != 0) {
+    if (xhci_submit_command(hc, input_phys, 0,
+                            (TRB_CONFIGURE_ENDPOINT << 10) |
+                            ((uint32_t)hid->slot_id << 24), &evt) != 0) {
         pmm_free_pages((void*)input_phys, 1);
         return false;
     }
@@ -1613,6 +1635,8 @@ static void init_usb_hid(xhci_controller_t *hc, uint8_t slot_id, uint8_t speed,
     hid->halted = 0;
     hid->report_ready = 0;
     hid->report_len = 0;
+    hid->disconnected = 0;
+    hid->stopped = 0;
     hid->led_probe_stage = 0;
 
     if (!xhci_configure_hid_endpoint(hc, hid)) {
@@ -1744,13 +1768,47 @@ void xhci_set_keyboard_leds(uint8_t leds) {
     }
 }
 
+/* Подстраховка на случай, если Port Status Change Event потерялся:
+   например адаптер/мышь воткнули до окончания инициализации контроллера
+   или CSC остался не подтверждённым. Раз в 200 мс сверяем состояние
+   портов с таблицей слотов. */
+static void xhci_rescan_ports(xhci_controller_t *hc) {
+    uint32_t hcsparams1 = xhci_read32(hc->cap_regs, 0x04);
+    uint8_t max_ports = (hcsparams1 >> 24) & 0xFF;
+    volatile uint8_t *port_base = hc->op_regs + 0x400;
+
+    for (uint8_t port = 1; port <= max_ports; port++) {
+        volatile uint8_t *reg = port_base + (port - 1) * 0x10;
+        uint32_t portsc = xhci_read32(reg, 0x00);
+        uint8_t slot = xhci_find_slot_by_port(hc, port);
+
+        if (portsc & XHCI_PORTSC_CSC) {
+            /* Реальная смена состояния (в т.ч. быстрая замена мыши).
+               CSC подтверждает сам handle_port_connect(). */
+            handle_port_connect(hc, port);
+        } else if ((portsc & XHCI_PORTSC_CCS) && !slot) {
+            handle_port_connect(hc, port);
+        } else if (!(portsc & XHCI_PORTSC_CCS) && slot) {
+            handle_port_disconnect(hc, port);
+        }
+    }
+}
+
 static void xhci_hotplug_task(void *arg) {
     xhci_controller_t *hc = (xhci_controller_t *)arg;
+    uint64_t last_rescan = 0;
+
     for (;;) {
         if (hc->port_change_head != hc->port_change_tail) {
             uint8_t port = hc->port_change_queue[hc->port_change_head];
             hc->port_change_head = (hc->port_change_head + 1) % 16;
             handle_port_connect(hc, port);
+        }
+
+        uint64_t now = get_monotonic_ms();
+        if (now - last_rescan >= 200) {
+            last_rescan = now;
+            xhci_rescan_ports(hc);
         }
         schedule_yield_safe();
     }
@@ -1765,6 +1823,12 @@ static void xhci_pool_task(void *arg) {
 }
 
 void parse_and_configure_device(xhci_controller_t *hc, uint8_t slot_id, uint8_t speed, uint16_t vid, uint16_t pid) {
+    console_print_string("[USB] device VID=");
+    console_print_hex(vid);
+    console_print_string(" PID=");
+    console_print_hex(pid);
+    console_print_string("\n");
+
     uint64_t temp_phys = (uint64_t)pmm_alloc_pages(1);
     struct usb_configuration_descriptor *cfg = (struct usb_configuration_descriptor *)phys_to_virt(temp_phys);
     memset(cfg, 0, 4096);
@@ -1783,9 +1847,17 @@ void parse_and_configure_device(xhci_controller_t *hc, uint8_t slot_id, uint8_t 
 
     uint16_t total_length = cfg->wTotalLength;
     uint8_t config_value = cfg->bConfigurationValue;
+    if (total_length < 9 || total_length > 16384) {
+        pmm_free_pages((void*)temp_phys, 1);
+        return;
+    }
     uint32_t full_pages = (total_length + 4095) / 4096;
 
     uint64_t full_phys = (uint64_t)pmm_alloc_pages(full_pages);
+    if (!full_phys) {
+        pmm_free_pages((void*)temp_phys, 1);
+        return;
+    }
     uint8_t *buffer = (uint8_t *)phys_to_virt(full_phys);
     memset(buffer, 0, full_pages * 4096);
 
@@ -1805,7 +1877,7 @@ void parse_and_configure_device(xhci_controller_t *hc, uint8_t slot_id, uint8_t 
     xhci_control_transfer(hc, slot_id, hc->ep0_ring[slot_id], &hc->ep0_enqueue[slot_id], &hc->ep0_cycle[slot_id], &set_cfg, 0, 0);
 
     uint8_t  cur_iface_class = 0, cur_iface_sub = 0, cur_iface_proto = 0, cur_iface_num = 0;
-    
+
     // Переменные для MSD и HID
     uint8_t  is_msd = 0, is_hid = 0;
     uint8_t  msd_ep_out = 0, msd_ep_in = 0; uint16_t msd_mps = 512;
@@ -1813,6 +1885,7 @@ void parse_and_configure_device(xhci_controller_t *hc, uint8_t slot_id, uint8_t 
     uint8_t  hid_proto = 0;
     uint16_t hid_report_desc_len = 0;
     bool msd_done = false;
+    bool is_hub = false;
 
     // Переменные для USB NET / Wi-Fi
     uint8_t  is_net = 0;
@@ -1821,11 +1894,19 @@ void parse_and_configure_device(xhci_controller_t *hc, uint8_t slot_id, uint8_t 
     uint8_t  net_ep_outs[4];
     uint8_t  net_ep_out_count = 0;
 
+    /* Для Wi-Fi адаптеров не полагаемся на класс интерфейса: у RTL8192EU
+       это Vendor Specific (0xFF), но драйвер известен по VID:PID.
+       Собираем ВСЕ bulk-эндпоинты конфигурации (в т.ч. из alt setting'ов). */
+    bool wifi_device = wifi_match_driver(vid, pid) != NULL;
+    uint8_t  all_bulk_in = 0, all_bulk_out[4];
+    uint8_t  all_bulk_out_count = 0;
+    uint16_t all_bulk_mps = 512;
+
     uint32_t offset = 0;
-    while (offset < total_length) {
+    while (offset + 2 <= total_length) {
         uint8_t len  = buffer[offset];
         uint8_t type = buffer[offset + 1];
-        if (len == 0) break;
+        if (len < 2 || offset + len > total_length) break;
 
         if (type == 0x04) {
             // Инициализируем предыдущие собранные MSD/HID
@@ -1852,43 +1933,61 @@ void parse_and_configure_device(xhci_controller_t *hc, uint8_t slot_id, uint8_t 
                 is_hid = 1;
                 hid_proto = cur_iface_proto;
             }
-            // Детект сети/Wi-Fi: CDC-ECM (0x02 или 0x0A) ИЛИ Vendor-Specific (Realtek, ASIX, TP-Link)
-            if (cur_iface_class == 0x02 || cur_iface_class == 0x0A || 
-               (cur_iface_class == 0xFF && (vid == 0x0BDA || vid == 0x0B95 || vid == 0x07AA || vid == 0x2357))) {
+            if (cur_iface_class == 0x09) is_hub = true;
+            // Детект сети/Wi-Fi: CDC-ECM (0x02 или 0x0A) ИЛИ Vendor-Specific
+            if (cur_iface_class == 0x02 || cur_iface_class == 0x0A ||
+                (cur_iface_class == 0xFF && wifi_device)) {
                 is_net = 1;
             }
 
         } else if (type == 0x21 && is_hid && len >= 9) {
             hid_report_desc_len = (uint16_t)buffer[offset + 7] |
                                   ((uint16_t)buffer[offset + 8] << 8);
-        } else if (type == 0x05) {
+        } else if (type == 0x05 && len >= 7) {
             struct usb_endpoint_descriptor *ep = (struct usb_endpoint_descriptor *)&buffer[offset];
             uint8_t attr = ep->bmAttributes & 0x03;
-            
-            if (attr == 2 && is_msd) {
-                if (ep->bEndpointAddress & 0x80) msd_ep_in  = ep->bEndpointAddress;
-                else                             msd_ep_out = ep->bEndpointAddress;
-                msd_mps = ep->wMaxPacketSize;
-            } else if (attr == 3 && is_hid) {
-                if (ep->bEndpointAddress & 0x80) {
-                    hid_ep_in   = ep->bEndpointAddress;
+            uint8_t addr = ep->bEndpointAddress;
+
+            if (attr == 2) {
+                /* Общий список bulk-эндпоинтов (для Wi-Fi). */
+                if (wifi_device) {
+                    if (addr & 0x80) {
+                        if (!all_bulk_in) {
+                            all_bulk_in = addr;
+                            all_bulk_mps = ep->wMaxPacketSize;
+                        }
+                    } else {
+                        bool seen = false;
+                        for (int k = 0; k < all_bulk_out_count; k++)
+                            if (all_bulk_out[k] == addr) { seen = true; break; }
+                        if (!seen && all_bulk_out_count < 4)
+                            all_bulk_out[all_bulk_out_count++] = addr;
+                    }
+                }
+                if (is_msd) {
+                    if (addr & 0x80) msd_ep_in  = addr;
+                    else             msd_ep_out = addr;
+                    msd_mps = ep->wMaxPacketSize;
+                } else if (is_net) {
+                    if (addr & 0x80) {
+                        net_ep_in  = addr;
+                        net_mps = ep->wMaxPacketSize;
+                    } else {
+                        net_ep_out = addr;
+                        bool seen = false;
+                        for (int k = 0; k < net_ep_out_count; k++)
+                            if (net_ep_outs[k] == addr) { seen = true; break; }
+                        if (!seen && net_ep_out_count < 4)
+                            net_ep_outs[net_ep_out_count++] = addr;
+                    }
+                }
+            } else if (attr == 3) {
+                if (is_hid && (addr & 0x80)) {
+                    hid_ep_in   = addr;
                     hid_mps     = ep->wMaxPacketSize;
                     hid_interval= ep->bInterval;
-                }
-            } 
-            // Собираем эндпоинты для Ethernet / Wi-Fi
-            else if (attr == 2 && is_net) {
-                if (ep->bEndpointAddress & 0x80) { 
-                    net_ep_in  = ep->bEndpointAddress; 
-                    net_mps = ep->wMaxPacketSize; 
-                } else { 
-                    net_ep_out = ep->bEndpointAddress; 
-                    if (net_ep_out_count < 4)
-                        net_ep_outs[net_ep_out_count++] = ep->bEndpointAddress;
-                }
-            } else if (attr == 3 && is_net) {
-                if (ep->bEndpointAddress & 0x80) { 
-                    net_ep_int = ep->bEndpointAddress; 
+                } else if (is_net && (addr & 0x80)) {
+                    net_ep_int = addr;
                 }
             }
         }
@@ -1902,14 +2001,48 @@ void parse_and_configure_device(xhci_controller_t *hc, uint8_t slot_id, uint8_t 
     } else if (is_hid && hid_ep_in) {
         init_usb_hid(hc, slot_id, speed, cur_iface_num, hid_proto, hid_ep_in, hid_mps, hid_interval, hid_report_desc_len);
     }
-    
-    /* Wi-Fi: только регистрация в подсистеме (FW потом) */
-    if ((vid == 0x2357 && pid == 0x0107) || (vid == 0x0BDA && pid == 0x818B)) {
-        if (net_ep_in && net_ep_out) {
-            wifi_probe_register_eps(hc, slot_id, speed, vid, pid,
-                                    net_ep_in, net_ep_outs, net_ep_out_count,
-                                    net_ep_int, net_mps);
+
+    if (is_hub) {
+        console_print_string("[USB] HUB detected VID=");
+        console_print_hex(vid);
+        console_print_string(" PID=");
+        console_print_hex(pid);
+        console_print_string(": devices behind an external hub are NOT enumerated; "
+                             "plug the adapter into a motherboard USB port\n");
+    }
+
+    /* Wi-Fi: только регистрация в подсистеме (FW потом). */
+    if (wifi_device) {
+        uint8_t  ep_in  = all_bulk_in  ? all_bulk_in  : net_ep_in;
+        uint8_t *outs   = all_bulk_out_count ? all_bulk_out : net_ep_outs;
+        uint8_t  outs_n = all_bulk_out_count ? all_bulk_out_count : net_ep_out_count;
+        uint16_t mps    = all_bulk_in ? all_bulk_mps : net_mps;
+
+        /* Если нашли эндпоинты только в vendor-интерфейсе — берём их. */
+        if (outs_n == 0 && net_ep_out_count != 0) {
+            outs   = net_ep_outs;
+            outs_n = net_ep_out_count;
         }
+        /* RTL8192EU: если дескриптор конфигурации не прочитался полностью,
+           используем стандартную раскладку эндпоинтов. */
+        if (!ep_in) ep_in = 0x81;
+        if (outs_n == 0) {
+            outs   = net_ep_outs;
+            outs[0] = 0x02;
+            outs[1] = 0x03;
+            outs[2] = 0x04;
+            outs_n  = 3;
+        }
+
+        console_print_string("[Wi-Fi] probing adapter, bulk IN=");
+        console_print_hex(ep_in);
+        console_print_string(" OUT=");
+        console_print_num(outs_n);
+        console_print_string("\n");
+
+        wifi_probe_register_eps(hc, slot_id, speed, vid, pid,
+                                ep_in, outs, outs_n,
+                                net_ep_int, mps ? mps : 512);
     }
     // В противном случае обычный проводной USB-Ethernet
     else if (is_net && net_ep_out && net_ep_in) {
@@ -1935,23 +2068,23 @@ int xhci_evaluate_ep0_mps(xhci_controller_t *hc, uint8_t slot_id, uint16_t mps) 
     uint32_t *ep0_ctx = (uint32_t *)(input_virt + ctx_size * 2);
     ep0_ctx[1] = ((uint32_t)mps << 16);
 
-    uint8_t cyc;
-    struct xhci_trb *trb = cmd_ring_enqueue(hc, &cyc);
-    trb->param   = input_phys;
-    trb->status  = 0;
-    trb->control = (TRB_EVALUATE_CONTEXT << 10) | ((uint32_t)slot_id << 24) | cyc;
-
-    __asm__ volatile("mfence" ::: "memory");
-    hc->db_regs[0] = 0;
-
     struct xhci_trb evt;
-    if (xhci_wait_event(hc, 33, &evt) != 0) {
+    if (xhci_submit_command(hc, input_phys, 0,
+                            (TRB_EVALUATE_CONTEXT << 10) |
+                            ((uint32_t)slot_id << 24), &evt) != 0) {
         pmm_free_pages((void*)input_phys, 1);
         return -1;
     }
     uint8_t code = (evt.status >> 24) & 0xFF;
     pmm_free_pages((void*)input_phys, 1);
     return (code == 1) ? 0 : -2;
+}
+
+/* Подтвердить изменение состояния порта (write-1-to-clear). */
+static void xhci_ack_port_changes(volatile uint8_t *portsc_reg) {
+    uint32_t portsc = xhci_read32(portsc_reg, 0x00);
+    xhci_write32(portsc_reg, 0x00,
+                 (portsc & XHCI_PORTSC_PRESERVE_MASK) | XHCI_PORTSC_CHANGE_MASK);
 }
 
 void xhci_port_reset(volatile uint8_t *portsc_reg) {
@@ -1968,42 +2101,75 @@ void xhci_port_reset(volatile uint8_t *portsc_reg) {
         if (portsc & XHCI_PORTSC_PED) break;
         __asm__ volatile("pause");
     }
-    xhci_write32(portsc_reg, 0x00,
-                 (portsc & XHCI_PORTSC_PRESERVE_MASK) | XHCI_PORTSC_PRC | XHCI_PORTSC_CSC | XHCI_PORTSC_PEC);
+    xhci_ack_port_changes(portsc_reg);
     delay_loop(2000000);
 }
 
-void handle_port_disconnect(xhci_controller_t *hc, uint8_t port) {
-    uint32_t hccparams1 = xhci_read32(hc->cap_regs, 0x10);
-    uint32_t ctx_size = (hccparams1 & (1u << 2)) ? 64 : 32;
+/* Выкидываем все события старого устройства из очередей слота:
+   при повторном использовании номера слота они иначе попадут
+   новому устройству (в том числе в control transfer'ы). */
+static void xhci_drain_slot_events(xhci_controller_t *hc, uint8_t slot_id) {
+    if (slot_id == 0 || slot_id >= MAX_XHCI_SLOTS) return;
+    for (int dci = 0; dci < 32; dci++)
+        evtq_drain(&hc->transfer_evt_q[slot_id][dci]);
+}
 
-    uint8_t slot_id = 0;
+static uint8_t xhci_find_slot_by_port(xhci_controller_t *hc, uint8_t port) {
     for (int s = 1; s < MAX_XHCI_SLOTS; s++) {
         uint64_t dev_ctx_phys = ((uint64_t *)hc->dcbaa)[s];
         if (dev_ctx_phys == 0) continue;
 
         uint32_t *slot_ctx = (uint32_t *)phys_to_virt(dev_ctx_phys);
         uint8_t slot_port = (slot_ctx[1] >> 16) & 0xFF;
-        if (slot_port == port) {
-            slot_id = s;
-            break;
+        if (slot_port == port) return (uint8_t)s;
+    }
+    return 0;
+}
+
+/* Паркуем все HID-задачи отключённого устройства и только потом
+   освобождаем их память. Раньше usb_hid_task продолжал вечно работать
+   с уже освобождённым hid, портить кольцо нового устройства и сбрасывать
+   его endpoint'ы — из-за этого вторая мышь "не доходила" до nano-X. */
+static void xhci_disconnect_hid_devices(xhci_controller_t *hc, uint8_t slot_id) {
+    struct usb_hid *hids[32];
+    int n = 0;
+
+    for (int dci = 0; dci < 32; dci++) {
+        struct usb_hid *hid = hc->hid_table[slot_id][dci];
+        if (!hid) continue;
+        hid->disconnected = 1;
+        hc->hid_table[slot_id][dci] = NULL;
+        hids[n++] = hid;
+    }
+    if (n == 0) return;
+
+    for (uint32_t wait = 0; wait < 300000; wait++) {
+        bool stopped = true;
+        for (int i = 0; i < n; i++) {
+            if (!hids[i]->stopped) { stopped = false; break; }
         }
+        if (stopped) break;
+        if ((wait & 0x3F) == 0) schedule_yield_safe();
+        __asm__ volatile("pause");
     }
 
-    if (slot_id == 0) return;
+    for (int i = 0; i < n; i++) {
+        if (!hids[i]->stopped) continue; /* задача ещё жива — не трогаем её память */
+        pmm_free_pages((void*)hids[i]->ring_phys, 1);
+        pmm_free_pages((void*)hids[i]->report_phys, 1);
+        malloc_free(hids[i]);
+    }
+}
 
-    uint64_t ep0_ring_phys = 0;
-    {
-        uint32_t *slot_ctx = (uint32_t *)phys_to_virt(((uint64_t *)hc->dcbaa)[slot_id]);
-        uint32_t *ep0_ctx_out = (uint32_t *)((uint8_t *)slot_ctx + ctx_size);
-        ep0_ring_phys = *(uint64_t *)&ep0_ctx_out[2] & ~0xFULL;
+static void xhci_destroy_slot(xhci_controller_t *hc, uint8_t slot_id) {
+    /* Даём завершиться control transfer, который ещё мог идти к старому
+       устройству (иначе ep0_lock останется захваченным навсегда). */
+    for (uint32_t i = 0; i < 200000 && hc->ep0_lock[slot_id]; i++) {
+        if ((i & 0x3F) == 0) schedule_yield_safe();
+        __asm__ volatile("pause");
     }
 
-    if (ep0_ring_phys == 0 && hc->ep0_ring[slot_id]) {
-        ep0_ring_phys = virt_to_phys((void*)hc->ep0_ring[slot_id]);
-    }
-
-    // Чистим флэшки
+    /* Чистим флэшки */
     for (int i = 0; i < MAX_BLOCK_DEVICES; i++) {
         struct block_device *bd = &block_devices[i];
         if (bd->type == DISK_TYPE_USB && bd->local_device_struct != NULL) {
@@ -2015,48 +2181,59 @@ void handle_port_disconnect(xhci_controller_t *hc, uint8_t port) {
                 pmm_free_pages((void*)msd->bulk_out_ring_phys, 1);
                 pmm_free_pages((void*)msd->bulk_in_ring_phys, 1);
                 malloc_free(msd);
-                hc->cmd_evt_q.head = hc->cmd_evt_q.tail = 0;
-                for (int dci = 0; dci < 32; dci++)
-                    hc->transfer_evt_q[slot_id][dci].head = hc->transfer_evt_q[slot_id][dci].tail = 0;
+                bd->local_device_struct = NULL;
                 break;
             }
         }
     }
 
-    // Чистим клавы/мышки
-    for (int dci = 0; dci < 32; dci++) {
-        struct usb_hid *hid = hc->hid_table[slot_id][dci];
-        if (hid) {
-            pmm_free_pages((void*)hid->ring_phys, 1);
-            pmm_free_pages((void*)hid->report_phys, 1);
-            malloc_free(hid);
-            hc->hid_table[slot_id][dci] = NULL;
-        }
-    }
-
-    // Оповещаем сетевой драйвер об отключении (чтобы убил планировщик тасков для этого девайса)
+    xhci_disconnect_hid_devices(hc, slot_id);
     wifi_probe_unregister(hc, slot_id);
     usb_net_disconnect(hc, slot_id);
 
-    uint8_t cyc;
-    struct xhci_trb *trb = cmd_ring_enqueue(hc, &cyc);
-    trb->param = 0;
-    trb->status = 0;
-    trb->control = cyc | (TRB_DISABLE_SLOT << 10) | ((uint32_t)slot_id << 24);
-    __asm__ volatile("mfence" ::: "memory");
-    hc->db_regs[0] = 0;
+    xhci_drain_slot_events(hc, slot_id);
 
     struct xhci_trb evt;
-    xhci_wait_event(hc, 33, &evt);
+    xhci_submit_command(hc, 0, 0,
+                        (TRB_DISABLE_SLOT << 10) | ((uint32_t)slot_id << 24), &evt);
 
-    if (ep0_ring_phys) {
-        pmm_free_pages((void*)ep0_ring_phys, 1);
+    /* Если control transfer всё ещё не отпустил ep0_lock, страницы rings
+       пока трогать нельзя — иначе получим use-after-free. Лучше потерять
+       страницу, чем уронить ядро. */
+    bool ep0_busy = (hc->ep0_lock[slot_id] != 0);
+    if (!ep0_busy) {
+        /* Освобождаем именно ту страницу, что выделяли под ep0 ring.
+           Раньше адрес брали из TR Dequeue Pointer в контексте устройства —
+           он указывает в СЕРЕДИНУ кольца, и pmm освобождал не ту страницу. */
+        if (hc->ep0_ring[slot_id]) {
+            pmm_free_pages((void*)virt_to_phys((void*)hc->ep0_ring[slot_id]), 1);
+            hc->ep0_ring[slot_id] = NULL;
+        }
+        hc->ep0_enqueue[slot_id] = 0;
+        hc->ep0_cycle[slot_id] = 0;
     }
-    pmm_free_pages((void*)((uint64_t *)hc->dcbaa)[slot_id], 1);
+
+    uint64_t dev_ctx_phys = ((uint64_t *)hc->dcbaa)[slot_id];
+    if (dev_ctx_phys) pmm_free_pages((void*)dev_ctx_phys, 1);
     ((uint64_t *)hc->dcbaa)[slot_id] = 0;
-    hc->ep0_ring[slot_id] = NULL;
-    hc->ep0_enqueue[slot_id] = 0;
-    hc->ep0_cycle[slot_id] = 0;
+
+    if (!ep0_busy) hc->ep0_lock[slot_id] = 0;
+    xhci_drain_slot_events(hc, slot_id);
+}
+
+void handle_port_disconnect(xhci_controller_t *hc, uint8_t port) {
+    volatile uint8_t *port_base = hc->op_regs + 0x400;
+    volatile uint8_t *portsc_reg = port_base + (port - 1) * 0x10;
+
+    xhci_ack_port_changes(portsc_reg);
+
+    for (int s = 1; s < MAX_XHCI_SLOTS; s++) {
+        uint64_t dev_ctx_phys = ((uint64_t *)hc->dcbaa)[s];
+        if (dev_ctx_phys == 0) continue;
+        uint32_t *slot_ctx = (uint32_t *)phys_to_virt(dev_ctx_phys);
+        uint8_t slot_port = (slot_ctx[1] >> 16) & 0xFF;
+        if (slot_port == port) xhci_destroy_slot(hc, (uint8_t)s);
+    }
 }
 
 void handle_port_connect(xhci_controller_t *hc, uint8_t port) {
@@ -2064,30 +2241,39 @@ void handle_port_connect(xhci_controller_t *hc, uint8_t port) {
     volatile uint8_t *portsc_reg = port_base + (port - 1) * 0x10;
 
     uint32_t portsc = xhci_read32(portsc_reg, 0x00);
+    xhci_ack_port_changes(portsc_reg);
+
     if (!(portsc & XHCI_PORTSC_CCS)) {
         handle_port_disconnect(hc, port);
         return;
+    }
+
+    /* Порт уже проинициализирован: без нового CSC это дубликат события,
+       повторно передёргивать устройство не нужно. */
+    if (xhci_find_slot_by_port(hc, port) != 0) {
+        if (!(portsc & XHCI_PORTSC_CSC)) return;
+        /* Потерянное событие disconnect (или быстрая замена мыши):
+           старый слот всё ещё висит на этом порту — убираем его. */
+        handle_port_disconnect(hc, port);
     }
 
     if (!(portsc & XHCI_PORTSC_PED)) xhci_port_reset(portsc_reg);
 
     portsc = xhci_read32(portsc_reg, 0x00);
     uint8_t speed = (portsc >> 10) & 0xF;
-
-    uint8_t cyc;
-    struct xhci_trb *trb = cmd_ring_enqueue(hc, &cyc);
-    trb->param = 0; trb->status = 0;
-    trb->control = cyc | (TRB_ENABLE_SLOT << 10);
-    __asm__ volatile("mfence" ::: "memory");
-    hc->db_regs[0] = 0;
+    if (!(portsc & XHCI_PORTSC_CCS)) return;
 
     struct xhci_trb evt;
-    if (xhci_wait_event(hc, 33, &evt) != 0) return;
+    if (xhci_submit_command(hc, 0, 0, TRB_ENABLE_SLOT << 10, &evt) != 0) return;
 
     uint8_t code = (evt.status >> 24) & 0xFF;
     uint8_t slot_id = (evt.control >> 24) & 0xFF;
     if (code != 1) return;
     if (slot_id == 0 || slot_id >= MAX_XHCI_SLOTS) return;
+
+    /* Слот мог остаться после аварийного отключения — чистим все его очереди. */
+    xhci_drain_slot_events(hc, slot_id);
+    hc->ep0_lock[slot_id] = 0;
 
     uint32_t hccparams1 = xhci_read32(hc->cap_regs, 0x10);
     uint32_t ctx_size = (hccparams1 & (1u << 2)) ? 64 : 32;
@@ -2124,22 +2310,19 @@ void handle_port_connect(xhci_controller_t *hc, uint8_t port) {
     *(uint64_t *)&ep0_ctx[2] = ep0_ring_phys | 1u;
     ep0_ctx[4] = 8;
 
-    trb = cmd_ring_enqueue(hc, &cyc);
-    trb->param = input_ctx_phys; trb->status = 0;
-    trb->control = cyc | (TRB_ADDRESS_DEVICE << 10) | ((uint32_t)slot_id << 24);
-    __asm__ volatile("mfence" ::: "memory");
-    hc->db_regs[0] = 0;
-
-    if (xhci_wait_event(hc, 33, &evt) != 0) {
+    if (xhci_submit_command(hc, input_ctx_phys, 0,
+                            (TRB_ADDRESS_DEVICE << 10) |
+                            ((uint32_t)slot_id << 24), &evt) != 0) {
         pmm_free_pages((void*)input_ctx_phys, 1);
+        xhci_destroy_slot(hc, slot_id);
         return;
     }
     code = (evt.status >> 24) & 0xFF;
+    pmm_free_pages((void*)input_ctx_phys, 1);
     if (code != 1) {
-        pmm_free_pages((void*)input_ctx_phys, 1);
+        xhci_destroy_slot(hc, slot_id);
         return;
     }
-    pmm_free_pages((void*)input_ctx_phys, 1);
 
     uint64_t desc_phys = (uint64_t)pmm_alloc_pages(1);
     struct usb_device_descriptor *desc = (struct usb_device_descriptor *)phys_to_virt(desc_phys);
@@ -2154,6 +2337,7 @@ void handle_port_connect(xhci_controller_t *hc, uint8_t port) {
 
     if (xhci_control_transfer(hc, slot_id, hc->ep0_ring[slot_id], &hc->ep0_enqueue[slot_id], &hc->ep0_cycle[slot_id], &setup, desc_phys, 8) != 0) {
         pmm_free_pages((void*)desc_phys, 1);
+        xhci_destroy_slot(hc, slot_id);
         return;
     }
 
@@ -2172,6 +2356,7 @@ void handle_port_connect(xhci_controller_t *hc, uint8_t port) {
     setup.wLength = 18;
     if (xhci_control_transfer(hc, slot_id, hc->ep0_ring[slot_id], &hc->ep0_enqueue[slot_id], &hc->ep0_cycle[slot_id], &setup, desc_phys, 18) != 0) {
         pmm_free_pages((void*)desc_phys, 1);
+        xhci_destroy_slot(hc, slot_id);
         return;
     }
 
@@ -2311,15 +2496,8 @@ void xhci_init(pci_device_t *dev) {
     xhci_write32(hc->op_regs, 0x00, usbcmd);
     wait_hchalt(hc->op_regs, false);
 
-    uint8_t cyc;
-    struct xhci_trb *noop = cmd_ring_enqueue(hc, &cyc);
-    noop->param = 0; noop->status = 0;
-    noop->control = cyc | (TRB_CMD_NOOP << 10);
-    __asm__ volatile("mfence" ::: "memory");
-    hc->db_regs[0] = 0;
-
     struct xhci_trb evt;
-    xhci_wait_event(hc, 33, &evt);
+    xhci_submit_command(hc, 0, 0, TRB_CMD_NOOP << 10, &evt);
 
     listing_all_ports(hc);
 

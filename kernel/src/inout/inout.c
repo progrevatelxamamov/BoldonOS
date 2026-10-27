@@ -11,6 +11,7 @@
 #include <inout/inout.h>
 #include <inout/ps2kbd.h>
 #include <scheduler/scheduler.h>
+#include <scheduler/spinlock.h>
 
 #include <fs/devfs.h>
 #include <fs/vfs.h>
@@ -48,9 +49,22 @@ static volatile uint32_t mouse_tail = 0;
 static uint8_t  cmd_resp_q[CMD_RESP_Q_SIZE];
 static volatile uint32_t cmd_resp_qh = 0, cmd_resp_qt = 0;
 
-/* Очередь пакетов движения мыши */
+/* Очередь байтов PS/2-пакетов движения мыши.
+   ВАЖНО: в очереди лежат ТОЛЬКО целые пакеты. Раньше при переполнении
+   очереди в неё попадал обрывок пакета, поток байтов навсегда
+   рассинхронизировался и Nano-X читал чужие байты как dx/dy — курсор
+   сам по себе уезжал в правый верхний угол. */
 static uint8_t  move_q[MOVE_Q_SIZE];
 static volatile uint32_t move_qh = 0, move_qt = 0;
+
+/* Остаток пакета, который не поместился в предыдущий read().
+   Без него read(fd, buf, 1) никогда не получал данные. */
+static uint8_t  mouse_read_buf[4];
+static uint32_t mouse_read_pos = 0;
+static uint32_t mouse_read_len = 0;
+
+/* Очереди трогают и USB-задачи, и процесс Nano-X (в т.ч. на разных CPU). */
+static spinlock_t input_q_lock = SPINLOCK_INIT;
 
 static uint8_t  kbd_q[KBD_Q_SIZE];
 static uint32_t kbd_qh = 0, kbd_qt = 0;
@@ -71,51 +85,109 @@ static inline void irq_restore(uint64_t flags) {
     __asm__ volatile("pushq %0; popfq" :: "r"(flags) : "memory", "cc");
 }
 
+static inline uint32_t move_q_count(void) {
+    return (move_qh >= move_qt) ? (move_qh - move_qt)
+                                : (MOVE_Q_SIZE - move_qt + move_qh);
+}
+
+/* Смена протокола 3 <-> 4 байта обязана очищать и очередь, и остаток
+   уже прочитанного пакета, иначе старые 4-байтовые пакеты будут читаться
+   как 3-байтовые и поток снова собьётся. */
+static void mouse_stream_set_protocol(bool imps2) {
+    uint64_t flags;
+    spin_lock_irqsave(&input_q_lock, &flags);
+    mouse_imps2 = imps2;
+    move_qh = move_qt = 0;
+    mouse_read_pos = mouse_read_len = 0;
+    spin_unlock_irqrestore(&input_q_lock, flags);
+}
+
+static void cmd_resp_flush(void) {
+    uint64_t flags;
+    spin_lock_irqsave(&input_q_lock, &flags);
+    cmd_resp_qh = cmd_resp_qt = 0;
+    spin_unlock_irqrestore(&input_q_lock, flags);
+}
+
 /* Поместить байт ответа на команду в очередь ответов */
 static void cmd_resp_push(uint8_t val) {
+    uint64_t flags;
+    spin_lock_irqsave(&input_q_lock, &flags);
     uint32_t next = (cmd_resp_qh + 1) % CMD_RESP_Q_SIZE;
     if (next != cmd_resp_qt) {
         cmd_resp_q[cmd_resp_qh] = val;
         cmd_resp_qh = next;
     }
+    spin_unlock_irqrestore(&input_q_lock, flags);
 }
 
-void input_dev_on_mouse_rel(int dx, int dy, uint8_t buttons) {
-    /* 1. Гарантируем, что передача данных всегда разрешена */
-    mouse_enabled = true;
+/* Собрать и atomically положить в очередь ОДИН ЦЕЛЫЙ PS/2-пакет. */
+static void mouse_packet_push(int dx, int dy, int dz, uint8_t buttons) {
+    if (dx >  127) dx =  127; else if (dx < -127) dx = -127;
+    if (dy >  127) dy =  127; else if (dy < -127) dy = -127;
+    if (dz >  127) dz =  127; else if (dz < -127) dz = -127;
 
-    int8_t sdx = dx > 127 ? 127 : dx < -128 ? -128 : (int8_t)dx;
+    int8_t sdx = (int8_t)dx;
+    /* PS/2: положительное Y — вверх, HID: положительное Y — вниз.
+       Nano-X (mou_devmice.c) делает y = -(signed char)data[2],
+       поэтому двойного инвертирования нет. */
+    int8_t sdy = (int8_t)(-dy);
+    int8_t sdw = (int8_t)dz;
 
-    /* Инвертируем Y для соответствия стандарту PS/2 (в PS/2 смещение вверх — положительное) */
-    int ps2_y = -dy;
-    int8_t sdy = ps2_y > 127 ? 127 : ps2_y < -128 ? -128 : (int8_t)ps2_y;
-
-    /* Байт 0 PS/2: Бит 3 (0x08) ОБЯЗАТЕЛЕН для синхронизации пакетов в Nano-X */
-    uint8_t b0 = 0x08;
+    uint8_t b0 = 0x08;                       /* sync bit, обязателен */
     if (buttons & 1) b0 |= 0x01;             /* Left */
     if (buttons & 2) b0 |= 0x02;             /* Right */
     if (buttons & 4) b0 |= 0x04;             /* Middle */
     if (sdx < 0)     b0 |= 0x10;             /* Sign X */
     if (sdy < 0)     b0 |= 0x20;             /* Sign Y */
 
-    uint32_t pkt_len = mouse_imps2 ? 4 : 3;
-    uint8_t pkt[4] = { b0, (uint8_t)sdx, (uint8_t)sdy, 0 };
+    uint8_t pkt[4] = { b0, (uint8_t)sdx, (uint8_t)sdy, (uint8_t)sdw };
 
-    for (uint32_t i = 0; i < pkt_len; i++) {
-        uint32_t next = (move_qh + 1) % MOVE_Q_SIZE;
-        if (next == move_qt) break;
-        move_q[move_qh] = pkt[i];
-        move_qh = next;
+    uint64_t flags;
+    spin_lock_irqsave(&input_q_lock, &flags);
+    uint8_t pkt_len = mouse_imps2 ? 4 : 3;
+
+    /* Мало места — выбрасываем СТАРЫЕ ЦЕЛЫЕ пакеты, а не обрываем новый. */
+    while (move_q_count() >= pkt_len &&
+           (MOVE_Q_SIZE - 1 - move_q_count()) < pkt_len) {
+        move_qt = (move_qt + pkt_len) % MOVE_Q_SIZE;
     }
+    if ((MOVE_Q_SIZE - 1 - move_q_count()) >= pkt_len) {
+        for (uint32_t i = 0; i < pkt_len; i++) {
+            move_q[move_qh] = pkt[i];
+            move_qh = (move_qh + 1) % MOVE_Q_SIZE;
+        }
+    }
+    spin_unlock_irqrestore(&input_q_lock, flags);
 }
 
-void input_dev_on_mouse_abs(int x, int y, uint8_t buttons) {
+static void input_stream_reset(void) {
+    uint64_t flags;
+    spin_lock_irqsave(&input_q_lock, &flags);
+    cmd_resp_qh = cmd_resp_qt = 0;
+    move_qh = move_qt = 0;
+    mouse_read_pos = mouse_read_len = 0;
+    mouse_cmd_state = 0;
+    mouse_sample_magic = 0;
+    mouse_imps2 = false;
+    mouse_enabled = true;
+    kbd_qh = kbd_qt = 0;
+    spin_unlock_irqrestore(&input_q_lock, flags);
+}
+
+static void input_dev_on_mouse_rel(int dx, int dy, int dz, uint8_t buttons) {
+    /* Гарантируем, что передача данных всегда разрешена */
+    mouse_enabled = true;
+    mouse_packet_push(dx, dy, dz, buttons);
+}
+
+static void input_dev_on_mouse_abs(int x, int y, uint8_t buttons) {
     static int last_x = 0, last_y = 0;
     int dx = x - last_x;
     int dy = y - last_y;
     last_x = x;
     last_y = y;
-    input_dev_on_mouse_rel(dx, dy, buttons);
+    input_dev_on_mouse_rel(dx, dy, 0, buttons);
 }
 
 /* Конечный автомат обработки команд управления от Nano-X */
@@ -133,11 +205,10 @@ static void mouse_process_cmd(uint8_t cmd) {
         } else if (cmd == 80 && mouse_sample_magic == 2) {
             /* Цепочка 200 -> 100 -> 80 завершена! */
             mouse_sample_magic = 0;
-            mouse_imps2 = true;
             mouse_enabled = true;
 
-            move_qh = move_qt = 0;         /* Очищаем старые 3-байтовые пакеты */
-            cmd_resp_qh = cmd_resp_qt = 0; /* Очищаем старые ACK */
+            mouse_stream_set_protocol(true);  /* чистит и очередь, и остаток read() */
+            cmd_resp_flush();                 /* чистим старые ACK */
 
             /* Эмулятор /dev/input/mice в Linux возвращает ровно 0xF4 для Nano-X */
             cmd_resp_push(0xF4);
@@ -159,12 +230,11 @@ static void mouse_process_cmd(uint8_t cmd) {
     /* Команды верхнего уровня */
     switch (cmd) {
     case 0xFF: /* Reset */
-        mouse_imps2 = false;
         mouse_sample_magic = 0;
         mouse_enabled = true;
         mouse_cmd_state = 0;
-        move_qh = move_qt = 0;
-        cmd_resp_qh = cmd_resp_qt = 0;
+        mouse_stream_set_protocol(false);
+        cmd_resp_flush();
         cmd_resp_push(0xFA);
         cmd_resp_push(0xAA);
         cmd_resp_push(0x00);
@@ -176,7 +246,7 @@ static void mouse_process_cmd(uint8_t cmd) {
         break;
 
     case 0xF2: /* Get Device ID */
-        cmd_resp_qh = cmd_resp_qt = 0;
+        cmd_resp_flush();
         cmd_resp_push(0xFA);
         cmd_resp_push(mouse_imps2 ? 0x03 : 0x00);
         break;
@@ -188,7 +258,7 @@ static void mouse_process_cmd(uint8_t cmd) {
 
     case 0xF4: /* Enable Data Reporting */
         mouse_enabled = true;
-        move_qh = move_qt = 0;
+        mouse_stream_set_protocol(mouse_imps2);  /* сбросить остатки старых пакетов */
         cmd_resp_push(0xFA);
         break;
 
@@ -198,9 +268,9 @@ static void mouse_process_cmd(uint8_t cmd) {
         break;
 
     case 0xF6: /* Set Defaults */
-        mouse_imps2 = false;
         mouse_sample_magic = 0;
         mouse_enabled = true;
+        mouse_stream_set_protocol(false);
         cmd_resp_push(0xFA);
         break;
 
@@ -215,39 +285,53 @@ static int mouse_dev_read(void *buf, uint64_t count, uint32_t flags) {
 
     uint8_t *out = (uint8_t *)buf;
     uint64_t got = 0;
+    uint64_t lf;
 
-    /* 1. Если есть ответы на команды — отдаем их первыми */
+    /* 1. Ответы на команды — побайтно, не больше count. */
+    spin_lock_irqsave(&input_q_lock, &lf);
     while (got < count && cmd_resp_qh != cmd_resp_qt) {
         out[got++] = cmd_resp_q[cmd_resp_qt];
         cmd_resp_qt = (cmd_resp_qt + 1) % CMD_RESP_Q_SIZE;
     }
+    spin_unlock_irqrestore(&input_q_lock, lf);
     if (got > 0) return (int)got;
 
-    uint32_t pkt_len = mouse_imps2 ? 4 : 3;
+    /* 2. Хвост пакета, который не влез в прошлый read(). */
+    spin_lock_irqsave(&input_q_lock, &lf);
+    while (got < count && mouse_read_pos < mouse_read_len)
+        out[got++] = mouse_read_buf[mouse_read_pos++];
+    if (mouse_read_pos >= mouse_read_len)
+        mouse_read_pos = mouse_read_len = 0;
+    spin_unlock_irqrestore(&input_q_lock, lf);
+    if (got > 0) return (int)got;
 
-    /* 2. Ждем, пока появится хотя бы один полный пакет */
-    while (1) {
-        uint32_t move_avail = (move_qh >= move_qt) ? (move_qh - move_qt) : (MOVE_Q_SIZE - move_qt + move_qh);
+    /* 3. Берём только ЦЕЛЫЙ, синхронизированный пакет. */
+    for (;;) {
+        spin_lock_irqsave(&input_q_lock, &lf);
+        uint8_t pkt_len = mouse_imps2 ? 4 : 3;
 
-        if (move_avail >= pkt_len) {
-            while (got + pkt_len <= count) {
-                move_avail = (move_qh >= move_qt) ? (move_qh - move_qt) : (MOVE_Q_SIZE - move_qt + move_qh);
-                if (move_avail < pkt_len) break;
+        /* На всякий случай ресинхронизация по sync-биту (0x08). */
+        while (move_q_count() > 0 &&
+               ((move_q[move_qt] & 0x08) == 0 || (move_q[move_qt] & 0xC0) != 0))
+            move_qt = (move_qt + 1) % MOVE_Q_SIZE;
 
-                for (uint32_t i = 0; i < pkt_len; i++) {
-                    out[got++] = move_q[move_qt];
-                    move_qt = (move_qt + 1) % MOVE_Q_SIZE;
-                }
+        if (move_q_count() >= pkt_len) {
+            for (uint32_t i = 0; i < pkt_len; i++) {
+                mouse_read_buf[i] = move_q[move_qt];
+                move_qt = (move_qt + 1) % MOVE_Q_SIZE;
             }
-            return (int)got;
-        }
+            mouse_read_len = pkt_len;
+            mouse_read_pos = 0;
 
-        /* Если пакета нет и режим NONBLOCK — возвращаем EAGAIN (НЕ 0!) */
-        if (flags & VFS_O_NONBLOCK) {
-            return -EAGAIN;
+            while (got < count && mouse_read_pos < mouse_read_len)
+                out[got++] = mouse_read_buf[mouse_read_pos++];
+            if (mouse_read_pos >= mouse_read_len)
+                mouse_read_pos = mouse_read_len = 0;
         }
+        spin_unlock_irqrestore(&input_q_lock, lf);
 
-        /* В блокирующем режиме ждем поступления данных */
+        if (got > 0) return (int)got;
+        if (flags & VFS_O_NONBLOCK) return -EAGAIN;
         schedule_yield();
     }
 }
@@ -285,10 +369,14 @@ uint32_t input_poll_events(vfs_file_t *file, uint32_t events) {
 
     if (events & POLLIN) {
         if (is_mouse) {
-            uint32_t pkt_len = mouse_imps2 ? 4 : 3;
-            uint32_t move_avail = (move_qh >= move_qt) ? (move_qh - move_qt) : (MOVE_Q_SIZE - move_qt + move_qh);
-            if (cmd_resp_qh != cmd_resp_qt || move_avail >= pkt_len)
-                re |= POLLIN;
+            uint64_t lf;
+            spin_lock_irqsave(&input_q_lock, &lf);
+            uint8_t pkt_len = mouse_imps2 ? 4 : 3;
+            bool ready = (cmd_resp_qh != cmd_resp_qt) ||
+                         (mouse_read_pos < mouse_read_len) ||
+                         (move_q_count() >= pkt_len);
+            spin_unlock_irqrestore(&input_q_lock, lf);
+            if (ready) re |= POLLIN;
         } else {
             if (kbd_qh != kbd_qt)
                 re |= POLLIN;
@@ -392,13 +480,8 @@ static vfs_file_ops_t kbd_ops = {
 };
 
 void input_register_devfs(void) {
-    move_qh = move_qt = 0;
-    cmd_resp_qh = cmd_resp_qt = 0;
-    mouse_cmd_state = 0;
-    mouse_sample_magic = 0;
-    mouse_imps2 = false;
-    mouse_enabled = true;
-    kbd_qh = kbd_qt = 0;
+    input_stream_reset();
+
 
     devfs_register_device("mouse",        VFS_TYPE_CHAR_DEV, &mouse_ops, NULL);
     devfs_register_device("input/mice",   VFS_TYPE_CHAR_DEV, &mouse_ops, NULL);
@@ -496,7 +579,7 @@ void inout_mouse_task(void) {
                 if (g_mouse.leftbtn_pressed)   btn |= 1;
                 if (g_mouse.rightbtn_pressed)  btn |= 2;
                 if (g_mouse.centerbtn_pressed) btn |= 4;
-                input_dev_on_mouse_rel(0, 0, btn);
+                input_dev_on_mouse_rel(0, 0, 0, btn);
             }
 
             if (data->mouse_state == INOUT_MOUSE_MOVE) {
@@ -508,7 +591,7 @@ void inout_mouse_task(void) {
                 if (g_mouse.leftbtn_pressed)   btn |= 1;
                 if (g_mouse.rightbtn_pressed)  btn |= 2;
                 if (g_mouse.centerbtn_pressed) btn |= 4;
-                input_dev_on_mouse_rel(data->x, data->y, btn);
+                input_dev_on_mouse_rel(data->x, data->y, data->z, btn);
             }
 
             if (data->mouse_state == INOUT_MOUSE_MOVE_ABSOLUTE) {
@@ -569,7 +652,7 @@ void inout_add_event(inout_event_t ev) {
             if (g_mouse.rightbtn_pressed)  btn |= 2;
             if (g_mouse.centerbtn_pressed) btn |= 4;
 
-            input_dev_on_mouse_rel(0, 0, btn);
+            input_dev_on_mouse_rel(0, 0, 0, btn);
         }
         else if (data->mouse_state == INOUT_MOUSE_MOVE) {
             g_mouse.x += data->x;
@@ -581,7 +664,7 @@ void inout_add_event(inout_event_t ev) {
             if (g_mouse.rightbtn_pressed)  btn |= 2;
             if (g_mouse.centerbtn_pressed) btn |= 4;
 
-            input_dev_on_mouse_rel(data->x, data->y, btn);
+            input_dev_on_mouse_rel(data->x, data->y, data->z, btn);
         }
         else if (data->mouse_state == INOUT_MOUSE_MOVE_ABSOLUTE) {
             uint8_t btn = 0;
@@ -603,13 +686,7 @@ void inout_add_event(inout_event_t ev) {
 void inout_init(void) {
     kbd_head = kbd_tail = 0;
     mouse_head = mouse_tail = 0;
-    move_qh = move_qt = 0;
-    cmd_resp_qh = cmd_resp_qt = 0;
-    mouse_cmd_state = 0;
-    mouse_sample_magic = 0;
-    mouse_imps2 = false;
-    mouse_enabled = true;
-    kbd_qh = kbd_qt = 0;
+    input_stream_reset();
 
     inout_kbd_proc = create_task_kernel((void *)inout_keyboard_task, "inout_kbd");
     inout_mouse_proc = create_task_kernel((void *)inout_mouse_task, "inout_mouse");
