@@ -877,17 +877,6 @@ void init_usb_mass_storage(xhci_controller_t *hc, uint8_t slot_id, uint8_t speed
     console_print_string("[MSD] Registered successfully.\n");
 }
 
-static void emit_modifier(uint16_t kc, bool prev_down, bool cur_down) {
-    if (prev_down == cur_down) return;
-    g_keyboard.down[kc] = cur_down;
-    inout_event_t ev;
-    memset(&ev, 0, sizeof(ev));
-    ev.type = INOUT_EVENT_KEY;
-    ev.data.key.key_state = cur_down ? INOUT_KEY_DOWN : INOUT_KEY_UP;
-    ev.data.key.keycode   = kc;
-    inout_add_event(ev);
-}
-
 typedef struct {
     uint32_t usage_page;
     int32_t  logical_min;
@@ -1202,71 +1191,70 @@ void handle_keyboard_report(struct usb_hid *hid) {
         if (hid->report_protocol_active && hid->has_input_report_id &&
             report_len >= 9 && r[0] == hid->input_report_id)
             offset = 1;
-        if (report_len < offset + 8) return;
-        modifiers = r[offset];
-        cur_key_count = 6;
-        memcpy(cur_keys, &r[offset + 2], 6);
+        if (report_len < offset + 8) {
+            /* Короткий/битый репорт: считаем все клавиши отпущенными.
+               Просто return здесь оставлял бы залипший Shift навсегда. */
+            modifiers = 0;
+            cur_key_count = 0;
+        } else {
+            modifiers = r[offset];
+            cur_key_count = 6;
+            memcpy(cur_keys, &r[offset + 2], 6);
+        }
     }
 
-    uint8_t prev_mod = hid->prev_modifiers;
-    g_keyboard.shift_pressed = (modifiers & 0x22) != 0;
+    /* Собираем ПОЛНОЕ текущее множество клавиш и сверяем его с прошлым.
+       Раньше g_keyboard.down[] писался здесь напрямую и только по фронтам,
+       а inout_keyboard_task писал его второй раз из своей очереди. Любое
+       потерянное UP-событие оставляло Shift включённым навсегда.
+       Теперь состояние меняется только в inout_set_key_state(), а на
+       каждом репорте мы заново выставляем ВСЕ известные клавиши —
+       рассинхронизация сама исправляется следующим репортом. */
+    static const uint16_t mod_codes[8] = {
+        KEY_LCTRL, KEY_LSHIFT, KEY_LALT, KEY_LGUI,
+        KEY_RCTRL, KEY_RSHIFT, KEY_RALT, KEY_RGUI
+    };
 
-    emit_modifier(KEY_LCTRL,  (prev_mod & 0x01), (modifiers & 0x01));
-    emit_modifier(KEY_LSHIFT, (prev_mod & 0x02), (modifiers & 0x02));
-    emit_modifier(KEY_LALT,   (prev_mod & 0x04), (modifiers & 0x04));
-    emit_modifier(KEY_LGUI,   (prev_mod & 0x08), (modifiers & 0x08));
-    emit_modifier(KEY_RCTRL,  (prev_mod & 0x10), (modifiers & 0x10));
-    emit_modifier(KEY_RSHIFT, (prev_mod & 0x20), (modifiers & 0x20));
-    emit_modifier(KEY_RALT,   (prev_mod & 0x40), (modifiers & 0x40));
-    emit_modifier(KEY_RGUI,   (prev_mod & 0x80), (modifiers & 0x80));
+    uint8_t cur_codes[32];
+    uint8_t cur_count = 0;
+
+    for (uint32_t i = 0; i < 8; i++) {
+        if (!(modifiers & (uint8_t)(1u << i))) continue;
+        uint8_t kc = (uint8_t)mod_codes[i];
+        bool seen = false;
+        for (uint32_t j = 0; j < cur_count; j++)
+            if (cur_codes[j] == kc) { seen = true; break; }
+        if (!seen && cur_count < sizeof(cur_codes)) cur_codes[cur_count++] = kc;
+    }
 
     for (uint32_t i = 0; i < cur_key_count; i++) {
-        uint8_t usage = cur_keys[i];
-        if (usage == 0) continue;
-
-        bool was_down = false;
-        for (uint32_t j = 0; j < hid->prev_key_count; j++)
-            if (hid->prev_keys[j] == usage) { was_down = true; break; }
-
-        if (!was_down) {
-            uint16_t kc = hid_usage_to_keycode(usage);
-            if (kc == 0) continue;
-
-            g_keyboard.down[kc] = true;
-
-            inout_event_t ev;
-            memset(&ev, 0, sizeof(ev));
-            ev.type = INOUT_EVENT_KEY;
-            ev.data.key.key_state = INOUT_KEY_DOWN;
-            ev.data.key.keycode   = kc;
-            inout_add_event(ev);
-        }
+        uint16_t kc = hid_usage_to_keycode(cur_keys[i]);
+        if (kc == 0 || kc >= KEY_MAX) continue;
+        bool seen = false;
+        for (uint32_t j = 0; j < cur_count; j++)
+            if (cur_codes[j] == (uint8_t)kc) { seen = true; break; }
+        if (!seen && cur_count < sizeof(cur_codes))
+            cur_codes[cur_count++] = (uint8_t)kc;
     }
 
-    for (uint32_t i = 0; i < hid->prev_key_count; i++) {
-        uint8_t usage = hid->prev_keys[i];
-        if (usage == 0) continue;
-
-        bool still_down = false;
-        for (uint32_t j = 0; j < cur_key_count; j++)
-            if (cur_keys[j] == usage) { still_down = true; break; }
-
-        if (!still_down) {
-            uint16_t kc = hid_usage_to_keycode(usage);
-            if (kc == 0) continue;
-
-            g_keyboard.down[kc] = false;
-
-            inout_event_t ev;
-            memset(&ev, 0, sizeof(ev));
-            ev.type = INOUT_EVENT_KEY;
-            ev.data.key.key_state = INOUT_KEY_UP;
-            ev.data.key.keycode   = kc;
-            inout_add_event(ev);
-        }
+    /* Сначала отпускаем исчезнувшие, затем подтверждаем нажатые. */
+    for (uint32_t i = 0; i < hid->active_keycode_count; i++) {
+        uint8_t kc = hid->active_keycodes[i];
+        bool still = false;
+        for (uint32_t j = 0; j < cur_count; j++)
+            if (cur_codes[j] == kc) { still = true; break; }
+        if (!still) inout_set_key_state(kc, false);
     }
+    for (uint32_t i = 0; i < cur_count; i++)
+        inout_set_key_state(cur_codes[i], true);
 
+    memcpy(hid->active_keycodes, cur_codes, cur_count);
+    hid->active_keycode_count = cur_count;
+
+    /* prev_* оставляем согласованными для отладочных дампов. */
     memset(hid->prev_keys, 0, sizeof(hid->prev_keys));
+    if (cur_key_count > sizeof(hid->prev_keys))
+        cur_key_count = sizeof(hid->prev_keys);
     memcpy(hid->prev_keys, cur_keys, cur_key_count);
     hid->prev_key_count = (uint8_t)cur_key_count;
     hid->prev_modifiers = modifiers;
@@ -1637,6 +1625,8 @@ static void init_usb_hid(xhci_controller_t *hc, uint8_t slot_id, uint8_t speed,
     hid->report_len = 0;
     hid->disconnected = 0;
     hid->stopped = 0;
+    hid->active_keycode_count = 0;
+    memset(hid->active_keycodes, 0, sizeof(hid->active_keycodes));
     hid->led_probe_stage = 0;
 
     if (!xhci_configure_hid_endpoint(hc, hid)) {

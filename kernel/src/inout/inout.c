@@ -23,10 +23,9 @@ void xhci_set_keyboard_leds(uint8_t leds);
 #define POLLOUT 0x0004
 #endif
 
-#define EVENT_QUEUE_SIZE 512
 #define MOVE_Q_SIZE      2048
 #define CMD_RESP_Q_SIZE  128
-#define KBD_Q_SIZE       256
+#define KBD_Q_SIZE       512
 
 process_t *inout_kbd_proc   = NULL;
 process_t *inout_mouse_proc = NULL;
@@ -36,14 +35,6 @@ volatile mouse_state_t    g_mouse = { .x = 0, .y = 0, .z = 0 };
 
 volatile bool new_kbd_event   = false;
 volatile bool new_mouse_event = false;
-
-static inout_event_t kbd_events[EVENT_QUEUE_SIZE];
-static volatile uint32_t kbd_head = 0;
-static volatile uint32_t kbd_tail = 0;
-
-static inout_event_t mouse_events[EVENT_QUEUE_SIZE];
-static volatile uint32_t mouse_head = 0;
-static volatile uint32_t mouse_tail = 0;
 
 /* Очередь ответов на команды (ACK 0xFA, Device ID 0x03, BAT 0xAA) */
 static uint8_t  cmd_resp_q[CMD_RESP_Q_SIZE];
@@ -66,8 +57,30 @@ static uint32_t mouse_read_len = 0;
 /* Очереди трогают и USB-задачи, и процесс Nano-X (в т.ч. на разных CPU). */
 static spinlock_t input_q_lock = SPINLOCK_INIT;
 
-static uint8_t  kbd_q[KBD_Q_SIZE];
-static uint32_t kbd_qh = 0, kbd_qt = 0;
+/* Очередь клавиатуры хранится СОБЫТИЯМИ, а не сырыми байтами: раньше
+   обрывок события (особенно потерянный байт отпускания) навсегда
+   оставлял Shift включённым у потребителя /dev/kbd (Nano-X). */
+typedef struct {
+    uint8_t code;
+    uint8_t down;
+} kbd_event_rec_t;
+
+static kbd_event_rec_t kbd_evt_q[KBD_Q_SIZE];
+static volatile uint32_t kbd_evt_h = 0, kbd_evt_t = 0;
+
+/* Остаток байтов текущего события (read(fd, buf, 1) должен работать). */
+static uint8_t  kbd_read_buf[2];
+static uint32_t kbd_read_pos = 0, kbd_read_len = 0;
+
+/* Что потребитель уже получил. Нужно для ресинхронизации после
+   переполнения очереди: заново посылаем UP для «залипших» клавиш. */
+static bool kbd_sent_down[KEY_MAX];
+static bool kbd_sync_needed = false;
+
+/* Один лок на состояние клавиатуры и на очередь событий: irq_save()
+   выключает прерывания только на ЭТОМ CPU и от SMP-гонки не спасает. */
+static spinlock_t kbd_state_lock = SPINLOCK_INIT;
+static volatile bool kbd_leds_dirty = false;
 
 /* Состояние эмулятора PS/2 / ImPS/2 */
 static uint8_t  mouse_cmd_state = 0;       /* 0 = idle, 1 = wait sample rate, 2 = wait resolution */
@@ -171,8 +184,19 @@ static void input_stream_reset(void) {
     mouse_sample_magic = 0;
     mouse_imps2 = false;
     mouse_enabled = true;
-    kbd_qh = kbd_qt = 0;
     spin_unlock_irqrestore(&input_q_lock, flags);
+
+    spin_lock_irqsave(&kbd_state_lock, &flags);
+    kbd_evt_h = kbd_evt_t = 0;
+    kbd_read_pos = kbd_read_len = 0;
+    kbd_sync_needed = false;
+    memset(kbd_sent_down, 0, sizeof(kbd_sent_down));
+    for (int k = 0; k < KEY_MAX; k++) g_keyboard.down[k] = false;
+    g_keyboard.caps_lock = false;
+    g_keyboard.num_lock = false;
+    g_keyboard.scroll_lock = false;
+    g_keyboard.shift_pressed = false;
+    spin_unlock_irqrestore(&kbd_state_lock, flags);
 }
 
 static void input_dev_on_mouse_rel(int dx, int dy, int dz, uint8_t buttons) {
@@ -359,7 +383,7 @@ uint32_t input_poll_events(vfs_file_t *file, uint32_t events) {
     if (!file || !file->node) return 0;
 
     uint32_t re = 0;
-    const char *name = file->node->name ? file->node->name : "";
+    const char *name = file->node->name;  /* это массив, NULL быть не может */
 
     bool is_mouse =
         (strstr(name, "mouse")  != NULL) ||
@@ -378,8 +402,12 @@ uint32_t input_poll_events(vfs_file_t *file, uint32_t events) {
             spin_unlock_irqrestore(&input_q_lock, lf);
             if (ready) re |= POLLIN;
         } else {
-            if (kbd_qh != kbd_qt)
-                re |= POLLIN;
+            uint64_t lf;
+            spin_lock_irqsave(&kbd_state_lock, &lf);
+            bool ready = (kbd_evt_h != kbd_evt_t) ||
+                         (kbd_read_pos < kbd_read_len) || kbd_sync_needed;
+            spin_unlock_irqrestore(&kbd_state_lock, lf);
+            if (ready) re |= POLLIN;
         }
     }
     if (events & POLLOUT)
@@ -427,35 +455,181 @@ char key_to_ascii(int key, bool shift, bool caps_lock, bool num_lock) {
     return keymap_normal[key];
 }
 
-static void q_kbd_push(uint8_t b) {
-    uint32_t n = (kbd_qh + 1) % KBD_Q_SIZE;
-    if (n == kbd_qt) return;
-    kbd_q[kbd_qh] = b;
-    kbd_qh = n;
+/* Внутренние keycodes >= KEY_EXT_BASE в байтовый поток не влезают
+   (старший бит — признак отпускания). Переводим их в PS/2 set 1 E0-коды,
+   иначе RAlt превращался в Esc, RCtrl в ноль, а стрелки терялись. */
+static uint8_t kbd_ext_scancode(uint8_t code) {
+    switch (code) {
+    case KEY_RCTRL:       return 0x1D;
+    case KEY_RALT:        return 0x38;
+    case KEY_KP_ENTER:    return 0x1C;
+    case KEY_KP_SLASH:    return 0x35;
+    case KEY_HOME:        return 0x47;
+    case KEY_UP:          return 0x48;
+    case KEY_PGUP:        return 0x49;
+    case KEY_LEFT:        return 0x4B;
+    case KEY_RIGHT:       return 0x4D;
+    case KEY_END:         return 0x4F;
+    case KEY_DOWN:        return 0x50;
+    case KEY_PGDN:        return 0x51;
+    case KEY_INSERT:      return 0x52;
+    case KEY_DELETE:      return 0x53;
+    case KEY_LGUI:        return 0x5B;
+    case KEY_RGUI:        return 0x5C;
+    case KEY_MENU:        return 0x5D;
+    case KEY_PRINTSCREEN: return 0x37;
+    default:              return 0;
+    }
 }
 
-void input_dev_on_key(uint64_t keycode, bool down) {
-    if (keycode >= KEY_MAX) return;
-    uint8_t b = (uint8_t)(keycode & 0x7F);
-    if (!down) b |= 0x80;
-    q_kbd_push(b);
+/* Только под kbd_state_lock. Отпускание НЕ теряется никогда:
+   именно потеря UP для Shift даёт «вечно включённый» модификатор. */
+static void kbd_event_push_locked(uint8_t code, bool down) {
+    uint32_t next = (kbd_evt_h + 1) % KBD_Q_SIZE;
+    if (next == kbd_evt_t) {
+        if (down) {
+            /* Новое нажатие можно выбросить — состояние всё равно
+               пришлём ресинхронизацией. */
+            kbd_sync_needed = true;
+            return;
+        }
+        /* Освобождаем место. Если в хвосте нажатие — убираем его. */
+        kbd_evt_t = (kbd_evt_t + 1) % KBD_Q_SIZE;
+        kbd_sync_needed = true;
+        next = (kbd_evt_h + 1) % KBD_Q_SIZE;
+    }
+    kbd_evt_q[kbd_evt_h].code = code;
+    kbd_evt_q[kbd_evt_h].down = down ? 1 : 0;
+    kbd_evt_h = next;
+}
+
+/* Сверить то, что знает потребитель, с авторитетным g_keyboard. */
+static void kbd_queue_resync_locked(void) {
+    kbd_sync_needed = false;
+    for (int k = 0; k < KEY_MAX; k++) {
+        bool want = g_keyboard.down[k] ? true : false;
+        if (want != kbd_sent_down[k])
+            kbd_event_push_locked((uint8_t)k, want);
+    }
+}
+
+/* ЕДИНСТВЕННОЕ место, где меняется g_keyboard.down[].
+   Раньше его писали и USB HID драйвер (по фронтам), и задача
+   inout_keyboard_task (из отдельной очереди) без всякой синхронизации:
+   потерянное/задержанное событие оставляло Shift включённым навсегда. */
+static void key_state_apply(uint64_t keycode, bool down) {
+    if (keycode == 0 || keycode >= KEY_MAX) return;
+
+    uint64_t flags;
+    spin_lock_irqsave(&kbd_state_lock, &flags);
+
+    bool was = g_keyboard.down[keycode] ? true : false;
+    if (was == down) {
+        /* Авто-повтор. Но если состояние испортилось где-то ещё —
+           оно уже совпадает, так что просто синхронизируем флаг Shift. */
+        g_keyboard.shift_pressed =
+            g_keyboard.down[KEY_LSHIFT] || g_keyboard.down[KEY_RSHIFT];
+        spin_unlock_irqrestore(&kbd_state_lock, flags);
+        return;
+    }
+
+    g_keyboard.down[keycode] = down;
+    g_keyboard.shift_pressed =
+        g_keyboard.down[KEY_LSHIFT] || g_keyboard.down[KEY_RSHIFT];
+
+    if (down) {
+        if (keycode == KEY_CAPSLOCK) {
+            g_keyboard.caps_lock = !g_keyboard.caps_lock;
+            kbd_leds_dirty = true;
+        } else if (keycode == KEY_NUMLOCK) {
+            g_keyboard.num_lock = !g_keyboard.num_lock;
+            kbd_leds_dirty = true;
+        } else if (keycode == KEY_SCROLLLOCK) {
+            g_keyboard.scroll_lock = !g_keyboard.scroll_lock;
+            kbd_leds_dirty = true;
+        }
+    }
+
+    kbd_event_push_locked((uint8_t)keycode, down);
+    new_kbd_event = true;
+    spin_unlock_irqrestore(&kbd_state_lock, flags);
+}
+
+void inout_set_key_state(uint64_t keycode, bool down) {
+    key_state_apply(keycode, down);
+}
+
+/* При открытии /dev/kbd потребитель считает все клавиши отпущенными.
+   Обнуляем его «тень» и просим ресинхронизацию: kbd_dev_read() пришлёт
+   DOWN для реально зажатых клавиш. Очередь НЕ очищаем — устройство могут
+   открыть и /dev/kbd, и /dev/input/event0, и события нельзя терять. */
+static int kbd_open(vfs_file_t *file) {
+    (void)file;
+    uint64_t flags;
+    spin_lock_irqsave(&kbd_state_lock, &flags);
+    memset(kbd_sent_down, 0, sizeof(kbd_sent_down));
+    kbd_sync_needed = true;
+    spin_unlock_irqrestore(&kbd_state_lock, flags);
+    return 0;
 }
 
 static int kbd_dev_read(void *buf, uint64_t count, uint32_t flags) {
     if (!buf || count == 0) return 0;
 
-    if (kbd_qh == kbd_qt) {
-        if (flags & VFS_O_NONBLOCK) return -EAGAIN;
-        while (kbd_qh == kbd_qt) schedule_yield();
-    }
-
     uint8_t *out = (uint8_t *)buf;
     uint64_t got = 0;
-    while (got < count && kbd_qh != kbd_qt) {
-        out[got++] = kbd_q[kbd_qt];
-        kbd_qt = (kbd_qt + 1) % KBD_Q_SIZE;
+    bool did_resync = false;
+
+    for (;;) {
+        uint64_t lf;
+        spin_lock_irqsave(&kbd_state_lock, &lf);
+
+        /* Ресинхронизация один раз за read(): иначе при переполненной
+           очереди можно было бы бесконечно её перезаполнять. */
+        if (kbd_sync_needed && !did_resync) {
+            kbd_queue_resync_locked();
+            did_resync = true;
+        }
+
+        /* Остаток события, не влезший в прошлый read(). */
+        while (got < count && kbd_read_pos < kbd_read_len)
+            out[got++] = kbd_read_buf[kbd_read_pos++];
+        if (kbd_read_pos >= kbd_read_len)
+            kbd_read_pos = kbd_read_len = 0;
+
+        /* Отдаём столько ЦЕЛЫХ событий, сколько влезает в count. */
+        while (got < count && kbd_evt_t != kbd_evt_h) {
+            kbd_event_rec_t e = kbd_evt_q[kbd_evt_t];
+            kbd_evt_t = (kbd_evt_t + 1) % KBD_Q_SIZE;
+            kbd_sent_down[e.code] = e.down != 0;
+
+            uint8_t sc = e.code;
+            if (sc >= KEY_EXT_BASE) {
+                uint8_t ext = kbd_ext_scancode(sc);
+                if (!ext) continue;
+                kbd_read_buf[0] = 0xE0;
+                kbd_read_buf[1] = (uint8_t)(ext | (e.down ? 0 : 0x80));
+                kbd_read_len = 2;
+            } else {
+                kbd_read_buf[0] = (uint8_t)(sc | (e.down ? 0 : 0x80));
+                kbd_read_len = 1;
+            }
+            kbd_read_pos = 0;
+
+            while (got < count && kbd_read_pos < kbd_read_len)
+                out[got++] = kbd_read_buf[kbd_read_pos++];
+            if (kbd_read_pos >= kbd_read_len)
+                kbd_read_pos = kbd_read_len = 0;
+            else
+                break;  /* двубайтовое событие разрезано — хвост в kbd_read_buf */
+        }
+
+        spin_unlock_irqrestore(&kbd_state_lock, lf);
+
+        if (got > 0) return (int)got;
+        if (flags & VFS_O_NONBLOCK) return -EAGAIN;
+        schedule_yield();
     }
-    return (int)got;
 }
 
 static int kbd_read(vfs_file_t *f, void *buf, uint64_t n) {
@@ -476,6 +650,7 @@ static vfs_file_ops_t mouse_ops = {
 static vfs_file_ops_t kbd_ops = {
     .read  = kbd_read,
     .write = kbd_write,
+    .open  = kbd_open,
     .poll  = input_poll_events
 };
 
@@ -492,148 +667,40 @@ void input_register_devfs(void) {
     devfs_register_device("input/event0", VFS_TYPE_CHAR_DEV, &kbd_ops, NULL);
 }
 
+/* Состояние клавиш теперь обновляется прямо в inout_add_event().
+   Задача нужна только для «медленной» части — мигания светодиодами:
+   ps2kbd_set_leds() делает ввод-вывод и не должна зваться из IRQ. */
 void inout_keyboard_task(void) {
-    while (1) {
-        while (1) {
-            inout_event_t ev;
-            bool got_event = false;
-
-            uint64_t flags = irq_save();
-            if (kbd_tail != kbd_head) {
-                ev = kbd_events[kbd_tail];
-                got_event = true;
-            } else {
-                new_kbd_event = false;
-                task_sleep(inout_kbd_proc);
-            }
-            irq_restore(flags);
-
-            if (!got_event) break;
-
-            inout_data_key_t *data = &ev.data.key;
-            if (data->keycode != 0) {
-                if (data->key_state == INOUT_KEY_DOWN) {
-                    g_keyboard.down[data->keycode] = true;
-
-                    if (data->keycode == KEY_CAPSLOCK) {
-                        g_keyboard.caps_lock = !g_keyboard.caps_lock;
-                        update_keyboard_leds();
-                    } else if (data->keycode == KEY_NUMLOCK) {
-                        g_keyboard.num_lock = !g_keyboard.num_lock;
-                        update_keyboard_leds();
-                    } else if (data->keycode == KEY_SCROLLLOCK) {
-                        g_keyboard.scroll_lock = !g_keyboard.scroll_lock;
-                        update_keyboard_leds();
-                    } else {
-                        g_keyboard.shift_pressed =
-                            g_keyboard.down[KEY_LSHIFT] || g_keyboard.down[KEY_RSHIFT];
-                    }
-                    input_dev_on_key(data->keycode, true);
-                } else if (data->key_state == INOUT_KEY_UP) {
-                    g_keyboard.down[data->keycode] = false;
-                    g_keyboard.shift_pressed =
-                        g_keyboard.down[KEY_LSHIFT] || g_keyboard.down[KEY_RSHIFT];
-                    input_dev_on_key(data->keycode, false);
-                }
-            }
-
-            flags = irq_save();
-            kbd_tail = (kbd_tail + 1) % EVENT_QUEUE_SIZE;
-            irq_restore(flags);
+    for (;;) {
+        if (kbd_leds_dirty) {
+            kbd_leds_dirty = false;
+            update_keyboard_leds();
         }
         schedule_yield();
     }
 }
 
+/* Мышиные события обрабатываются сразу в inout_add_event(), отдельная
+   очередь не нужна. Оставляем задачу как «дежурную» без task_sleep(),
+   чтобы она не могла уснуть навсегда из-за lost wakeup. */
 void inout_mouse_task(void) {
-    while (1) {
-        while (1) {
-            inout_event_t ev;
-            bool got_event = false;
-
-            uint64_t flags = irq_save();
-            if (mouse_tail != mouse_head) {
-                ev = mouse_events[mouse_tail];
-                got_event = true;
-            } else {
-                new_mouse_event = false;
-                task_sleep(inout_mouse_proc);
-            }
-            irq_restore(flags);
-
-            if (!got_event) break;
-
-            inout_data_mouse_t *data = &ev.data.mouse;
-
-            if (data->mouse_state == INOUT_MOUSE_DOWN ||
-                data->mouse_state == INOUT_MOUSE_UP) {
-                bool pressed = (data->mouse_state == INOUT_MOUSE_DOWN);
-                if (data->mouse_btn == INOUT_MOUSE_LEFTBTN)
-                    g_mouse.leftbtn_pressed = pressed;
-                else if (data->mouse_btn == INOUT_MOUSE_RIGHTBTN)
-                    g_mouse.rightbtn_pressed = pressed;
-                else if (data->mouse_btn == INOUT_MOUSE_CENTERBTN)
-                    g_mouse.centerbtn_pressed = pressed;
-
-                uint8_t btn = 0;
-                if (g_mouse.leftbtn_pressed)   btn |= 1;
-                if (g_mouse.rightbtn_pressed)  btn |= 2;
-                if (g_mouse.centerbtn_pressed) btn |= 4;
-                input_dev_on_mouse_rel(0, 0, 0, btn);
-            }
-
-            if (data->mouse_state == INOUT_MOUSE_MOVE) {
-                g_mouse.x += data->x;
-                g_mouse.y += data->y;
-                g_mouse.z += data->z;
-
-                uint8_t btn = 0;
-                if (g_mouse.leftbtn_pressed)   btn |= 1;
-                if (g_mouse.rightbtn_pressed)  btn |= 2;
-                if (g_mouse.centerbtn_pressed) btn |= 4;
-                input_dev_on_mouse_rel(data->x, data->y, data->z, btn);
-            }
-
-            if (data->mouse_state == INOUT_MOUSE_MOVE_ABSOLUTE) {
-                g_mouse.x = data->x;
-                g_mouse.y = data->y;
-
-                uint8_t btn = 0;
-                if (g_mouse.leftbtn_pressed)   btn |= 1;
-                if (g_mouse.rightbtn_pressed)  btn |= 2;
-                if (g_mouse.centerbtn_pressed) btn |= 4;
-                input_dev_on_mouse_abs(data->x, data->y, btn);
-            }
-
-            flags = irq_save();
-            mouse_tail = (mouse_tail + 1) % EVENT_QUEUE_SIZE;
-            irq_restore(flags);
-        }
-        schedule_yield();
-    }
+    for (;;) schedule_yield();
 }
 
 void inout_call_scheduler(void) {
-    if (new_kbd_event && inout_kbd_proc &&
-        inout_kbd_proc->state == TASK_SLEEPING) {
-        task_wake(inout_kbd_proc);
-    }
-    if (new_mouse_event && inout_mouse_proc &&
-        inout_mouse_proc->state == TASK_SLEEPING) {
-        task_wake(inout_mouse_proc);
-    }
+    /* Обработка событий идёт прямо в inout_add_event(), задачи больше
+       не спят: task_sleep()+task_wake() давали lost wakeup на SMP, и
+       событие отпускания Shift могло навсегда застрять в очереди. */
+    (void)new_kbd_event;
+    (void)new_mouse_event;
 }
 
 void inout_add_event(inout_event_t ev) {
     uint64_t flags = irq_save();
 
     if (ev.type == INOUT_EVENT_KEY) {
-        uint32_t next = (kbd_head + 1) % EVENT_QUEUE_SIZE;
-        if (next != kbd_tail) {
-            kbd_events[kbd_head] = ev;
-            kbd_head = next;
-            new_kbd_event = true;
-        }
+        key_state_apply(ev.data.key.keycode,
+                        ev.data.key.key_state == INOUT_KEY_DOWN);
     } else if (ev.type == INOUT_EVENT_MOUSE) {
         inout_data_mouse_t *data = &ev.data.mouse;
 
@@ -677,15 +744,9 @@ void inout_add_event(inout_event_t ev) {
     }
 
     irq_restore(flags);
-
-    if (ev.type == INOUT_EVENT_KEY && inout_kbd_proc && inout_kbd_proc->state == TASK_SLEEPING) {
-        task_wake(inout_kbd_proc);
-    }
 }
 
 void inout_init(void) {
-    kbd_head = kbd_tail = 0;
-    mouse_head = mouse_tail = 0;
     input_stream_reset();
 
     inout_kbd_proc = create_task_kernel((void *)inout_keyboard_task, "inout_kbd");
