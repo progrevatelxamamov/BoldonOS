@@ -2581,16 +2581,7 @@ void listing_all_ports(xhci_controller_t *hc) {
     console_print_num(max_ports);
     console_print_string(")\n");
 
-    for (uint32_t t = 0; t < 30000000; t++) {
-        bool any = false;
-        for (uint8_t port = 1; port <= max_ports; port++) {
-            volatile uint8_t *reg = port_base + (port - 1) * 0x10;
-            if (xhci_read32(reg, 0x00) & XHCI_PORTSC_CCS) { any = true; break; }
-        }
-        if (any) break;
-        if ((t & 0xFFFF) == 0) schedule_yield_safe();
-        __asm__ volatile("pause");
-    }
+    console_print_string("[XHCI] scanning ports now; late connections handled by hotplug\n");
 
     uint32_t connected = 0;
     for (uint8_t port = 1; port <= max_ports; port++) {
