@@ -518,7 +518,10 @@ static int device_add(const char *dev, bool auto_mount) {
     }
 
     (void)register_partition_nodes(dev, pt, alias);
-    if (auto_mount) auto_mount_partitions(dev, pt, alias);
+    int root_res = -1;
+    if (!vfs_get_mount('C')) root_res = partitions_try_mount_root(dev);
+    if (root_res == 0) console_print_string("[HOTPLUG] root filesystem became available as C:\n");
+    if (auto_mount && root_res != 0) auto_mount_partitions(dev, pt, alias);
     return 0;
 }
 
@@ -668,11 +671,19 @@ static void hotplug_scan(void) {
 }
 
 static void hotplug_task(void) {
-    uint64_t next = get_monotonic_ms() + 200;
+    uint64_t start = get_monotonic_ms();
+    uint64_t next = start + 200;
+    uint64_t next_root = start + 2000;
     for (;;) {
-        if (hotplug_ready && get_monotonic_ms() >= next) {
-            next = get_monotonic_ms() + 200;
+        uint64_t now = get_monotonic_ms();
+        if (hotplug_ready && now >= next) {
+            next = now + 200;
             hotplug_scan();
+        }
+        if (hotplug_ready && !vfs_get_mount('C') && now >= next_root) {
+            next_root = now + 2000;
+            if (partitions_try_mount_root(NULL) == 0)
+                console_print_string("[HOTPLUG] root filesystem became available as C:\n");
         }
         schedule_yield();
     }
@@ -707,6 +718,8 @@ void partitions_hotplug_start(void) {
     console_print_string("[HOTPLUG] disks found: ");
     console_print_num(known_count);
     console_print_string("\n");
+
+    if (!vfs_get_mount('C')) partitions_try_mount_root(NULL);
 
     hotplug_ready = true;
     create_task_kernel((void *)hotplug_task, "hotplug");

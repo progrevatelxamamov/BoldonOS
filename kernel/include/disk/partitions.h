@@ -126,5 +126,7 @@ void guid_to_string(const uint8_t g[16], char *out);
 void mount_all_partitions(void);
 void partitions_set_boot_serial(const char *guid_str);
 void partitions_set_boot_serial_bytes(const uint8_t guid[16]);
+uint32_t partitions_block_device_count(void);
+int partitions_try_mount_root(const char *dev);
 
 #endif

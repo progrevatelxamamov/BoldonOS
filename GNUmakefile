@@ -132,6 +132,45 @@ kernel/.deps-obtained:
 kernel: kernel/.deps-obtained
 	$(MAKE) -C kernel
 
+.PHONY: check-image
+check-image:
+	@if [ ! -f kernel/bin/kernel ]; then \
+		echo "ERROR: kernel/bin/kernel is missing. Run: make -j$$(nproc)"; exit 1; \
+	fi
+	@if ! grep -aq '\[BOOT\] PCI scan' kernel/bin/kernel; then \
+		echo "ERROR: kernel/bin/kernel is a stale build without [BOOT] markers."; \
+		echo "Run: make clean && make -j$$(nproc)"; exit 1; \
+	fi
+	@if [ -f template.iso ] && ! grep -aq '\[BOOT\] PCI scan' template.iso; then \
+		echo "ERROR: template.iso contains an OLD kernel."; \
+		echo "Run: rm -f template.iso && make -j$$(nproc)"; exit 1; \
+	fi
+	@echo "OK: kernel and image contain the current boot diagnostics"
+
+.PHONY: check-osdata
+check-osdata:
+	@if [ ! -d osdata ]; then \
+		echo "ERROR: osdata/ is missing."; \
+		echo "The root filesystem must contain bin/sh and etc/init.sh."; \
+		exit 1; \
+	fi
+	@if [ ! -f osdata/etc/init.sh ]; then \
+		echo "WARNING: osdata/etc/init.sh is missing - init will fail"; \
+	fi
+	@if [ ! -f osdata/bin/sh ]; then \
+		echo "WARNING: osdata/bin/sh is missing - init will fail"; \
+	fi
+
+.PHONY: usb-image
+usb-image:
+	@$(MAKE) check-osdata
+	@$(MAKE) main.img
+	@$(MAKE) check-image
+	@echo ""
+	@echo "Write main.img to a USB flash drive (replace sdX with the real device):"
+	@echo "  sudo dd if=main.img of=/dev/sdX bs=4M status=progress conv=fsync"
+	@echo "Then boot from that USB stick in BIOS or UEFI mode."
+
 $(IMAGE_NAME).iso: limine-binary/limine kernel
 	rm -rf iso_root
 	mkdir -p iso_root/boot
@@ -175,6 +214,7 @@ distclean: clean
 MAIN_SIZE_MIB := 1024
 
 main.img: limine-binary/limine kernel
+	@if [ ! -d osdata ]; then echo "WARNING: osdata/ is missing - the ext4 root will be empty and /etc/init.sh will not exist"; fi
 	@echo "==> Создаём пустой GPT образ $(MAIN_SIZE_MIB) МиБ"
 	rm -f main.img
 	dd if=/dev/zero bs=1M count=$(MAIN_SIZE_MIB) of=main.img status=none
