@@ -8,19 +8,27 @@
 
 static bool extended = false;
 static bool in_pause  = false;
-static uint8_t pause_bytes = 0;   /* сколько байт уже проглотили в E1-последовательности */
+static uint8_t pause_bytes = 0;
 static bool ps2_kbd_present = false;
 
-void ps2kbd_init(void) {
+void ps2kbd_reset_state(void) {
     extended = false;
-    in_pause  = false;
+    in_pause = false;
     pause_bytes = 0;
+}
 
-    if (ps2_write_kbd(0xF4)) {
-        uint8_t resp = ps2_read_byte();
-        if (resp == 0xFA) {
-            ps2_kbd_present = true;
-        }
+void ps2kbd_init(void) {
+    ps2kbd_reset_state();
+    ps2_kbd_present = false;
+
+    if (!ps2_write_kbd(0xF4)) return;
+
+    for (int i = 0; i < 32; i++) {
+        uint8_t b;
+        if (!ps2_read_any_timeout(&b)) return;
+        if (b == 0xFA) { ps2_kbd_present = true; return; }
+        if (b == 0xFE) { ps2_write_kbd(0xF4); continue; }
+        if ((b & 0xC0) == 0xC0) continue;
     }
 }
 
@@ -32,6 +40,7 @@ static bool ps2kbd_send_with_ack(uint8_t value) {
             if (!ps2_read_kbd_byte_timeout(&response)) return false;
             if (response == 0xFA) return true;
             if (response == 0xFE) break;
+            if ((response & 0xC0) == 0xC0) continue;
             ps2kbd_feed(response);
         }
     }
@@ -54,14 +63,8 @@ void ps2kbd_set_leds(uint8_t leds) {
 static int translate(uint8_t sc, bool *is_release) {
     *is_release = (sc & 0x80) != 0;
 
-    /* 0xFA=ACK, 0xEE=Echo, 0xFC=BAT-fail — ответы устройства на команды.
-       ВАЖНО: 0xAA сюда НЕ входит. 0xAA приходит и как "BAT passed" сразу
-       после RESET (один раз, на инициализации), НО в обычном потоке IRQ это
-       break-код ЛЕВОГО SHIFT (0x2A | 0x80). Раньше он отбрасывался вместе
-       с ответами, отпускание Shift терялось и модификатор "залипал" навсегда:
-       один make 0x2A без парного break 0xAA. */
     if (sc == 0xFA || sc == 0xEE || sc == 0xFC) {
-        extended = false;   /* не даём ответу устройства "залипнуть" префикс */
+        extended = false;
         return -1;
     }
     uint8_t code = sc & 0x7F;
@@ -86,14 +89,11 @@ static int translate(uint8_t sc, bool *is_release) {
         case 0x5B: return KEY_LGUI;
         case 0x5C: return KEY_RGUI;
         case 0x5D: return KEY_MENU;
+        case 0x37: return KEY_PRINTSCREEN;
         default:   return -1;
         }
     }
 
-    /* code == 0 не бывает (это ложное срабатывание при переполнении).
-       Намеренно НЕ обрезаем code > 0x58: одиночные multimedia/ACPI
-       сканкоды 0x5E..0x7F должны доходить до inout, а ответы устройства
-       (ACK/Echo/BAT-fail) уже отфильтрованы выше по полному байту. */
     if (code == 0) return -1;
     return (int)code;
 }
@@ -102,9 +102,6 @@ void ps2kbd_feed(uint8_t byte) {
     if (byte == 0xE0) { extended = true; return; }
     if (byte == 0xE1) { in_pause = true; pause_bytes = 0; return; }
     if (in_pause) {
-        /* Pause/Break даёт E1 1D 45 E1 9D C5. Если хвост C5 потерялся,
-           раньше in_pause оставался TRUE навсегда и клавиатура "умирала":
-           все последующие сканкоды молча глотались. Ограничиваем длину. */
         if (byte == 0xC5 || ++pause_bytes >= 6) {
             in_pause = false;
             pause_bytes = 0;

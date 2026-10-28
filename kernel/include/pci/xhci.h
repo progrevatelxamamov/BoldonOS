@@ -10,6 +10,7 @@
 #define MAX_XHCI_SLOTS 64
 #define MAX_XHCI_CONTROLLERS 8
 #define EVT_QUEUE_SIZE 64
+#define HID_REPORT_QUEUE 8
 
 struct xhci_controller;
 struct usb_hid;
@@ -175,6 +176,7 @@ struct hid_field {
     int32_t  logical_min;
     int32_t  logical_max;
     bool     present;
+    bool     relative;
 };
 
 struct usb_hid {
@@ -206,6 +208,16 @@ struct usb_hid {
     volatile uint8_t pending;
     volatile uint8_t halted;
     volatile uint8_t report_ready;
+    uint8_t  ep_addr;
+    volatile uint32_t report_lock;
+    uint64_t pending_trb_phys;
+    volatile uint8_t transfer_pending;
+    volatile uint8_t report_qh;
+    volatile uint8_t report_qt;
+    uint8_t  report_data[HID_REPORT_QUEUE][64];
+    uint8_t  report_data_len[HID_REPORT_QUEUE];
+    uint32_t last_transfer_ms;
+    uint32_t halt_recovery_ms;
     /* Hotplug: устройство отключено, задача должна освободить ресурсы и уснуть. */
     volatile uint8_t disconnected;
     volatile uint8_t stopped;

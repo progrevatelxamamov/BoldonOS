@@ -1,118 +1,83 @@
 #include <inout/ps2mouse.h>
 #include <inout/ps2.h>
 #include <inout/inout.h>
-#include <mm/malloc.h>
+#include <cpu/time.h>
 #include <stdint.h>
 #include <stdbool.h>
-#include <io.h>
 
 static uint8_t packet[4];
 static int     packet_index = 0;
 static int     packet_size  = 3;
 static uint8_t prev_btns    = 0;
+static uint64_t last_byte_ms = 0;
+static bool    stream_ready = false;
 
-static uint8_t mouse_cmd(uint8_t cmd) {
-    ps2_write_mouse(cmd);
-    return ps2_read_byte();
+void ps2mouse_resync(void) {
+    packet_index = 0;
+    prev_btns = 0;
+    last_byte_ms = get_monotonic_ms();
+    stream_ready = true;
 }
 
-static void mouse_set_sample(uint8_t rate) {
-    mouse_cmd(0xF3);
-    mouse_cmd(rate);
-}
-
-static void mouse_set_resolution(uint8_t res) {
-    mouse_cmd(0xE8);
-    mouse_cmd(res);
-}
-
-static void mouse_set_scaling_1_1(void) {
-    mouse_cmd(0xE6);
-}
-
-static int mouse_get_id(void) {
-    mouse_cmd(0xF2);
-    return ps2_read_byte();
-}
-
-static bool mouse_enable_wheel(void) {
-    mouse_set_sample(200);
-    mouse_set_sample(100);
-    mouse_set_sample(80);
-    int id = mouse_get_id();
-    if (id == 3 || id == 4) {
-        packet_size = 4;
-        return true;
-    }
-    mouse_set_sample(100);
-    return false;
-}
-
-#define PS2_DATA    0x60
-#define PS2_STATUS  0x64
-#define PS2_CMD     0x64
-
-#define STATUS_OUTPUT_FULL  0x01
-#define STATUS_INPUT_FULL   0x02
-
-#define CMD_WRITE_MOUSE     0xD4
-#define CMD_DISABLE_KBD     0xAD
-#define CMD_ENABLE_KBD      0xAE
-#define CMD_DISABLE_MOUSE   0xA7
-#define CMD_ENABLE_MOUSE    0xA8
-
-bool ps2_try_read_byte(uint8_t *out) {
-    for (int i = 0; i < 100000; i++) {
-        if (inb(PS2_STATUS) & STATUS_OUTPUT_FULL) {
-            *out = inb(PS2_DATA);
-            return true;
+static int mouse_cmd(uint8_t cmd) {
+    for (int retry = 0; retry < 3; retry++) {
+        if (!ps2_write_mouse(cmd)) return -1;
+        for (int i = 0; i < 96; i++) {
+            uint8_t b;
+            if (!ps2_read_any_timeout(&b)) break;
+            if (b == 0xFA) return 0;
+            if (b == 0xFE) break;
+            if (b == 0xFC || b == 0xFD) return -1;
+            if ((b & 0xC0) == 0xC0) continue;
         }
     }
-    return false;
+    return -1;
 }
 
-static int mouse_cmd_expect_ack(uint8_t cmd) {
-    for (int retry = 0; retry < 3; retry++) {
-        ps2_write_mouse(cmd);
-        uint8_t resp;
-        if (!ps2_try_read_byte(&resp)) continue;
-        if (resp == 0xFA) return 0;
-        if (resp == 0xFE) continue;
-        return -1;
+static int mouse_read_id(void) {
+    if (!ps2_write_mouse(0xF2)) return -1;
+    bool ack = false;
+    for (int i = 0; i < 96; i++) {
+        uint8_t b;
+        if (!ps2_read_any_timeout(&b)) break;
+        if (b == 0xFA) { ack = true; continue; }
+        if (!ack) continue;
+        if (b == 0x00 || b == 0x02 || b == 0x03 || b == 0x04) return (int)b;
+        if ((b & 0xC0) != 0xC0) continue;
     }
     return -1;
 }
 
 void ps2mouse_init(void) {
+    stream_ready = false;
     packet_index = 0;
-    prev_btns    = 0;
-    packet_size  = 3;
+    prev_btns = 0;
+    packet_size = 3;
 
-    if (mouse_cmd_expect_ack(0xF6) < 0) return;   /* defaults */
+    ps2_write_mouse(0xF5);
+    ps2_drain_quiet(512);
 
-    if (mouse_cmd_expect_ack(0xE8) < 0) return;   /* resolution */
-    if (mouse_cmd_expect_ack(3) < 0) return;      /* 8 counts/mm */
-
-    if (mouse_cmd_expect_ack(0xF3) < 0) return;   /* sample rate */
-    if (mouse_cmd_expect_ack(100) < 0) return;
-
-    if (mouse_cmd_expect_ack(0xF3) == 0) {
-        if (mouse_cmd_expect_ack(200) == 0 &&
-            mouse_cmd_expect_ack(0xF3) == 0 &&
-            mouse_cmd_expect_ack(100) == 0 &&
-            mouse_cmd_expect_ack(0xF3) == 0 &&
-            mouse_cmd_expect_ack(80) == 0)
-        {
-            if (mouse_cmd_expect_ack(0xF2) == 0) {
-                uint8_t id;
-                if (ps2_try_read_byte(&id)) {
-                    if (id == 3 || id == 4) packet_size = 4;
-                }
-            }
-        }
+    if (mouse_cmd(0xFF) == 0) {
+        ps2_drain_quiet(1024);
     }
 
-    if (mouse_cmd_expect_ack(0xF4) < 0) return;   /* enable reporting */
+    if (mouse_cmd(0xF5) != 0) return;
+
+    if (mouse_cmd(0xF3) == 0 && mouse_cmd(200) == 0 &&
+        mouse_cmd(0xF3) == 0 && mouse_cmd(100) == 0 &&
+        mouse_cmd(0xF3) == 0 && mouse_cmd(80) == 0) {
+        int id = mouse_read_id();
+        if (id == 3 || id == 4) packet_size = 4;
+    }
+
+    if (mouse_cmd(0xE8) == 0) mouse_cmd(3);
+    if (mouse_cmd(0xF3) == 0) mouse_cmd(100);
+
+    ps2_drain_quiet(256);
+
+    if (mouse_cmd(0xF4) != 0) return;
+
+    ps2mouse_resync();
 }
 
 static void emit_move(int dx, int dy, int dz) {
@@ -144,24 +109,43 @@ static void emit_button(int btn, bool down) {
 }
 
 void ps2mouse_feed(uint8_t byte) {
-    if (packet_index == 0 && (byte & 0x08) == 0)
+    if (!stream_ready) return;
+
+    uint64_t now = get_monotonic_ms();
+    uint64_t gap = now - last_byte_ms;
+    last_byte_ms = now;
+
+    if (packet_index > 0 && gap >= 3) packet_index = 0;
+
+    if (packet_index == 0) {
+        if ((byte & 0x08) == 0 || (byte & 0xC0)) return;
+        packet[0] = byte;
+        packet_index = 1;
         return;
+    }
+
+    if (packet_index == 1 && (byte & 0xC0)) {
+        packet_index = 0;
+        return;
+    }
+
+    if (packet_index >= 1 && packet_index < packet_size &&
+        (byte & 0x08) && !(byte & 0xC0) && gap >= 3) {
+        packet[0] = byte;
+        packet_index = 1;
+        return;
+    }
 
     packet[packet_index++] = byte;
-
-    if (packet_index < packet_size)
-        return;
+    if (packet_index < packet_size) return;
 
     packet_index = 0;
 
     uint8_t flags = packet[0];
-
-    if (flags & 0xC0)
-        return;
+    if (flags & 0xC0) return;
 
     int dx = (int8_t)packet[1];
     int dy = (int8_t)packet[2];
-
     dy = -dy;
 
     int dz = 0;
@@ -179,6 +163,5 @@ void ps2mouse_feed(uint8_t byte) {
     if (changed & 0x04) emit_button(INOUT_MOUSE_CENTERBTN, (curr_btns & 0x04) != 0);
 
     prev_btns = curr_btns;
-
     emit_move(dx, dy, dz);
 }

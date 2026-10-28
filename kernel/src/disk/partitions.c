@@ -645,7 +645,7 @@ void mount_all_partitions(void) {
     fat32_vfs_init();
     ext4_vfs_init();
 
-    char next_letter = 'D';
+    char next_letter = 'E';
     bool c_mounted = false;
     int boot_cand_idx = -1;
 
@@ -837,4 +837,56 @@ void mount_all_partitions(void) {
         console_print_string("NOT MOUNTED (FAIL)\n");
     }
     console_print_string("==================================================================\n\n");
+}
+
+int partitions_add_table(struct partition_table *pt) {
+    if (!pt || !pt->block_device_name) return -1;
+
+    for (uint64_t i = 0; i < part_tables_count; i++) {
+        if (!part_tables[i]) continue;
+        if (my_strcmp(part_tables[i]->block_device_name, pt->block_device_name) == 0) {
+            void *old = part_tables[i];
+            part_tables[i] = pt;
+            if (old && old != pt) malloc_free(old);
+            return 0;
+        }
+    }
+
+    for (uint64_t i = 0; i < MAX_BLOCK_DEVICES; i++) {
+        if (!part_tables[i]) {
+            part_tables[i] = pt;
+            if (i >= part_tables_count) part_tables_count = i + 1;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+void partitions_remove_table(const char *name) {
+    if (!name) return;
+    for (uint64_t i = 0; i < part_tables_count; i++) {
+        if (!part_tables[i] || !part_tables[i]->block_device_name) continue;
+        if (my_strcmp(part_tables[i]->block_device_name, name) != 0) continue;
+        void *old = part_tables[i];
+        part_tables[i] = NULL;
+        if (old) malloc_free(old);
+    }
+    while (part_tables_count > 0 && !part_tables[part_tables_count - 1])
+        part_tables_count--;
+}
+
+const char *partitions_detect_fs(const char *dev, uint64_t lba) {
+    void *page = pmm_alloc_page();
+    if (!page) return NULL;
+    void *buf = (void *)((uint64_t)page + get_bootinfo().hhdm->offset);
+    memset(buf, 0, 4096);
+
+    const char *result = NULL;
+    if (block_read(dev, lba, 8, buf) == 0) {
+        uint8_t *raw = (uint8_t *)buf;
+        if (is_fat32_sector(raw)) result = "fat32";
+        else if (is_ext4_sector(raw + 1024)) result = "ext4";
+    }
+    pmm_free_page(page);
+    return result;
 }

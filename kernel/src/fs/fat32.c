@@ -685,5 +685,10 @@ static vfs_mount_t* fat32_mount(const char *dev, void *data) {
     return m;
 }
 
-static vfs_fs_type_t fat32_type = { .name = "fat32", .mount = fat32_mount };
+static int fat32_unmount(vfs_mount_t *mnt) {
+    (void)mnt;
+    return 0;
+}
+
+static vfs_fs_type_t fat32_type = { .name = "fat32", .mount = fat32_mount, .unmount = fat32_unmount };
 void fat32_vfs_init(void) { vfs_register_fs(&fat32_type); }

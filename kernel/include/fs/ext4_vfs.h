@@ -7,5 +7,6 @@
 
 bool is_ext4_sector(const uint8_t *sb_buf);
 void ext4_vfs_init(void);
+int  ext4_vfs_unmount(vfs_mount_t *mnt);
 
 #endif

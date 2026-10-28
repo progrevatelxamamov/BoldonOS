@@ -5,5 +5,6 @@
 
 void ps2mouse_init(void);
 void ps2mouse_feed(uint8_t byte);
+void ps2mouse_resync(void);
 
 #endif

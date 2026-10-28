@@ -4,7 +4,7 @@
 #include <string.h>
 #include <errno.h>
 
-#define MAX_DEVFS_NODES 64
+#define MAX_DEVFS_NODES 256
 
 typedef struct {
     char name[64];
@@ -202,7 +202,19 @@ int devfs_register_device(const char *name, vfs_node_type_t type, vfs_file_ops_t
             dev_nodes[i].node.file_ops = ops;
             dev_nodes[i].node.fs_data = private_data;
             dev_nodes[i].node.mode = 0666;
+            dev_nodes[i].node.inode_num = (type == VFS_TYPE_BLOCK_DEV ? 0x0800u : 0x0100u) + (uint32_t)i;
             dev_nodes[i].used = true;
+            return 0;
+        }
+    }
+    return -1;
+}
+int devfs_unregister_device(const char *name) {
+    if (!name) return -1;
+    const char *sname = clean_name(name);
+    for (int i = 0; i < MAX_DEVFS_NODES; i++) {
+        if (dev_nodes[i].used && strcmp(clean_name(dev_nodes[i].name), sname) == 0) {
+            memset(&dev_nodes[i], 0, sizeof(devfs_node_entry_t));
             return 0;
         }
     }

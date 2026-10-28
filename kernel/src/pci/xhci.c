@@ -11,6 +11,7 @@
 #include <gconsole.h>
 #include <memory.h>
 #include <disk/block.h>
+#include <disk/partitions.h>
 #include <scheduler/scheduler.h>
 #include <inout/inout.h>
 #include <cpu/apic.h>
@@ -19,8 +20,8 @@
 
 extern int init_rtl8192eu_wifi(xhci_controller_t *hc, uint8_t slot_id, uint8_t speed, uint8_t ep_in, uint8_t ep_out, uint16_t mps);
 
-void handle_keyboard_report(struct usb_hid *hid);
-void handle_mouse_report(struct usb_hid *hid);
+static void hid_capture_report(struct usb_hid *hid, const struct xhci_trb *evt, uint32_t len);
+static void hid_capture_fail(struct usb_hid *hid, const struct xhci_trb *evt);
 void handle_port_connect(xhci_controller_t *hc, uint8_t port);
 void handle_port_disconnect(xhci_controller_t *hc, uint8_t port);
 static void xhci_ack_port_changes(volatile uint8_t *portsc_reg);
@@ -167,6 +168,7 @@ void ep_ring_enqueue(volatile struct xhci_trb *ring, uint32_t *enqueue, uint8_t 
 int xhci_poll_event(xhci_controller_t *hc, struct xhci_trb *out_evt) {
     volatile struct xhci_trb *ring = (volatile struct xhci_trb *)hc->evt_ring;
     uint32_t control = ring[hc->evt_dequeue].control;
+    __sync_synchronize();
     if ((control & 1) != hc->evt_cycle) {
         return 0;
     }
@@ -181,6 +183,38 @@ int xhci_poll_event(xhci_controller_t *hc, struct xhci_trb *out_evt) {
     uint64_t erdp = hc->evt_ring_phys + (hc->evt_dequeue * sizeof(struct xhci_trb));
     xhci_write64(hc->rt_regs, 0x20 + 0x18, erdp | (1u << 3));
     return 1;
+}
+
+static void hid_capture_report(struct usb_hid *hid, const struct xhci_trb *evt, uint32_t len) {
+    if (!hid || !evt || !hid->report || hid->disconnected || len == 0) return;
+    if (len > 64) len = 64;
+    if (len > hid->report_size) len = hid->report_size;
+
+    xhci_lock(&hid->report_lock);
+    if (!hid->transfer_pending || evt->param != hid->pending_trb_phys) {
+        xhci_unlock(&hid->report_lock);
+        return;
+    }
+    hid->transfer_pending = 0;
+
+    uint8_t next = (uint8_t)((hid->report_qh + 1) % HID_REPORT_QUEUE);
+    if (next == hid->report_qt)
+        hid->report_qt = (uint8_t)((hid->report_qt + 1) % HID_REPORT_QUEUE);
+    memcpy(hid->report_data[hid->report_qh], (const void *)hid->report, len);
+    hid->report_data_len[hid->report_qh] = (uint8_t)len;
+    hid->report_qh = next;
+    hid->report_ready = 1;
+    xhci_unlock(&hid->report_lock);
+}
+
+static void hid_capture_fail(struct usb_hid *hid, const struct xhci_trb *evt) {
+    if (!hid || !evt || hid->disconnected) return;
+    xhci_lock(&hid->report_lock);
+    if (hid->transfer_pending && evt->param == hid->pending_trb_phys) {
+        hid->transfer_pending = 0;
+        hid->halted = 1;
+    }
+    xhci_unlock(&hid->report_lock);
 }
 
 void xhci_poll(xhci_controller_t *hc) {
@@ -205,13 +239,13 @@ void xhci_poll(xhci_controller_t *hc) {
                 if (hid && !hid->disconnected) {
                     if (code == 1 || code == 13) {
                         uint32_t residual = evt.status & 0x00FFFFFFu;
-                        if (residual <= hid->report_size)
-                            hid->report_len = (uint16_t)(hid->report_size - residual);
-                        else
-                            hid->report_len = hid->report_size;
-                        hid->report_ready = 1;
-                    } else {
-                        hid->halted = 1;
+                        uint32_t len = (residual <= hid->report_size)
+                            ? (uint32_t)(hid->report_size - residual)
+                            : (uint32_t)hid->report_size;
+                        hid->report_len = (uint16_t)len;
+                        hid_capture_report(hid, &evt, len);
+                    } else if (code >= 2) {
+                        hid_capture_fail(hid, &evt);
                     }
                 }
             }
@@ -426,7 +460,6 @@ int xhci_bulk_transfer(xhci_controller_t *hc, uint8_t slot_id,
         idx = 0;
     }
     uint32_t trb_idx   = idx;
-    uint32_t cur_enq   = *enqueue;
     uint8_t  cur_cyc   = *cycle;
 
     ring[trb_idx].param   = data_phys;
@@ -439,19 +472,25 @@ int xhci_bulk_transfer(xhci_controller_t *hc, uint8_t slot_id,
     __asm__ volatile("mfence" ::: "memory");
     hc->db_regs[slot_id] = db_target;
 
-    xhci_unlock(&hc->ep_lock[slot_id][db_target]);
-
     struct xhci_trb evt;
+    int result = -2;
     if (xhci_wait_transfer(hc, slot_id, db_target, &evt) != 0) {
         xhci_reset_endpoint(hc, slot_id, db_target);
+        xhci_set_tr_dequeue(hc, slot_id, db_target,
+                            virt_to_phys((void*)ring) + trb_idx * sizeof(struct xhci_trb),
+                            cur_cyc);
         *enqueue = trb_idx;
         *cycle   = cur_cyc;
         evtq_drain(&hc->transfer_evt_q[slot_id][db_target]);
-        return -1;
+        result = -1;
+        goto bulk_out;
     }
 
     uint8_t code = (evt.status >> 24) & 0xFF;
-    if (code == 1 || code == 13) return 0;
+    if (code == 1 || code == 13) {
+        result = 0;
+        goto bulk_out;
+    }
 
     if (code == 6) {
         xhci_reset_endpoint(hc, slot_id, db_target);
@@ -461,9 +500,12 @@ int xhci_bulk_transfer(xhci_controller_t *hc, uint8_t slot_id,
         *enqueue = trb_idx;
         *cycle   = cur_cyc;
         evtq_drain(&hc->transfer_evt_q[slot_id][db_target]);
-        return -6;
+        result = -6;
     }
-    return -2;
+
+bulk_out:
+    xhci_unlock(&hc->ep_lock[slot_id][db_target]);
+    return result;
 }
 
 int xhci_bulk_transfer_len(xhci_controller_t *hc, uint8_t slot_id,
@@ -499,15 +541,18 @@ int xhci_bulk_transfer_len(xhci_controller_t *hc, uint8_t slot_id,
     __asm__ volatile("mfence" ::: "memory");
     hc->db_regs[slot_id] = db_target;
 
-    xhci_unlock(&hc->ep_lock[slot_id][db_target]);
-
     struct xhci_trb evt;
+    int result = -2;
     if (xhci_wait_transfer(hc, slot_id, db_target, &evt) != 0) {
         xhci_reset_endpoint(hc, slot_id, db_target);
+        xhci_set_tr_dequeue(hc, slot_id, db_target,
+                            virt_to_phys((void*)ring) + trb_idx * sizeof(struct xhci_trb),
+                            cur_cyc);
         *enqueue = trb_idx;
         *cycle   = cur_cyc;
         evtq_drain(&hc->transfer_evt_q[slot_id][db_target]);
-        return -1;
+        result = -1;
+        goto bulk_len_out;
     }
 
     uint8_t code = (evt.status >> 24) & 0xFF;
@@ -516,7 +561,8 @@ int xhci_bulk_transfer_len(xhci_controller_t *hc, uint8_t slot_id,
             uint32_t residual = evt.status & 0xFFFFFF;
             *out_actual = (residual < length) ? (length - residual) : 0;
         }
-        return 0;
+        result = 0;
+        goto bulk_len_out;
     }
 
     if (code == 6) {
@@ -527,9 +573,12 @@ int xhci_bulk_transfer_len(xhci_controller_t *hc, uint8_t slot_id,
         *enqueue = trb_idx;
         *cycle   = cur_cyc;
         evtq_drain(&hc->transfer_evt_q[slot_id][db_target]);
-        return -6;
+        result = -6;
     }
-    return -2;
+
+bulk_len_out:
+    xhci_unlock(&hc->ep_lock[slot_id][db_target]);
+    return result;
 }
 
 int usb_bot_command(xhci_controller_t *hc, usb_msd_t *msd,
@@ -907,7 +956,7 @@ static int32_t hid_extract_field(const uint8_t *report, uint32_t report_len,
         if (report[byte_index] & (uint8_t)(1u << (bit_index & 7)))
             value |= 1ULL << i;
     }
-    if (field->logical_min < 0 && bits < 32 &&
+    if (bits < 32 && (field->logical_min < 0 || field->relative) &&
         (value & (1ULL << (bits - 1))))
         value |= ~((1ULL << bits) - 1ULL);
     return (int32_t)value;
@@ -1058,6 +1107,7 @@ static void hid_parse_report_descriptor(struct usb_hid *hid, const uint8_t *desc
                     field.logical_min = state.logical_min;
                     field.logical_max = state.logical_max;
                     field.present = state.report_size != 0;
+                    field.relative = is_relative;
 
                     if (tag == 8 && hid->protocol == 2 && is_variable && have_usage) {
                         bool report_match = !mouse_id_known || report_id == mouse_id;
@@ -1149,23 +1199,26 @@ static void hid_parse_report_descriptor(struct usb_hid *hid, const uint8_t *desc
     }
 }
 
-void handle_keyboard_report(struct usb_hid *hid) {
-    uint8_t *r = hid->report;
-    uint32_t report_len = hid->report_len ? hid->report_len : hid->report_size;
+static void handle_keyboard_report(struct usb_hid *hid, const uint8_t *r, uint32_t report_len) {
+    if (!r || report_len == 0 || report_len > 64) return;
     if (report_len > hid->report_size) report_len = hid->report_size;
 
     uint8_t cur_keys[16] = {0};
     uint32_t cur_key_count = 0;
     uint8_t modifiers = 0;
-    bool parsed = false;
 
-    if (hid->kbd_layout_valid) {
-        uint32_t expected = (uint32_t)((hid->kbd_report_bits + 7) / 8) + (hid->kbd_report_id ? 1 : 0);
+    bool use_layout = hid->kbd_layout_valid &&
+        (hid->report_protocol_active || hid->kbd_report_id == 0);
+
+    if (use_layout) {
+        uint32_t expected = (uint32_t)((hid->kbd_report_bits + 7) / 8) +
+                            (hid->kbd_report_id ? 1 : 0);
         uint32_t offset = 0;
         if (hid->kbd_report_id) {
-            if (report_len >= 1 && r[0] == hid->kbd_report_id) offset = 1;
+            if (report_len < 1 || r[0] != hid->kbd_report_id) return;
+            offset = 1;
         }
-        if ((hid->kbd_report_id == 0 || offset == 1) && report_len >= expected) {
+        if (report_len >= expected) {
             const uint8_t *payload = r + offset;
             uint32_t payload_len = report_len - offset;
             for (uint32_t i = 0; i < 8; i++) {
@@ -1182,34 +1235,19 @@ void handle_keyboard_report(struct usb_hid *hid) {
                 int32_t usage = hid_extract_field(payload, payload_len, &field);
                 cur_keys[i] = usage > 0 && usage <= 0xFF ? (uint8_t)usage : 0;
             }
-            parsed = true;
         }
-    }
-
-    if (!parsed) {
+    } else {
         uint32_t offset = 0;
         if (hid->report_protocol_active && hid->has_input_report_id &&
             report_len >= 9 && r[0] == hid->input_report_id)
             offset = 1;
-        if (report_len < offset + 8) {
-            /* Короткий/битый репорт: считаем все клавиши отпущенными.
-               Просто return здесь оставлял бы залипший Shift навсегда. */
-            modifiers = 0;
-            cur_key_count = 0;
-        } else {
+        if (report_len >= offset + 8) {
             modifiers = r[offset];
             cur_key_count = 6;
             memcpy(cur_keys, &r[offset + 2], 6);
         }
     }
 
-    /* Собираем ПОЛНОЕ текущее множество клавиш и сверяем его с прошлым.
-       Раньше g_keyboard.down[] писался здесь напрямую и только по фронтам,
-       а inout_keyboard_task писал его второй раз из своей очереди. Любое
-       потерянное UP-событие оставляло Shift включённым навсегда.
-       Теперь состояние меняется только в inout_set_key_state(), а на
-       каждом репорте мы заново выставляем ВСЕ известные клавиши —
-       рассинхронизация сама исправляется следующим репортом. */
     static const uint16_t mod_codes[8] = {
         KEY_LCTRL, KEY_LSHIFT, KEY_LALT, KEY_LGUI,
         KEY_RCTRL, KEY_RSHIFT, KEY_RALT, KEY_RGUI
@@ -1237,14 +1275,6 @@ void handle_keyboard_report(struct usb_hid *hid) {
             cur_codes[cur_count++] = (uint8_t)kc;
     }
 
-    /* Сначала отпускаем исчезнувшие, затем подтверждаем нажатые.
-       ВАЖНО: репорт клавиатуры — это ПОЛНОЕ состояние её модификаторов.
-       Явно снимаем все 8 модификаторов, которых в репорте нет, даже если
-       этот hid их никогда не нажимал: на реальном железе BIOS часто
-       дублирует USB-клавиатуру через PS/2-эмуляцию (USB legacy support),
-       и залипший там Shift иначе нечему отпустить. inout_set_key_state()
-       сама игнорирует повторные UP, так что нормальная работа не меняется.
-       Допущение: одна физическая клавиатура, что и есть типичный случай. */
     static const uint8_t hid_mod_codes[8] = {
         KEY_LCTRL, KEY_LSHIFT, KEY_LALT, KEY_LGUI,
         KEY_RCTRL, KEY_RSHIFT, KEY_RALT, KEY_RGUI
@@ -1267,7 +1297,6 @@ void handle_keyboard_report(struct usb_hid *hid) {
     memcpy(hid->active_keycodes, cur_codes, cur_count);
     hid->active_keycode_count = cur_count;
 
-    /* prev_* оставляем согласованными для отладочных дампов. */
     memset(hid->prev_keys, 0, sizeof(hid->prev_keys));
     if (cur_key_count > sizeof(hid->prev_keys))
         cur_key_count = sizeof(hid->prev_keys);
@@ -1276,9 +1305,8 @@ void handle_keyboard_report(struct usb_hid *hid) {
     hid->prev_modifiers = modifiers;
 }
 
-void handle_mouse_report(struct usb_hid *hid) {
-    uint8_t *r = hid->report;
-    uint32_t report_len = hid->report_len ? hid->report_len : hid->report_size;
+static void handle_mouse_report(struct usb_hid *hid, const uint8_t *r, uint32_t report_len) {
+    if (!r || report_len == 0 || report_len > 64) return;
     if (report_len > hid->report_size) report_len = hid->report_size;
 
     int dx = 0;
@@ -1287,47 +1315,54 @@ void handle_mouse_report(struct usb_hid *hid) {
     uint8_t buttons = 0;
     bool parsed = false;
 
-    if (hid->mouse_layout_valid) {
-        uint32_t expected = (uint32_t)((hid->mouse_report_bits + 7) / 8) + (hid->mouse_report_id ? 1 : 0);
+    bool use_layout = hid->mouse_layout_valid &&
+        (hid->report_protocol_active || hid->mouse_report_id == 0);
+
+    if (use_layout) {
+        uint32_t expected = (uint32_t)((hid->mouse_report_bits + 7) / 8) +
+                            (hid->mouse_report_id ? 1 : 0);
         uint32_t offset = 0;
         if (hid->mouse_report_id) {
-            if (report_len >= 1 && r[0] == hid->mouse_report_id) offset = 1;
+            if (report_len < 1 || r[0] != hid->mouse_report_id) return;
+            offset = 1;
         }
-        if ((hid->mouse_report_id == 0 || offset == 1) && report_len >= expected) {
-            const uint8_t *payload = r + offset;
-            uint32_t payload_len = report_len - offset;
-            uint32_t button_bits = 0;
-            for (uint32_t i = 0; i < hid->mouse_button_count && i < 8; i++) {
-                struct hid_field field = hid->mouse_buttons;
-                field.bit_offset = (uint16_t)(field.bit_offset + i * field.bit_size);
-                if (hid_extract_field(payload, payload_len, &field) != 0)
-                    button_bits |= 1u << i;
-            }
-            buttons = (uint8_t)button_bits;
-            dx = hid_extract_field(payload, payload_len, &hid->mouse_x);
-            dy = hid_extract_field(payload, payload_len, &hid->mouse_y);
-            dz = hid_extract_field(payload, payload_len, &hid->mouse_wheel);
-            parsed = true;
+        if (report_len < expected) return;
+
+        const uint8_t *payload = r + offset;
+        uint32_t payload_len = report_len - offset;
+        uint32_t button_bits = 0;
+        for (uint32_t i = 0; i < hid->mouse_button_count && i < 8; i++) {
+            struct hid_field field = hid->mouse_buttons;
+            field.bit_offset = (uint16_t)(field.bit_offset + i * field.bit_size);
+            if (hid_extract_field(payload, payload_len, &field) != 0)
+                button_bits |= 1u << i;
         }
+        buttons = (uint8_t)button_bits;
+        dx = hid_extract_field(payload, payload_len, &hid->mouse_x);
+        dy = hid_extract_field(payload, payload_len, &hid->mouse_y);
+        dz = hid_extract_field(payload, payload_len, &hid->mouse_wheel);
+        parsed = true;
     }
 
     if (!parsed) {
         uint32_t offset = 0;
         if (hid->report_protocol_active && hid->has_input_report_id &&
-            report_len >= 5 && r[0] == hid->input_report_id)
+            r[0] == hid->input_report_id)
             offset = 1;
         if (report_len < offset + 3) return;
-        buttons = r[offset];
+        if (r[offset] & 0xC0) return;
+        buttons = (uint8_t)(r[offset] & 0x07);
         dx = (int8_t)r[offset + 1];
         dy = (int8_t)r[offset + 2];
         dz = report_len > offset + 3 ? (int8_t)r[offset + 3] : 0;
     }
 
-    uint8_t prev = hid->prev_buttons;
+    if (dx > 2048 || dx < -2048 || dy > 2048 || dy < -2048) return;
+    if (dx > 127) dx = 127; else if (dx < -127) dx = -127;
+    if (dy > 127) dy = 127; else if (dy < -127) dy = -127;
+    if (dz > 127) dz = 127; else if (dz < -127) dz = -127;
 
-    g_mouse.leftbtn_pressed   = (buttons & 0x01) != 0;
-    g_mouse.rightbtn_pressed  = (buttons & 0x02) != 0;
-    g_mouse.centerbtn_pressed = (buttons & 0x04) != 0;
+    uint8_t prev = hid->prev_buttons;
 
     if (dx != 0 || dy != 0 || dz != 0) {
         inout_event_t ev;
@@ -1468,10 +1503,11 @@ static void usb_hid_task(void *arg) {
     struct usb_hid *hid = (struct usb_hid *)arg;
     xhci_controller_t *hc = hid->hc;
     bool transfer_queued = false;
+    uint8_t snap[64];
+
+    hid->last_transfer_ms = (uint32_t)get_monotonic_ms();
 
     for (;;) {
-        /* Нас отключили: больше не трогаем кольцо/endpoint'ы и отдаём
-           handle_port_disconnect'у возможность освободить память. */
         if (hid->disconnected) {
             hid->stopped = 1;
             for (;;) {
@@ -1481,12 +1517,28 @@ static void usb_hid_task(void *arg) {
         }
 
         if (hid->halted) {
+            hid->halted = 0;
+            uint32_t now = (uint32_t)get_monotonic_ms();
+            if (now - hid->halt_recovery_ms > 50 && hid->ep_addr)
+                usb_msd_clear_halt(hc, hid->slot_id, hid->ep_addr);
+            hid->halt_recovery_ms = now;
+
+            xhci_lock(&hid->report_lock);
+            hid->transfer_pending = 0;
+            hid->report_qh = 0;
+            hid->report_qt = 0;
+            hid->report_ready = 0;
+            xhci_unlock(&hid->report_lock);
+
             xhci_reset_endpoint(hc, hid->slot_id, hid->dci);
-            xhci_set_tr_dequeue(hc, hid->slot_id, hid->dci, hid->ring_phys, 1);
+
             hid->enqueue = 0;
             hid->cycle = 1;
-            hid->halted = 0;
-            hid->report_ready = 0;
+            hid->ring[COUNT_OF_TRB - 1].param   = hid->ring_phys;
+            hid->ring[COUNT_OF_TRB - 1].status  = 0;
+            hid->ring[COUNT_OF_TRB - 1].control = (TRB_LINK << 10) | (1u << 1) | 1u;
+            xhci_set_tr_dequeue(hc, hid->slot_id, hid->dci, hid->ring_phys, 1);
+
             hid->report_len = 0;
             transfer_queued = false;
         }
@@ -1511,12 +1563,26 @@ static void usb_hid_task(void *arg) {
             }
         }
 
-        if (hid->report_ready) {
-            hid->report_ready = 0;
-            transfer_queued = false;
-            if (hid->protocol == 1) handle_keyboard_report(hid);
-            else if (hid->protocol == 2) handle_mouse_report(hid);
+        uint8_t snap_len = 0;
+        xhci_lock(&hid->report_lock);
+        if (hid->report_qt != hid->report_qh) {
+            snap_len = hid->report_data_len[hid->report_qt];
+            if (snap_len > 64) snap_len = 64;
+            memcpy(snap, hid->report_data[hid->report_qt], snap_len);
+            hid->report_qt = (uint8_t)((hid->report_qt + 1) % HID_REPORT_QUEUE);
+            if (hid->report_qt == hid->report_qh) hid->report_ready = 0;
         }
+        xhci_unlock(&hid->report_lock);
+
+        if (snap_len) {
+            transfer_queued = false;
+            if (hid->protocol == 1) handle_keyboard_report(hid, snap, snap_len);
+            else if (hid->protocol == 2) handle_mouse_report(hid, snap, snap_len);
+        }
+
+        if (transfer_queued &&
+            (uint32_t)get_monotonic_ms() - hid->last_transfer_ms > 500)
+            hid->halted = 1;
 
         if (!transfer_queued) {
             xhci_lock(&hc->ep_lock[hid->slot_id][hid->dci]);
@@ -1536,8 +1602,15 @@ static void usb_hid_task(void *arg) {
             hid->ring[idx].param   = hid->report_phys;
             hid->ring[idx].status  = hid->report_size;
             hid->ring[idx].control = (TRB_NORMAL << 10) | (1u << 5) | hid->cycle;
+
+            xhci_lock(&hid->report_lock);
+            hid->pending_trb_phys = hid->ring_phys + (uint64_t)idx * sizeof(struct xhci_trb);
+            hid->transfer_pending = 1;
+            xhci_unlock(&hid->report_lock);
+
             hid->enqueue++;
             transfer_queued = true;
+            hid->last_transfer_ms = (uint32_t)get_monotonic_ms();
 
             __asm__ volatile("mfence" ::: "memory");
             hc->db_regs[hid->slot_id] = hid->dci;
@@ -1545,7 +1618,6 @@ static void usb_hid_task(void *arg) {
             xhci_unlock(&hc->ep_lock[hid->slot_id][hid->dci]);
         }
         schedule_yield_safe();
-
     }
 }
 
@@ -1612,6 +1684,7 @@ static void init_usb_hid(xhci_controller_t *hc, uint8_t slot_id, uint8_t speed,
     hid->speed = speed;
     hid->iface_num = iface_num;
     hid->dci = (ep_in_addr & 0x0F) * 2 + 1;
+    hid->ep_addr = ep_in_addr;
     hid->mps = mps;
     hid->bInterval = interval;
     hid->report_size = (mps > 0 && mps <= 64) ? mps : 8;
@@ -1639,6 +1712,11 @@ static void init_usb_hid(xhci_controller_t *hc, uint8_t slot_id, uint8_t speed,
     hid->halted = 0;
     hid->report_ready = 0;
     hid->report_len = 0;
+    hid->report_qh = 0;
+    hid->report_qt = 0;
+    hid->transfer_pending = 0;
+    hid->report_lock = 0;
+    hid->last_transfer_ms = (uint32_t)get_monotonic_ms();
     hid->disconnected = 0;
     hid->stopped = 0;
     hid->active_keycode_count = 0;
@@ -2175,7 +2253,9 @@ static void xhci_disconnect_hid_devices(xhci_controller_t *hc, uint8_t slot_id) 
     }
 
     for (int i = 0; i < n; i++) {
-        if (!hids[i]->stopped) continue; /* задача ещё жива — не трогаем её память */
+        if (!hids[i]->stopped) continue;
+        hids[i]->report = NULL;
+        hids[i]->transfer_pending = 0;
         pmm_free_pages((void*)hids[i]->ring_phys, 1);
         pmm_free_pages((void*)hids[i]->report_phys, 1);
         malloc_free(hids[i]);
@@ -2196,7 +2276,12 @@ static void xhci_destroy_slot(xhci_controller_t *hc, uint8_t slot_id) {
         if (bd->type == DISK_TYPE_USB && bd->local_device_struct != NULL) {
             usb_msd_t *msd = (usb_msd_t *)bd->local_device_struct;
             if (msd->hc == hc && msd->slot_id == slot_id) {
-                unregister_device(bd->name);
+                char dev_name[32];
+                memset(dev_name, 0, sizeof(dev_name));
+                for (uint32_t k = 0; k < sizeof(dev_name) - 1 && bd->name[k]; k++)
+                    dev_name[k] = bd->name[k];
+                partitions_device_remove(dev_name);
+                unregister_device(dev_name);
                 if (msd->bd) malloc_free(msd->bd);
                 pmm_free_pages((void*)msd->cmd_page_phys, 1);
                 pmm_free_pages((void*)msd->bulk_out_ring_phys, 1);
