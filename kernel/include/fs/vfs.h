@@ -107,10 +107,17 @@ typedef struct vfs_mount {
     char drive_letter;
     vfs_node_t *root;
     void *fs_data;
+    char device[32];
+    char fs_name[16];
+    uint64_t start_lba;
+    bool dead;
+    bool read_only;
+    int (*unmount)(struct vfs_mount *mnt);
 } vfs_mount_t;
 
 typedef struct {
     vfs_mount_t* (*mount)(const char *device, void *data);
+    int (*unmount)(vfs_mount_t *mnt);
     const char *name;
 } vfs_fs_type_t;
 
@@ -123,8 +130,17 @@ typedef struct {
 void vfs_init(void);
 int vfs_register_fs(vfs_fs_type_t *fs);
 int vfs_mount_fs(const char *fs_name, const char *device, char drive_letter, void *data);
+int vfs_umount_fs(char drive_letter);
+char vfs_alloc_drive_letter(void);
+bool vfs_drive_mounted(char drive_letter);
+vfs_mount_t *vfs_get_mount(char drive_letter);
+int vfs_bind_mountpoint(const char *path, char letter);
+void vfs_unbind_mountpoint(char letter);
+char vfs_mountpoint_lookup(const char *normalized_path, uint32_t *prefix_len);
+const char *vfs_mountpoint_path(char letter);
 void vfs_set_boot_drive(char drive_letter);
 
+char *normalize_path(const char *path);
 vfs_node_t *vfs_resolve_path(const char *path);
 vfs_node_t *vfs_resolve_path_ext(const char *path, bool parent_only, char *last_component);
 

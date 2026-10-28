@@ -189,3 +189,41 @@ int bcache_flush(const char *dev_name) {
     }
     return 0;
 }
+int bcache_drop_device(const char *dev_name) {
+    if (!dev_name || !dev_name[0]) return -1;
+
+    uint64_t flags;
+    spin_lock_irqsave(&bcache_lock, &flags);
+
+    for (int i = 0; i < BCACHE_SLOTS; i++) {
+        if (!entries[i].valid || my_strcmp(entries[i].dev_name, dev_name) != 0)
+            continue;
+        if (entries[i].dirty) {
+            struct block_device *d = find_device(dev_name);
+            if (d && d->write)
+                d->write(d->local_device_struct, entries[i].page_lba,
+                         BCACHE_PAGE_SECTORS, entries[i].data);
+        }
+        entries[i].dirty = false;
+        entries[i].valid = false;
+        entries[i].dev_name[0] = 0;
+    }
+
+    spin_unlock_irqrestore(&bcache_lock, flags);
+    return 0;
+}
+
+int bcache_invalidate_device(const char *dev_name) {
+    if (!dev_name || !dev_name[0]) return -1;
+    uint64_t flags;
+    spin_lock_irqsave(&bcache_lock, &flags);
+    for (int i = 0; i < BCACHE_SLOTS; i++) {
+        if (!entries[i].valid || my_strcmp(entries[i].dev_name, dev_name) != 0)
+            continue;
+        entries[i].dirty = false;
+        entries[i].valid = false;
+        entries[i].dev_name[0] = 0;
+    }
+    spin_unlock_irqrestore(&bcache_lock, flags);
+    return 0;
+}

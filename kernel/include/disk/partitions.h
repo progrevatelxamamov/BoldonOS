@@ -107,6 +107,18 @@ struct partition_table {
 };
 
 struct partition_table *get_partition_struct(const char *name);
+struct partition_table *osdev_get_partition_struct(const char *name);
+int  partitions_add_table(struct partition_table *pt);
+void partitions_remove_table(const char *name);
+const char *partitions_detect_fs(const char *dev, uint64_t lba);
+void partitions_hotplug_start(void);
+void partitions_device_remove(const char *name);
+void partitions_device_eject(const char *name);
+int  partitions_refresh(const char *name);
+int  partitions_resolve_source(const char *source, char *dev_out,
+                               uint64_t *lba_out, const char **fstype_out);
+int  partitions_node_for(const char *dev, uint64_t lba, char *out, uint32_t cap);
+int  partitions_proc_partitions(char *buf, uint32_t len);
 void partitions_level_init(void);
 int create_partition(const char *name, struct partition *new_part);
 int delete_partition(const char *name, uint32_t index);

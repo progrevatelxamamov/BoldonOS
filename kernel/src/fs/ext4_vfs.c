@@ -18,7 +18,10 @@
 
 typedef struct {
     char dev_name[32];
+    char mp_name[16];
+    char mount_path[16];
     uint64_t start_lba;
+    bool used;
     struct ext4_blockdev bd;
     struct ext4_blockdev_iface iface;
 } boldon_ext4_bdev_t;
@@ -565,7 +568,11 @@ static void *ext4_vfs_op_mmap(vfs_file_t *file, void *addr, uint64_t length, int
 }
 
 vfs_mount_t *ext4_vfs_mount(const char *device, void *data) {
-    if (g_ext4_count >= 4) return NULL;
+    int slot = -1;
+    for (int i = 0; i < 4; i++) {
+        if (!g_ext4_bdevs[i].used) { slot = i; break; }
+    }
+    if (slot < 0) return NULL;
 
     uint64_t start_lba = (uint64_t)data;
 
@@ -582,7 +589,10 @@ vfs_mount_t *ext4_vfs_mount(const char *device, void *data) {
 
     if (part_index < 0) return NULL;
 
-    boldon_ext4_bdev_t *dev = &g_ext4_bdevs[g_ext4_count++];
+    boldon_ext4_bdev_t *dev = &g_ext4_bdevs[slot];
+    memset(dev, 0, sizeof(*dev));
+    dev->used = true;
+    g_ext4_count++;
 
     strncpy(dev->dev_name, device, 31);
     dev->start_lba = start_lba;
@@ -602,18 +612,24 @@ vfs_mount_t *ext4_vfs_mount(const char *device, void *data) {
     dev->bd.part_offset = 0;
     dev->bd.part_size = blocks_count * 512;
 
-    char mp_name[16];
-    snprintf(mp_name, sizeof(mp_name), "ext4_%d", g_ext4_count);
+    snprintf(dev->mp_name, sizeof(dev->mp_name), "ext4_%d", slot + 1);
+    snprintf(dev->mount_path, sizeof(dev->mount_path), "/");
 
-    int r = ext4_device_register(&dev->bd, mp_name);
-    if (r != EOK) return NULL;
-
-    char mount_path[4] = { '/', '\0', '\0', '\0' };
-    r = ext4_mount(mp_name, mount_path, false);
+    int r = ext4_device_register(&dev->bd, dev->mp_name);
     if (r != EOK) {
+        dev->used = false;
+        g_ext4_count--;
         return NULL;
     }
-    (void)ext4_mount_setup_locks(mount_path, &ext4_os_locks);
+
+    r = ext4_mount(dev->mp_name, dev->mount_path, false);
+    if (r != EOK) {
+        ext4_device_unregister(dev->mp_name);
+        dev->used = false;
+        g_ext4_count--;
+        return NULL;
+    }
+    (void)ext4_mount_setup_locks(dev->mount_path, &ext4_os_locks);
 
     vfs_mount_t *mnt = malloc_alloc(sizeof(vfs_mount_t));
     if (!mnt) return NULL;
@@ -661,7 +677,26 @@ void ext4_vfs_init(void) {
     g_ext4_node_ops.chown = ext4_vfs_op_chown;
 
     g_ext4_fs_type.mount = ext4_vfs_mount;
+    g_ext4_fs_type.unmount = ext4_vfs_unmount;
     g_ext4_fs_type.name = "ext4";
 
     vfs_register_fs(&g_ext4_fs_type);
+}
+
+int ext4_vfs_unmount(vfs_mount_t *mnt) {
+    if (!mnt || !mnt->fs_data) return 0;
+    boldon_ext4_bdev_t *dev = (boldon_ext4_bdev_t *)mnt->fs_data;
+    if (!dev->used) return 0;
+
+    ext4_cache_flush(dev->mount_path);
+    ext4_umount(dev->mount_path);
+    ext4_device_unregister(dev->mp_name);
+
+    if (dev->iface.ph_bbuf) {
+        malloc_free(dev->iface.ph_bbuf);
+        dev->iface.ph_bbuf = NULL;
+    }
+    dev->used = false;
+    if (g_ext4_count > 0) g_ext4_count--;
+    return 0;
 }

@@ -172,6 +172,7 @@ void kstart(bootloader_t blinfo) {
     eventfd_init();
     input_register_devfs();
     base_devs_register();
+    partitions_hotplug_start();
 
     syscall_init();
 

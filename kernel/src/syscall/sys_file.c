@@ -6,6 +6,9 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <fs/vfs.h>
+#include <fs/mount.h>
+#include <disk/block.h>
+#include <disk/bcache.h>
 #include <scheduler/scheduler.h>
 #include <errno.h>
 #include <memory.h>
@@ -297,6 +300,8 @@ static void fill_linux_stat(vfs_node_t *node, struct linux_stat *st) {
     st->st_size  = node->size;
     st->st_blksize = 4096;
     st->st_blocks  = (node->size + 511) / 512;
+    st->st_rdev    = (node->type == VFS_TYPE_BLOCK_DEV ||
+                      node->type == VFS_TYPE_CHAR_DEV) ? node->inode_num : 0;
 
     uint32_t mode = node->mode;
 
@@ -379,6 +384,8 @@ uint64_t sys_statx_impl(uint64_t dirfd, uint64_t path, uint64_t flags,
     sx->stx_ino = st.st_ino;
     sx->stx_size = (uint64_t)st.st_size;
     sx->stx_blocks = (uint64_t)st.st_blocks;
+    sx->stx_rdev_major = (uint32_t)(st.st_rdev >> 8);
+    sx->stx_rdev_minor = (uint32_t)(st.st_rdev & 0xFF);
     return 0;
 }
 
@@ -1002,4 +1009,64 @@ uint64_t sys_reboot_impl(uint64_t magic, uint64_t magic2, uint64_t cmd, uint64_t
     (void)magic; (void)magic2; (void)cmd; (void)arg;
     outb(0x64, 0xFE);
     return 0;
+}
+uint64_t sys_mount_impl(uint64_t source, uint64_t target, uint64_t fstype,
+                        uint64_t flags, uint64_t data) {
+    char ksource[256], ktarget[256], kfstype[64];
+    memset(ksource, 0, sizeof(ksource));
+    memset(ktarget, 0, sizeof(ktarget));
+    memset(kfstype, 0, sizeof(kfstype));
+
+    if (!source || !target) return (uint64_t)-EFAULT;
+    if (copy_str_from_user(ksource, source, sizeof(ksource)) != 0) return (uint64_t)-EFAULT;
+    if (copy_str_from_user(ktarget, target, sizeof(ktarget)) != 0) return (uint64_t)-EFAULT;
+    if (fstype && copy_str_from_user(kfstype, fstype, sizeof(kfstype)) != 0)
+        return (uint64_t)-EFAULT;
+
+    int res = vfs_mount(ksource, ktarget, kfstype, (uint32_t)flags, (const void *)data);
+    return (uint64_t)(int64_t)res;
+}
+
+uint64_t sys_umount2_impl(uint64_t target, uint64_t flags) {
+    char ktarget[256];
+    memset(ktarget, 0, sizeof(ktarget));
+    if (!target) return (uint64_t)-EFAULT;
+    if (copy_str_from_user(ktarget, target, sizeof(ktarget)) != 0) return (uint64_t)-EFAULT;
+    int res = vfs_umount(ktarget, (uint32_t)flags);
+    return (uint64_t)(int64_t)res;
+}
+
+uint64_t sys_fsync_impl(uint64_t fd) {
+    process_t *p = get_current_process();
+    if (!p || !p->fd_table || fd >= VFS_MAX_FD || !p->fd_table->fds[fd])
+        return (uint64_t)-EBADF;
+    for (int i = 0; i < MAX_BLOCK_DEVICES; i++) {
+        if (block_devices[i].sector_count > 0 && block_devices[i].name[0])
+            bcache_flush(block_devices[i].name);
+    }
+    return 0;
+}
+
+uint64_t sys_pread64_impl(uint64_t fd, uint64_t buf, uint64_t count, uint64_t offset) {
+    process_t *p = get_current_process();
+    if (!p || !p->fd_table || fd >= VFS_MAX_FD || !p->fd_table->fds[fd])
+        return (uint64_t)-EBADF;
+    vfs_file_t *file = p->fd_table->fds[fd];
+    uint64_t saved = file->offset;
+    file->offset = offset;
+    int res = vfs_read(file, (void *)buf, count);
+    file->offset = saved;
+    return (uint64_t)(int64_t)res;
+}
+
+uint64_t sys_pwrite64_impl(uint64_t fd, uint64_t buf, uint64_t count, uint64_t offset) {
+    process_t *p = get_current_process();
+    if (!p || !p->fd_table || fd >= VFS_MAX_FD || !p->fd_table->fds[fd])
+        return (uint64_t)-EBADF;
+    vfs_file_t *file = p->fd_table->fds[fd];
+    uint64_t saved = file->offset;
+    file->offset = offset;
+    int res = vfs_write(file, (const void *)buf, count);
+    file->offset = saved;
+    return (uint64_t)(int64_t)res;
 }

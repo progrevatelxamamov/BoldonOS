@@ -36,16 +36,32 @@ static bool wait_read(void) {
     return false;
 }
 
-static void flush_output(void) {
-    for (int i = 0; i < 32; i++) {
-        if ((inb(PS2_STATUS) & STATUS_OUTPUT_FULL) == 0) break;
-        (void)inb(PS2_DATA);
-    }
-}
-
 uint8_t ps2_read_byte(void) {
     wait_read();
     return inb(PS2_DATA);
+}
+
+bool ps2_read_any_timeout(uint8_t *out) {
+    if (!out) return false;
+    for (uint32_t i = 0; i < 300000; i++) {
+        if (inb(PS2_STATUS) & STATUS_OUTPUT_FULL) {
+            *out = inb(PS2_DATA);
+            return true;
+        }
+        __asm__ volatile("pause");
+    }
+    return false;
+}
+
+void ps2_drain_quiet(uint32_t idle_spins) {
+    for (uint32_t idle = 0; idle < idle_spins; idle++) {
+        if (inb(PS2_STATUS) & STATUS_OUTPUT_FULL) {
+            (void)inb(PS2_DATA);
+            idle = 0;
+            continue;
+        }
+        for (volatile uint32_t k = 0; k < 200; k++) __asm__ volatile("pause");
+    }
 }
 
 static void write_cmd(uint8_t cmd) {
@@ -96,18 +112,10 @@ void ps2_flush_input(void) {
     }
 }
 
-
 void ps2_init(void) {
-    flush_output();
-
     write_cmd(CMD_DISABLE_KBD);
     write_cmd(CMD_DISABLE_MOUSE);
-    flush_output();
-
-    ps2kbd_init();
-    ps2mouse_init();
-
-    flush_output();
+    ps2_drain_quiet(64);
 
     write_cmd(CMD_READ_CONFIG);
     uint8_t config = ps2_read_byte();
@@ -118,9 +126,16 @@ void ps2_init(void) {
     write_cmd(CMD_WRITE_CONFIG);
     write_data(config);
 
-    write_cmd(CMD_ENABLE_KBD);
     write_cmd(CMD_ENABLE_MOUSE);
-    flush_output();
+    write_cmd(CMD_ENABLE_KBD);
+
+    ps2kbd_init();
+    ps2mouse_init();
+
+    ps2_drain_quiet(256);
+
+    ps2kbd_reset_state();
+    ps2mouse_resync();
 }
 
 void ps2_irq_keyboard(void) {

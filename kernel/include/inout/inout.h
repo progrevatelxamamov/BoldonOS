@@ -229,8 +229,13 @@ static const char keymap_caps[KEY_MAX] = {
     [KEY_N] = 'N', [KEY_M] = 'M',
 };
 
+#define MOUSE_IOC_SETSPEED  0x4D01
+#define MOUSE_IOC_GETSPEED  0x4D02
+
 void inout_init(void);
 void inout_add_event(inout_event_t ev);
+void inout_set_mouse_speed(int percent);
+int  inout_get_mouse_speed(void);
 void inout_call_scheduler(void);
 void update_keyboard_leds(void);
 

@@ -14,16 +14,28 @@
 
 #define MAX_FS_TYPES 16
 #define MAX_SYMLINK_DEPTH 8
+#define MAX_MOUNTPOINTS 24
+
+typedef struct {
+    char path[256];
+    char letter;
+    bool used;
+} mountpoint_t;
 
 static vfs_fs_type_t *fs_types[MAX_FS_TYPES];
 static int fs_type_count = 0;
 
 static vfs_mount_t *drives[26];
+static mountpoint_t mountpoints[MAX_MOUNTPOINTS];
 static char boot_drive_letter = 'C';
+
+static void normalize_path_raw(const char *path, char *norm, size_t cap);
+static bool letter_is_root(char c);
 
 void vfs_init(void) {
     memset(drives, 0, sizeof(drives));
     memset(fs_types, 0, sizeof(fs_types));
+    memset(mountpoints, 0, sizeof(mountpoints));
     fs_type_count = 0;
 }
 
@@ -40,8 +52,9 @@ int vfs_register_fs(vfs_fs_type_t *fs) {
 
 int vfs_mount_fs(const char *fs_name, const char *device, char drive_letter, void *data) {
     if (drive_letter >= 'a' && drive_letter <= 'z') drive_letter -= 32;
-    if (drive_letter < 'A' || drive_letter > 'Z') return -1;
-    
+    if (drive_letter < 'A' || drive_letter > 'Z') return -EINVAL;
+    if (drives[drive_letter - 'A']) return -EBUSY;
+
     vfs_fs_type_t *fs = NULL;
     for (int i = 0; i < fs_type_count; i++) {
         const char *a = fs_types[i]->name;
@@ -53,57 +66,179 @@ int vfs_mount_fs(const char *fs_name, const char *device, char drive_letter, voi
         }
     }
 
-    if (!fs) return -2;
+    if (!fs) return -ENODEV;
 
     vfs_mount_t *mnt = fs->mount(device, data);
-    if (!mnt) {
-        return -3;
-    }
+    if (!mnt) return -EIO;
 
     mnt->drive_letter = drive_letter;
+    mnt->unmount = fs->unmount;
+    mnt->dead = false;
+    mnt->read_only = false;
+    mnt->start_lba = (uint64_t)data;
+    memset(mnt->device, 0, sizeof(mnt->device));
+    memset(mnt->fs_name, 0, sizeof(mnt->fs_name));
+    if (device) {
+        for (int i = 0; i < (int)sizeof(mnt->device) - 1 && device[i]; i++)
+            mnt->device[i] = device[i];
+    }
+    if (fs_name) {
+        for (int i = 0; i < (int)sizeof(mnt->fs_name) - 1 && fs_name[i]; i++)
+            mnt->fs_name[i] = fs_name[i];
+    }
     drives[drive_letter - 'A'] = mnt;
     return 0;
 }
 
-char* normalize_path(const char *path) {
-    if (!path) return NULL;
-    
-    char *norm = malloc_alloc(512);
-    if (!norm) return NULL;
-    memset(norm, 0, 512);
+int vfs_umount_fs(char drive_letter) {
+    if (drive_letter >= 'a' && drive_letter <= 'z') drive_letter -= 32;
+    if (drive_letter < 'A' || drive_letter > 'Z') return -EINVAL;
+    if (letter_is_root(drive_letter)) return -EBUSY;
 
-    if (path[0] == '/' && path[1] == 'd' && path[2] == 'e' && path[3] == 'v' && 
+    vfs_mount_t *mnt = drives[drive_letter - 'A'];
+    if (!mnt) return -EINVAL;
+
+    if (mnt->unmount) mnt->unmount(mnt);
+    mnt->dead = true;
+
+    drives[drive_letter - 'A'] = NULL;
+    vfs_unbind_mountpoint(drive_letter);
+    return 0;
+}
+
+char vfs_alloc_drive_letter(void) {
+    for (char c = 'E'; c <= 'Z'; c++) {
+        if (!drives[c - 'A']) return c;
+    }
+    return 0;
+}
+
+bool vfs_drive_mounted(char drive_letter) {
+    if (drive_letter >= 'a' && drive_letter <= 'z') drive_letter -= 32;
+    if (drive_letter < 'A' || drive_letter > 'Z') return false;
+    return drives[drive_letter - 'A'] != NULL;
+}
+
+vfs_mount_t *vfs_get_mount(char drive_letter) {
+    if (drive_letter >= 'a' && drive_letter <= 'z') drive_letter -= 32;
+    if (drive_letter < 'A' || drive_letter > 'Z') return NULL;
+    return drives[drive_letter - 'A'];
+}
+
+int vfs_bind_mountpoint(const char *path, char letter) {
+    if (!path || !path[0]) return -EINVAL;
+    if (letter >= 'a' && letter <= 'z') letter -= 32;
+    if (letter < 'A' || letter > 'Z') return -EINVAL;
+
+    char raw[512];
+    normalize_path_raw(path, raw, sizeof(raw));
+    if (raw[0] < 'A' || raw[0] > 'Z' || raw[1] != ':') return -EINVAL;
+
+    size_t len = strlen(raw);
+    while (len > 3 && raw[len - 1] == '/') raw[--len] = 0;
+
+    for (int i = 0; i < MAX_MOUNTPOINTS; i++) {
+        if (mountpoints[i].used && mountpoints[i].letter == letter) {
+            memset(&mountpoints[i], 0, sizeof(mountpoints[i]));
+        }
+    }
+    for (int i = 0; i < MAX_MOUNTPOINTS; i++) {
+        if (!mountpoints[i].used) {
+            memcpy(mountpoints[i].path, raw, len + 1);
+            mountpoints[i].letter = letter;
+            mountpoints[i].used = true;
+            return 0;
+        }
+    }
+    return -ENOSPC;
+}
+
+void vfs_unbind_mountpoint(char letter) {
+    if (letter >= 'a' && letter <= 'z') letter -= 32;
+    for (int i = 0; i < MAX_MOUNTPOINTS; i++) {
+        if (mountpoints[i].used && mountpoints[i].letter == letter)
+            memset(&mountpoints[i], 0, sizeof(mountpoints[i]));
+    }
+}
+
+char vfs_mountpoint_lookup(const char *normalized_path, uint32_t *prefix_len) {
+    if (!normalized_path) return 0;
+    char best = 0;
+    uint32_t best_len = 0;
+    size_t nlen = strlen(normalized_path);
+    for (int i = 0; i < MAX_MOUNTPOINTS; i++) {
+        if (!mountpoints[i].used) continue;
+        size_t plen = strlen(mountpoints[i].path);
+        if (plen > nlen || plen <= best_len) continue;
+        if (strncmp(normalized_path, mountpoints[i].path, plen) != 0) continue;
+        if (normalized_path[plen] != '/' && normalized_path[plen] != '\0') continue;
+        best = mountpoints[i].letter;
+        best_len = (uint32_t)plen;
+    }
+    if (prefix_len) *prefix_len = best_len;
+    return best;
+}
+
+const char *vfs_mountpoint_path(char letter) {
+    if (letter >= 'a' && letter <= 'z') letter -= 32;
+    for (int i = 0; i < MAX_MOUNTPOINTS; i++) {
+        if (mountpoints[i].used && mountpoints[i].letter == letter)
+            return mountpoints[i].path;
+    }
+    return NULL;
+}
+
+static bool letter_is_root(char c) {
+    return c == boot_drive_letter || c == 'D';
+}
+
+static void normalize_path_raw(const char *path, char *norm, size_t cap) {
+    if (!path || !norm || cap < 8) return;
+    memset(norm, 0, cap);
+
+    if (path[0] == '/' && path[1] == 'p' && path[2] == 'r' && path[3] == 'o' &&
+        path[4] == 'c' && (path[5] == '/' || path[5] == '\0')) {
+        norm[0] = 'D'; norm[1] = ':';
+        if (strncmp(path, "/proc/self/mountinfo", 20) == 0) {
+            memcpy(norm + 2, "/proc/mountinfo", 16);
+            return;
+        }
+        size_t j = 2;
+        for (size_t i = 5; path[i] && j < cap - 1; i++) norm[j++] = path[i];
+        norm[j] = 0;
+        return;
+    }
+
+    if (path[0] == '/' && path[1] == 'd' && path[2] == 'e' && path[3] == 'v' &&
        (path[4] == '/' || path[4] == '\0')) {
         norm[0] = 'D';
         norm[1] = ':';
         if (path[4] == '\0') {
             norm[2] = '/';
             norm[3] = '\0';
-            return norm;
+            return;
         }
-        int i = 4;
-        int j = 2;
-        while (path[i] && j < 510) norm[j++] = path[i++];
-        norm[j] = '\0';
-        return norm;
+        size_t j = 2;
+        for (size_t i = 4; path[i] && j < cap - 1; i++) norm[j++] = path[i];
+        norm[j] = 0;
+        return;
     }
 
     if (((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z')) && path[1] == ':') {
-        int i = 0;
-        while (path[i] && i < 511) { norm[i] = path[i]; i++; }
+        size_t i = 0;
+        while (path[i] && i < cap - 1) { norm[i] = path[i]; i++; }
         if (norm[0] >= 'a' && norm[0] <= 'z') norm[0] -= 32;
         norm[i] = '\0';
-        return norm;
+        return;
     }
 
     if (path[0] == '/') {
         norm[0] = boot_drive_letter;
         norm[1] = ':';
-        int i = 0;
-        int j = 2;
-        while (path[i] && j < 511) norm[j++] = path[i++];
+        size_t j = 2;
+        for (size_t i = 0; path[i] && j < cap - 1; i++) norm[j++] = path[i];
         norm[j] = '\0';
-        return norm;
+        return;
     }
 
     process_t *p = get_current_process();
@@ -118,26 +253,49 @@ char* normalize_path(const char *path) {
 
     norm[0] = target_drive;
     norm[1] = ':';
-    int j = 2;
-
-    int i = 0;
+    size_t j = 2;
+    size_t i = 0;
     if (cwd[0] == '/') {
-        if (target_drive == 'D') {
-            i = 4;
-        }
-        while (cwd[i] && j < 510) norm[j++] = cwd[i++];
+        if (target_drive == 'D') i = 4;
+        while (cwd[i] && j < cap - 2) norm[j++] = cwd[i++];
     } else if (((cwd[0] >= 'A' && cwd[0] <= 'Z') || (cwd[0] >= 'a' && cwd[0] <= 'z')) && cwd[1] == ':') {
         i = 2;
-        while (cwd[i] && j < 510) norm[j++] = cwd[i++];
+        while (cwd[i] && j < cap - 2) norm[j++] = cwd[i++];
     }
 
-    if (j == 2 || norm[j - 1] != '/') {
-        norm[j++] = '/';
-    }
-
+    if (j == 2 || norm[j - 1] != '/') norm[j++] = '/';
     i = 0;
-    while (path[i] && j < 511) norm[j++] = path[i++];
+    while (path[i] && j < cap - 1) norm[j++] = path[i++];
+    norm[j] = '\0';
+}
 
+char* normalize_path(const char *path) {
+    if (!path) return NULL;
+
+    char raw[512];
+    normalize_path_raw(path, raw, sizeof(raw));
+
+    char *norm = (char *)malloc_alloc(512);
+    if (!norm) return NULL;
+    memset(norm, 0, 512);
+
+    uint32_t prefix_len = 0;
+    char letter = vfs_mountpoint_lookup(raw, &prefix_len);
+    if (!letter || prefix_len < 2) {
+        memcpy(norm, raw, strlen(raw) + 1);
+        return norm;
+    }
+
+    norm[0] = letter;
+    norm[1] = ':';
+    const char *rest = raw + prefix_len;
+    if (*rest == '\0') {
+        norm[2] = '/';
+        norm[3] = '\0';
+        return norm;
+    }
+    size_t j = 2;
+    while (*rest && j < 511) norm[j++] = *rest++;
     norm[j] = '\0';
     return norm;
 }
