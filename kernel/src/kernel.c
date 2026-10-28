@@ -144,15 +144,22 @@ void kstart(bootloader_t blinfo) {
     tcpip_init(NULL, NULL);
     /* Драйверы Wi-Fi должны быть зарегистрированы ДО pci_init():
        xhci_init() сразу перечисляет порты и ищет VID:PID в реестре. */
+    console_print_string("[BOOT] PCI scan...\n");
     wifi_subsystem_init();
     pci_init();
+    console_print_string("[BOOT] PCI scan done\n");
 
+    console_print_string("[BOOT] partitions scan...\n");
     partitions_level_init();
+    console_print_string("[BOOT] partitions scan done\n");
     parse_boot_serial_from_cmdline();
+    console_print_string("[BOOT] mounting filesystems...\n");
     mount_all_partitions();
+    console_print_string("[BOOT] filesystems mounted\n");
 
     devfs_vfs_init();
     vfs_mount_fs("devfs", NULL, 'D', NULL);
+    console_print_string("[BOOT] devfs ready\n");
     extern void fbdev_init(void);
     extern void evdev_init(void);
     extern void pty_register_devfs(void);
@@ -173,11 +180,13 @@ void kstart(bootloader_t blinfo) {
     input_register_devfs();
     base_devs_register();
     partitions_hotplug_start();
+    console_print_string("[BOOT] hotplug started\n");
 
     syscall_init();
 
     inout_init();
     ps2_init();
+    console_print_string("[BOOT] input ready\n");
     //gui_init();
 
     extern void wifi_start_boot_task(void);
@@ -186,7 +195,11 @@ void kstart(bootloader_t blinfo) {
     extern void launch_init_process(void);
     create_task_kernel((void *)launch_init_process, "init");
 
+    console_print_string("[BOOT] enabling interrupts\n");
     __asm__ volatile ("sti");
+    extern void xhci_mark_boot_complete(void);
+    xhci_mark_boot_complete();
+    console_print_string("[BOOT] interrupts enabled, scheduler running\n");
 
     while (1) {
         __asm__ volatile ("hlt");

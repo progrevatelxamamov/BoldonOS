@@ -1,4 +1,5 @@
 #include <stddef.h>
+#include <errno.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <pci/pci.h>
@@ -46,10 +47,17 @@ static int xhci_register_controller(xhci_controller_t *hc) {
     return g_xhci_count - 1;
 }
 
-static inline void xhci_lock(volatile uint32_t *lock) {
-    while (__sync_lock_test_and_set(lock, 1)) {
+static inline bool xhci_lock_timeout(volatile uint32_t *lock, uint32_t spins) {
+    for (uint32_t i = 0; i < spins; i++) {
+        if (!__sync_lock_test_and_set(lock, 1)) return true;
+        if ((i & 0x3FF) == 0) schedule_yield_safe();
         __asm__ volatile("pause");
     }
+    return false;
+}
+
+static inline void xhci_lock(volatile uint32_t *lock) {
+    (void)xhci_lock_timeout(lock, 0xFFFFFFFFu);
 }
 
 static inline void xhci_unlock(volatile uint32_t *lock) {
@@ -190,7 +198,7 @@ static void hid_capture_report(struct usb_hid *hid, const struct xhci_trb *evt, 
     if (len > 64) len = 64;
     if (len > hid->report_size) len = hid->report_size;
 
-    xhci_lock(&hid->report_lock);
+    if (!xhci_lock_timeout(&hid->report_lock, 200000)) return;
     if (!hid->transfer_pending || evt->param != hid->pending_trb_phys) {
         xhci_unlock(&hid->report_lock);
         return;
@@ -209,7 +217,7 @@ static void hid_capture_report(struct usb_hid *hid, const struct xhci_trb *evt, 
 
 static void hid_capture_fail(struct usb_hid *hid, const struct xhci_trb *evt) {
     if (!hid || !evt || hid->disconnected) return;
-    xhci_lock(&hid->report_lock);
+    if (!xhci_lock_timeout(&hid->report_lock, 200000)) return;
     if (hid->transfer_pending && evt->param == hid->pending_trb_phys) {
         hid->transfer_pending = 0;
         hid->halted = 1;
@@ -218,7 +226,7 @@ static void hid_capture_fail(struct usb_hid *hid, const struct xhci_trb *evt) {
 }
 
 void xhci_poll(xhci_controller_t *hc) {
-    xhci_lock(&hc->evt_lock);
+    if (!xhci_lock_timeout(&hc->evt_lock, 2000000)) return;
     for (;;) {
         struct xhci_trb evt;
         if (xhci_poll_event(hc, &evt) != 1) break;
@@ -261,9 +269,34 @@ void xhci_poll(xhci_controller_t *hc) {
     xhci_unlock(&hc->evt_lock);
 }
 
+#define XHCI_BOOT_TIMEOUT_LIMIT 40
+static volatile uint32_t xhci_enum_timeouts = 0;
+static volatile bool xhci_enum_active = false;
+static volatile bool xhci_boot_done = false;
+
+void xhci_mark_boot_complete(void) {
+    xhci_boot_done = true;
+}
+
+static void xhci_enum_begin(void) {
+    xhci_enum_timeouts = 0;
+    xhci_enum_active = true;
+}
+
+static void xhci_enum_end(void) {
+    xhci_enum_active = false;
+}
+
+static bool xhci_boot_exhausted(void) {
+    if (xhci_boot_done || interrupts_enabled()) return false;
+    if (!xhci_enum_active) return false;
+    return xhci_enum_timeouts >= XHCI_BOOT_TIMEOUT_LIMIT;
+}
+
 static int wait_event_from(xhci_controller_t *hc, struct evt_queue *q,
                            struct xhci_trb *out_evt)
 {
+    if (xhci_boot_exhausted()) return -1;
     for (uint64_t t = 0; t < 2000000; t++) {
         if (evtq_pop(q, out_evt)) return 0;
 
@@ -271,6 +304,11 @@ static int wait_event_from(xhci_controller_t *hc, struct evt_queue *q,
 
         if ((t & 0x3FF) == 0) schedule_yield_safe();
         __asm__ volatile("pause");
+    }
+    if (!xhci_boot_done && !interrupts_enabled() && xhci_enum_active) {
+        uint32_t n = __atomic_add_fetch(&xhci_enum_timeouts, 1, __ATOMIC_RELAXED);
+        if (n == XHCI_BOOT_TIMEOUT_LIMIT)
+            console_print_string("[XHCI] boot timeout budget exhausted, deferring to hotplug\n");
     }
     return -1;
 }
@@ -297,11 +335,13 @@ int xhci_wait_event(xhci_controller_t *hc, uint8_t expected_type, struct xhci_tr
    потом забрать чужие Command Completion Events из общей очереди. Из-за этого
    после переподключения мыши ENABLE_SLOT/ADDRESS_DEVICE получали ответ не от
    своей команды (вплоть до неверного slot_id). */
-static void xhci_cmd_exec_lock(xhci_controller_t *hc) {
-    while (__sync_lock_test_and_set(&hc->cmd_exec_lock, 1)) {
-        schedule_yield_safe();
+static bool xhci_cmd_exec_lock(xhci_controller_t *hc) {
+    for (uint32_t i = 0; i < 2000000; i++) {
+        if (!__sync_lock_test_and_set(&hc->cmd_exec_lock, 1)) return true;
+        if ((i & 0x3FF) == 0) schedule_yield_safe();
         __asm__ volatile("pause");
     }
+    return false;
 }
 
 static void xhci_cmd_exec_unlock(xhci_controller_t *hc) {
@@ -316,7 +356,7 @@ static int xhci_submit_command(xhci_controller_t *hc,
     struct xhci_trb evt;
     memset(&evt, 0, sizeof(evt));
 
-    xhci_cmd_exec_lock(hc);
+    if (!xhci_cmd_exec_lock(hc)) return -1;
     evtq_drain(&hc->cmd_evt_q);
 
     uint8_t cyc;
@@ -354,10 +394,7 @@ int xhci_control_transfer(xhci_controller_t *hc, uint8_t slot_id,
                           struct usb_setup_packet *setup, uint64_t data_buf_phys, uint16_t transfer_len)
 {
     if (!hc || !setup || slot_id >= MAX_XHCI_SLOTS) return -1;
-    while (__sync_lock_test_and_set(&hc->ep0_lock[slot_id], 1)) {
-        if (interrupts_enabled()) schedule_yield();
-        else __asm__ volatile("pause");
-    }
+    if (!xhci_lock_timeout(&hc->ep0_lock[slot_id], 2000000)) return -1;
 
     int result = -2;
     uint64_t setup_data;
@@ -448,7 +485,7 @@ int xhci_bulk_transfer(xhci_controller_t *hc, uint8_t slot_id,
     (void)dir_in;
     if (length == 0) return 0;
 
-    xhci_lock(&hc->ep_lock[slot_id][db_target]);
+    if (!xhci_lock_timeout(&hc->ep_lock[slot_id][db_target], 2000000)) return -EBUSY;
 
     uint32_t idx = *enqueue;
     if (idx >= COUNT_OF_TRB - 1) {
@@ -517,7 +554,7 @@ int xhci_bulk_transfer_len(xhci_controller_t *hc, uint8_t slot_id,
     if (out_actual) *out_actual = 0;
     if (length == 0) return 0;
 
-    xhci_lock(&hc->ep_lock[slot_id][db_target]);
+    if (!xhci_lock_timeout(&hc->ep_lock[slot_id][db_target], 2000000)) return -EBUSY;
 
     uint32_t idx = *enqueue;
     if (idx >= COUNT_OF_TRB - 1) {
@@ -866,16 +903,16 @@ void init_usb_mass_storage(xhci_controller_t *hc, uint8_t slot_id, uint8_t speed
         return;
     }
 
-    cooperative_delay(20000000);
+    cooperative_delay(300000);
 
     int inquiry_res = -1;
-    for (int retry = 0; retry < 15; retry++) {
+    for (int retry = 0; retry < 5; retry++) {
         inquiry_res = scsi_inquiry(hc, msd);
         if (inquiry_res == 0) break;
 
         usb_msd_clear_halt(hc, slot_id, ep_out_addr);
         usb_msd_clear_halt(hc, slot_id, ep_in_addr);
-        cooperative_delay(150000000);
+        cooperative_delay(500000);
     }
 
     if (inquiry_res != 0) {
@@ -887,13 +924,13 @@ void init_usb_mass_storage(xhci_controller_t *hc, uint8_t slot_id, uint8_t speed
     }
 
     int cap_res = -1;
-    for (int retry = 0; retry < 5; retry++) {
+    for (int retry = 0; retry < 3; retry++) {
         cap_res = scsi_read_capacity(hc, msd);
         if (cap_res == 0) break;
 
         usb_msd_clear_halt(hc, slot_id, ep_out_addr);
         usb_msd_clear_halt(hc, slot_id, ep_in_addr);
-        cooperative_delay(50000000);
+        cooperative_delay(300000);
     }
 
     if (cap_res != 0) {
@@ -1523,12 +1560,13 @@ static void usb_hid_task(void *arg) {
                 usb_msd_clear_halt(hc, hid->slot_id, hid->ep_addr);
             hid->halt_recovery_ms = now;
 
-            xhci_lock(&hid->report_lock);
-            hid->transfer_pending = 0;
-            hid->report_qh = 0;
-            hid->report_qt = 0;
-            hid->report_ready = 0;
-            xhci_unlock(&hid->report_lock);
+            if (xhci_lock_timeout(&hid->report_lock, 200000)) {
+                hid->transfer_pending = 0;
+                hid->report_qh = 0;
+                hid->report_qt = 0;
+                hid->report_ready = 0;
+                xhci_unlock(&hid->report_lock);
+            }
 
             xhci_reset_endpoint(hc, hid->slot_id, hid->dci);
 
@@ -1564,15 +1602,16 @@ static void usb_hid_task(void *arg) {
         }
 
         uint8_t snap_len = 0;
-        xhci_lock(&hid->report_lock);
-        if (hid->report_qt != hid->report_qh) {
-            snap_len = hid->report_data_len[hid->report_qt];
-            if (snap_len > 64) snap_len = 64;
-            memcpy(snap, hid->report_data[hid->report_qt], snap_len);
-            hid->report_qt = (uint8_t)((hid->report_qt + 1) % HID_REPORT_QUEUE);
-            if (hid->report_qt == hid->report_qh) hid->report_ready = 0;
+        if (xhci_lock_timeout(&hid->report_lock, 200000)) {
+            if (hid->report_qt != hid->report_qh) {
+                snap_len = hid->report_data_len[hid->report_qt];
+                if (snap_len > 64) snap_len = 64;
+                memcpy(snap, hid->report_data[hid->report_qt], snap_len);
+                hid->report_qt = (uint8_t)((hid->report_qt + 1) % HID_REPORT_QUEUE);
+                if (hid->report_qt == hid->report_qh) hid->report_ready = 0;
+            }
+            xhci_unlock(&hid->report_lock);
         }
-        xhci_unlock(&hid->report_lock);
 
         if (snap_len) {
             transfer_queued = false;
@@ -1584,9 +1623,8 @@ static void usb_hid_task(void *arg) {
             (uint32_t)get_monotonic_ms() - hid->last_transfer_ms > 500)
             hid->halted = 1;
 
-        if (!transfer_queued) {
-            xhci_lock(&hc->ep_lock[hid->slot_id][hid->dci]);
-
+        if (!transfer_queued &&
+            xhci_lock_timeout(&hc->ep_lock[hid->slot_id][hid->dci], 200000)) {
             uint32_t idx = hid->enqueue;
             if (idx >= COUNT_OF_TRB - 1) {
                 hid->ring[idx].param   = hid->ring_phys;
@@ -1603,17 +1641,18 @@ static void usb_hid_task(void *arg) {
             hid->ring[idx].status  = hid->report_size;
             hid->ring[idx].control = (TRB_NORMAL << 10) | (1u << 5) | hid->cycle;
 
-            xhci_lock(&hid->report_lock);
-            hid->pending_trb_phys = hid->ring_phys + (uint64_t)idx * sizeof(struct xhci_trb);
-            hid->transfer_pending = 1;
-            xhci_unlock(&hid->report_lock);
+            if (xhci_lock_timeout(&hid->report_lock, 200000)) {
+                hid->pending_trb_phys = hid->ring_phys + (uint64_t)idx * sizeof(struct xhci_trb);
+                hid->transfer_pending = 1;
+                xhci_unlock(&hid->report_lock);
 
-            hid->enqueue++;
-            transfer_queued = true;
-            hid->last_transfer_ms = (uint32_t)get_monotonic_ms();
+                hid->enqueue++;
+                transfer_queued = true;
+                hid->last_transfer_ms = (uint32_t)get_monotonic_ms();
 
-            __asm__ volatile("mfence" ::: "memory");
-            hc->db_regs[hid->slot_id] = hid->dci;
+                __asm__ volatile("mfence" ::: "memory");
+                hc->db_regs[hid->slot_id] = hid->dci;
+            }
 
             xhci_unlock(&hc->ep_lock[hid->slot_id][hid->dci]);
         }
@@ -1856,10 +1895,21 @@ void xhci_set_keyboard_leds(uint8_t leds) {
    например адаптер/мышь воткнули до окончания инициализации контроллера
    или CSC остался не подтверждённым. Раз в 200 мс сверяем состояние
    портов с таблицей слотов. */
+static uint64_t xhci_port_next_try[64];
+
+static bool xhci_port_try(uint8_t port, uint64_t now) {
+    if (port >= 64) return true;
+    if (now < xhci_port_next_try[port]) return false;
+    xhci_port_next_try[port] = now + 1000;
+    return true;
+}
+
 static void xhci_rescan_ports(xhci_controller_t *hc) {
     uint32_t hcsparams1 = xhci_read32(hc->cap_regs, 0x04);
     uint8_t max_ports = (hcsparams1 >> 24) & 0xFF;
+    if (max_ports == 0 || max_ports > 32) max_ports = 32;
     volatile uint8_t *port_base = hc->op_regs + 0x400;
+    uint64_t now = get_monotonic_ms();
 
     for (uint8_t port = 1; port <= max_ports; port++) {
         volatile uint8_t *reg = port_base + (port - 1) * 0x10;
@@ -1867,11 +1917,9 @@ static void xhci_rescan_ports(xhci_controller_t *hc) {
         uint8_t slot = xhci_find_slot_by_port(hc, port);
 
         if (portsc & XHCI_PORTSC_CSC) {
-            /* Реальная смена состояния (в т.ч. быстрая замена мыши).
-               CSC подтверждает сам handle_port_connect(). */
-            handle_port_connect(hc, port);
+            if (xhci_port_try(port, now)) handle_port_connect(hc, port);
         } else if ((portsc & XHCI_PORTSC_CCS) && !slot) {
-            handle_port_connect(hc, port);
+            if (xhci_port_try(port, now)) handle_port_connect(hc, port);
         } else if (!(portsc & XHCI_PORTSC_CCS) && slot) {
             handle_port_disconnect(hc, port);
         }
@@ -1886,7 +1934,8 @@ static void xhci_hotplug_task(void *arg) {
         if (hc->port_change_head != hc->port_change_tail) {
             uint8_t port = hc->port_change_queue[hc->port_change_head];
             hc->port_change_head = (hc->port_change_head + 1) % 16;
-            handle_port_connect(hc, port);
+            if (xhci_port_try(port, get_monotonic_ms()))
+                handle_port_connect(hc, port);
         }
 
         uint64_t now = get_monotonic_ms();
@@ -2474,6 +2523,7 @@ void handle_port_connect(xhci_controller_t *hc, uint8_t port) {
 void listing_all_ports(xhci_controller_t *hc) {
     uint32_t hcsparams1 = xhci_read32(hc->cap_regs, 0x04);
     uint8_t max_ports = (hcsparams1 >> 24) & 0xFF;
+    if (max_ports == 0 || max_ports > 32) max_ports = 32;
     volatile uint8_t *port_base = hc->op_regs + 0x400;
 
     for (uint8_t port = 1; port <= max_ports; port++) {
@@ -2484,21 +2534,52 @@ void listing_all_ports(xhci_controller_t *hc) {
             xhci_write32(portsc_reg, 0x00, portsc | XHCI_PORTSC_PP);
         }
     }
-    delay_loop(10000000);
+    console_print_string("[XHCI] waiting for ports (");
+    console_print_num(max_ports);
+    console_print_string(")\n");
+
+    for (uint32_t t = 0; t < 30000000; t++) {
+        bool any = false;
+        for (uint8_t port = 1; port <= max_ports; port++) {
+            volatile uint8_t *reg = port_base + (port - 1) * 0x10;
+            if (xhci_read32(reg, 0x00) & XHCI_PORTSC_CCS) { any = true; break; }
+        }
+        if (any) break;
+        if ((t & 0xFFFF) == 0) schedule_yield_safe();
+        __asm__ volatile("pause");
+    }
 
     for (uint8_t port = 1; port <= max_ports; port++) {
         volatile uint8_t *portsc_reg = port_base + (port - 1) * 0x10;
         uint32_t portsc = xhci_read32(portsc_reg, 0x00);
-        if (portsc & XHCI_PORTSC_CCS) handle_port_connect(hc, port);
+        if (portsc & XHCI_PORTSC_CCS) {
+            console_print_string("[XHCI] port ");
+            console_print_num(port);
+            console_print_string(" connected\n");
+            handle_port_connect(hc, port);
+        }
     }
 }
 
 void xhci_init(pci_device_t *dev) {
+    console_print_string("[XHCI] probing controller ");
+    console_print_num(dev->bus);
+    console_print_string(":");
+    console_print_num(dev->slot);
+    console_print_string(":");
+    console_print_num(dev->func);
+    console_print_string("\n");
+
     xhci_controller_t *hc = (xhci_controller_t *)malloc_alloc(sizeof(xhci_controller_t));
     memset(hc, 0, sizeof(*hc));
 
     uint64_t bar0_phys = (dev->bars[0] & 0xFFFFFFF0);
     if ((dev->bars[0] & 0x6) == 0x4) bar0_phys |= ((uint64_t)dev->bars[1] << 32);
+    if (!bar0_phys) {
+        console_print_string("[XHCI] invalid BAR0, skipping controller\n");
+        malloc_free(hc);
+        return;
+    }
     uint64_t bar0_virt = (uint64_t)phys_to_virt(bar0_phys);
     hc->cap_regs = (volatile uint8_t *)bar0_virt;
 
@@ -2515,6 +2596,12 @@ void xhci_init(pci_device_t *dev) {
                      PTE_PRESENT | PTE_WRITABLE | PTE_PCD | PTE_PWT);
 
     uint8_t caplength = xhci_read8(hc->cap_regs, 0x00);
+    uint16_t hciversion = *(volatile uint16_t *)(hc->cap_regs + 0x02);
+    if (caplength < 0x20 || caplength > 0x80 || hciversion == 0 || hciversion == 0xFFFF) {
+        console_print_string("[XHCI] invalid capability registers, skipping controller\n");
+        malloc_free(hc);
+        return;
+    }
     hc->op_regs = hc->cap_regs + caplength;
 
     uint32_t rtsoff = xhci_read32(hc->cap_regs, 0x18) & ~0x1F;
@@ -2546,8 +2633,18 @@ void xhci_init(pci_device_t *dev) {
     wait_hchalt(hc->op_regs, true);
 
     xhci_write32(hc->op_regs, 0x00, 1u << 1);
-    while (xhci_read32(hc->op_regs, 0x00) & (1u << 1)) { }
-    wait_controller_ready(hc->op_regs);
+    bool reset_ok = false;
+    for (uint32_t i = 0; i < 10000000; i++) {
+        if (!(xhci_read32(hc->op_regs, 0x00) & (1u << 1))) { reset_ok = true; break; }
+        __asm__ volatile("pause");
+    }
+    if (!reset_ok) {
+        console_print_string("[XHCI] controller reset timed out, skipping controller\n");
+        malloc_free(hc);
+        return;
+    }
+    if (!wait_controller_ready(hc->op_regs))
+        console_print_string("[XHCI] warning: controller not ready after reset\n");
 
     uint32_t hcsparams1 = xhci_read32(hc->cap_regs, 0x04);
     uint8_t max_slots = hcsparams1 & 0xFF;
@@ -2605,12 +2702,14 @@ void xhci_init(pci_device_t *dev) {
     struct xhci_trb evt;
     xhci_submit_command(hc, 0, 0, TRB_CMD_NOOP << 10, &evt);
 
+    xhci_register_controller(hc);
+
+    xhci_enum_begin();
     listing_all_ports(hc);
+    xhci_enum_end();
 
     create_task_kernel_arg((void *)xhci_hotplug_task, (uint64_t)hc, "xhci-hotplug");
     create_task_kernel_arg((void *)xhci_pool_task, (uint64_t)hc, "xhci-pool");
-
-    xhci_register_controller(hc);
 
     console_print_string("[XHCI] Controller Initialized\n");
 }
