@@ -18,6 +18,17 @@ static inline void mmio_write32(volatile uint8_t *base, uint32_t off, uint32_t v
     *(volatile uint32_t *)(base + off) = v;
 }
 
+static bool nvme_wait_csts(volatile uint8_t *base, bool want_enabled) {
+    for (uint64_t i = 0; i < 5000000; i++) {
+        uint32_t csts = mmio_read32(base, 0x1C);
+        if (csts == 0xFFFFFFFFu) return false;
+        if (csts & 2) return false;
+        if (((csts & 1) != 0) == want_enabled) return true;
+        __asm__ volatile("pause");
+    }
+    return false;
+}
+
 static bool nvme_submit_admin_cmd(volatile uint8_t *base, 
                                  void *asq, void *acq,
                                  uint16_t *sq_tail, uint16_t *cq_head, 
@@ -34,8 +45,9 @@ static bool nvme_submit_admin_cmd(volatile uint8_t *base,
     mmio_write32(base, 0x1000, *sq_tail);
 
     volatile struct nvme_cqe *cqe = (volatile struct nvme_cqe *)((uint8_t *)acq + (*cq_head) * 16);
-    uint64_t timeout = 100000000;
+    uint64_t timeout = 20000000;
     while (((cqe->status & 1) != *phase)) {
+        __asm__ volatile("pause");
         if (--timeout == 0) {
             console_print_string("[NVMe] Admin Command Timeout (CID=");
             console_print_hex(cid);
@@ -96,8 +108,9 @@ int nvme_io_read(struct nvme_ctrl *c, uint64_t lba, uint16_t nlb, uint64_t buf_p
     volatile struct nvme_cqe *cqe = (volatile struct nvme_cqe *)
         ((uint8_t *)c->io_cq + c->io_cq_head * 16);
 
-    uint64_t t = 100000000;
+    uint64_t t = 20000000;
     while ((cqe->status & 1) != c->io_phase) {
+        __asm__ volatile("pause");
         if (--t == 0) return -1;
     }
 
@@ -145,8 +158,9 @@ int nvme_io_write(struct nvme_ctrl *c, uint64_t lba, uint16_t nlb, uint64_t buf_
     volatile struct nvme_cqe *cqe = (volatile struct nvme_cqe *)
         ((uint8_t *)c->io_cq + c->io_cq_head * 16);
 
-    uint64_t t = 100000000;
+    uint64_t t = 20000000;
     while ((cqe->status & 1) != c->io_phase) {
+        __asm__ volatile("pause");
         if (--t == 0) {
             console_print_string("[NVMe] I/O Write timeout\n");
             return -1;
@@ -190,8 +204,9 @@ int nvme_io_flush(struct nvme_ctrl *c) {
     volatile struct nvme_cqe *cqe = (volatile struct nvme_cqe *)
         ((uint8_t *)c->io_cq + c->io_cq_head * 16);
 
-    uint64_t t = 100000000;
+    uint64_t t = 20000000;
     while ((cqe->status & 1) != c->io_phase) {
+        __asm__ volatile("pause");
         if (--t == 0) return -1;
     }
 
@@ -218,7 +233,9 @@ static int nvme_block_read(void* local_device_struct, uint64_t lba, uint32_t cou
         return -1;
     }
 
-    uint32_t max_sectors_per_bounce = (4096 * NVME_BOUNCE_PAGES) / sector_size;
+    uint32_t max_sectors_per_bounce = sector_size ?
+        (4096 * NVME_BOUNCE_PAGES) / sector_size : 0;
+    if (max_sectors_per_bounce == 0) return -1;
 
     uint8_t *out = (uint8_t *)buf_virt;
     uint64_t cur_lba = lba;
@@ -264,7 +281,9 @@ static int nvme_block_write(void* local_device_struct, uint64_t lba, uint32_t co
         return -1;
     }
 
-    uint32_t max_sectors_per_bounce = (4096 * NVME_BOUNCE_PAGES) / sector_size;
+    uint32_t max_sectors_per_bounce = sector_size ?
+        (4096 * NVME_BOUNCE_PAGES) / sector_size : 0;
+    if (max_sectors_per_bounce == 0) return -1;
 
     uint8_t *in = (uint8_t *)buf_virt;
     uint64_t cur_lba = lba;
@@ -306,8 +325,13 @@ static int nvme_block_flush(void* local_device_struct) {
 }
 
 void nvme_init(pci_device_t *dev) {
-    uint64_t bar0_phys = (uint64_t)(dev->bars[0] & 0xFFFFFFF0)
-                    | ((uint64_t)dev->bars[1] << 32);
+    uint64_t bar0_phys = (uint64_t)(dev->bars[0] & 0xFFFFFFF0);
+    if ((dev->bars[0] & 0x6) == 0x4)
+        bar0_phys |= ((uint64_t)dev->bars[1] << 32);
+    if (!bar0_phys) {
+        console_print_string("[NVMe] invalid BAR0, skipping controller\n");
+        return;
+    }
     uint64_t bar0_virt = bar0_phys + get_bootinfo().hhdm->offset;
     volatile uint8_t *base = (volatile uint8_t *)bar0_virt;
 
@@ -324,12 +348,19 @@ void nvme_init(pci_device_t *dev) {
     }
 
     uint32_t csts = mmio_read32(base, 0x1C);
+    if (csts == 0xFFFFFFFFu) {
+        console_print_string("[NVMe] controller not responding, skipping\n");
+        return;
+    }
+    console_print_string("[NVMe] controller found, initializing\n");
     if (csts & 1) {
         uint32_t cc = mmio_read32(base, 0x14);
-        cc &= ~1u; // EN = 0
+        cc &= ~1u;
         mmio_write32(base, 0x14, cc);
 
-        while (mmio_read32(base, 0x1C) & 1) {
+        if (!nvme_wait_csts(base, false)) {
+            console_print_string("[NVMe] disable timed out, skipping\n");
+            return;
         }
     }
 
@@ -357,8 +388,12 @@ void nvme_init(pci_device_t *dev) {
     mmio_write32(base, 0x34, (uint32_t)(acq_phys >> 32));
 
     mmio_write32(base, 0x14, cc);
-    
-    while (!(mmio_read32(base, 0x1C) & 1)) {
+
+    if (!nvme_wait_csts(base, true)) {
+        console_print_string("[NVMe] enable timed out, skipping\n");
+        pmm_free_page((void*)asq_phys);
+        pmm_free_page((void*)acq_phys);
+        return;
     }
 
     uint16_t admin_sq_tail = 0;

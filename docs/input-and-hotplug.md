@@ -113,3 +113,53 @@ echo "umount /mnt/usb"            > /dev/diskctl
 lwext4 в дереве использует один общий mount point `/`, поэтому одновременно
 может быть смонтирован только один раздел ext4 (обычно корневой `C:`).
 Разделы FAT32 на флешках монтируются без ограничений.
+
+## Диагностика зависания на реальном железе
+
+Если загрузка останавливается после `[XHCI] Controller Initialized`, соберите
+последние строки экрана — теперь на каждом этапе есть маркер:
+
+```
+[BOOT] PCI scan...
+[XHCI] probing controller <bus>:<slot>:<func>
+[XHCI] waiting for ports (<N>)
+[XHCI] port <N> connected
+[USB] device VID=0x... PID=0x...
+[XHCI] Controller Initialized
+[BOOT] PCI scan done
+[BOOT] partitions scan...
+[BOOT] partitions scan done
+[BOOT] mounting filesystems...
+[BOOT] filesystems mounted
+[BOOT] devfs ready
+[HOTPLUG] disks found: <N>
+[BOOT] hotplug started
+[BOOT] input ready
+[BOOT] enabling interrupts
+[BOOT] interrupts enabled, scheduler running
+```
+
+Что сделано для защиты от «вечного» ожидания железа:
+
+* В `xhci_init()` проверяются BAR0/CAPLENGTH/HCIVERSION, а ожидание HCRST
+  ограничено; неотвечающий контроллер пропускается с сообщением, а не вешает ядро.
+* Все спинлоки xHCI (`evt_lock`, `ep_lock`, `ep0_lock`, `cmd_exec_lock`,
+  `report_lock`) получили таймауты и периодический `schedule_yield()`:
+  взаимная блокировка задач больше не останавливает систему.
+* Перечисление USB до `sti` имеет бюджет в 40 таймаутов
+  (`[XHCI] boot timeout budget exhausted, deferring to hotplug`). Исчерпавшие
+  бюджет устройства перечисляются повторно задачей hotplug после включения
+  прерываний — загрузка всегда продолжается.
+* `xhci_register_controller()` вызывается до перечисления портов; повторные
+  попытки hotplug для одного порта ограничены одной попыткой в секунду.
+* Задержки в `init_usb_mass_storage()` уменьшены на два порядка
+  (было 150 млн итераций `pause` на каждую попытку INQUIRY).
+* В `nvme_init()` исправлено чтение 64-битного BAR (раньше старшая половина
+  бралась из BAR1 даже для 32-битного BAR), добавлены таймауты ожидания
+  CSTS.RDY/CSTS.CFS, таймауты completion queue уменьшены до 20 млн итераций,
+  исключён бесконечный цикл при нулевом размере сектора.
+
+Обратите внимание: в дереве нет драйвера AHCI/SATA, поэтому загрузочный диск
+на реальном ПК должен быть USB (или NVMe). Устройства за внешним USB-хабом
+пока не перечисляются — если флешка/мышь/клавиатура висят на хабе, их нужно
+воткнуть напрямую в порт материнской платы.

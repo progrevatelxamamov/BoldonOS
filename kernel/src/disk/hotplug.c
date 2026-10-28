@@ -704,6 +704,10 @@ void partitions_hotplug_start(void) {
         if (pt) (void)register_partition_nodes(d->name, pt, alias);
     }
 
+    console_print_string("[HOTPLUG] disks found: ");
+    console_print_num(known_count);
+    console_print_string("\n");
+
     hotplug_ready = true;
     create_task_kernel((void *)hotplug_task, "hotplug");
 }
