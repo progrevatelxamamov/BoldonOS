@@ -63,6 +63,8 @@ typedef struct {
     struct evt_queue  cmd_evt_q;
     struct evt_queue  transfer_evt_q[MAX_XHCI_SLOTS][32];
     volatile uint8_t port_change_queue[16];
+    uint64_t port_next_try[33];
+    uint32_t enum_fail_reported;
     volatile uint8_t port_change_head;
     volatile uint8_t port_change_tail;
     struct usb_hid *hid_table[MAX_XHCI_SLOTS][32];

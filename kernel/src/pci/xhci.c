@@ -17,6 +17,7 @@
 #include <inout/inout.h>
 #include <cpu/apic.h>
 #include <cpu/time.h>
+#include <cpu/acpi.h>
 #include <net/wifi.h>
 
 extern int init_rtl8192eu_wifi(xhci_controller_t *hc, uint8_t slot_id, uint8_t speed, uint8_t ep_in, uint8_t ep_out, uint16_t mps);
@@ -273,12 +274,16 @@ void xhci_poll(xhci_controller_t *hc) {
 static volatile uint32_t xhci_enum_timeouts = 0;
 static volatile bool xhci_enum_active = false;
 static volatile bool xhci_boot_done = false;
+static uint64_t xhci_enum_start;
+static uint64_t xhci_enum_ticks;
 
 void xhci_mark_boot_complete(void) {
     xhci_boot_done = true;
 }
 
 static void xhci_enum_begin(void) {
+    xhci_enum_start = hpet_read_counter();
+    xhci_enum_ticks = hpet_ticks_for_ms(750);
     xhci_enum_timeouts = 0;
     xhci_enum_active = true;
 }
@@ -290,15 +295,24 @@ static void xhci_enum_end(void) {
 static bool xhci_boot_exhausted(void) {
     if (xhci_boot_done || interrupts_enabled()) return false;
     if (!xhci_enum_active) return false;
-    return xhci_enum_timeouts >= XHCI_BOOT_TIMEOUT_LIMIT;
+    return xhci_enum_timeouts >= XHCI_BOOT_TIMEOUT_LIMIT ||
+           (xhci_enum_ticks && hpet_read_counter() - xhci_enum_start >= xhci_enum_ticks);
 }
 
 static int wait_event_from(xhci_controller_t *hc, struct evt_queue *q,
                            struct xhci_trb *out_evt)
 {
     if (xhci_boot_exhausted()) return -1;
-    for (uint64_t t = 0; t < 2000000; t++) {
+    bool boot = !xhci_boot_done && !interrupts_enabled();
+    uint64_t start = hpet_read_counter();
+    uint64_t ticks = hpet_ticks_for_ms(boot ? 100 : 1000);
+    uint64_t spins = boot ? 200000 : 2000000;
+    for (uint64_t t = 0; t < spins; t++) {
         if (evtq_pop(q, out_evt)) return 0;
+        if ((t & 0x3F) == 0) {
+            if (ticks && hpet_read_counter() - start >= ticks) break;
+            if (xhci_boot_exhausted()) break;
+        }
 
         if ((t & 0x3F) == 0) xhci_poll(hc);
 
@@ -1901,12 +1915,11 @@ void xhci_set_keyboard_leds(uint8_t leds) {
    например адаптер/мышь воткнули до окончания инициализации контроллера
    или CSC остался не подтверждённым. Раз в 200 мс сверяем состояние
    портов с таблицей слотов. */
-static uint64_t xhci_port_next_try[64];
 
-static bool xhci_port_try(uint8_t port, uint64_t now) {
-    if (port >= 64) return true;
-    if (now < xhci_port_next_try[port]) return false;
-    xhci_port_next_try[port] = now + 1000;
+static bool xhci_port_try(xhci_controller_t *hc, uint8_t port, uint64_t now) {
+    if (port < 1 || port > 32) return false;
+    if (now < hc->port_next_try[port]) return false;
+    hc->port_next_try[port] = now + 1000;
     return true;
 }
 
@@ -1923,9 +1936,9 @@ static void xhci_rescan_ports(xhci_controller_t *hc) {
         uint8_t slot = xhci_find_slot_by_port(hc, port);
 
         if (portsc & XHCI_PORTSC_CSC) {
-            if (xhci_port_try(port, now)) handle_port_connect(hc, port);
+            if (xhci_port_try(hc, port, now)) handle_port_connect(hc, port);
         } else if ((portsc & XHCI_PORTSC_CCS) && !slot) {
-            if (xhci_port_try(port, now)) handle_port_connect(hc, port);
+            if (xhci_port_try(hc, port, now)) handle_port_connect(hc, port);
         } else if (!(portsc & XHCI_PORTSC_CCS) && slot) {
             handle_port_disconnect(hc, port);
         }
@@ -1940,7 +1953,7 @@ static void xhci_hotplug_task(void *arg) {
         if (hc->port_change_head != hc->port_change_tail) {
             uint8_t port = hc->port_change_queue[hc->port_change_head];
             hc->port_change_head = (hc->port_change_head + 1) % 16;
-            if (xhci_port_try(port, get_monotonic_ms()))
+            if (xhci_port_try(hc, port, get_monotonic_ms()))
                 handle_port_connect(hc, port);
         }
 
@@ -2397,13 +2410,11 @@ void handle_port_disconnect(xhci_controller_t *hc, uint8_t port) {
     }
 }
 
-static uint32_t enum_fail_reported;
-
 static void usb_enum_fail(xhci_controller_t *hc, uint8_t port, const char *stage) {
     if (port < 1 || port > 32) return;
     uint32_t bit = 1u << (port - 1);
-    if (enum_fail_reported & bit) return;
-    enum_fail_reported |= bit;
+    if (hc->enum_fail_reported & bit) return;
+    hc->enum_fail_reported |= bit;
     console_print_string("[USB] ");
     console_print_num(hc->bus);
     console_print_string(":");
@@ -2563,7 +2574,7 @@ void handle_port_connect(xhci_controller_t *hc, uint8_t port) {
 }
 
 void listing_all_ports(xhci_controller_t *hc) {
-    enum_fail_reported = 0;
+    hc->enum_fail_reported = 0;
     uint32_t hcsparams1 = xhci_read32(hc->cap_regs, 0x04);
     uint8_t max_ports = (hcsparams1 >> 24) & 0xFF;
     if (max_ports == 0 || max_ports > 32) max_ports = 32;
