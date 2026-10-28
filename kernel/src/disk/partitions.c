@@ -239,16 +239,48 @@ struct partition_table* osdev_get_partition_struct(const char *name) {
 
 uint64_t get_partitions_count(struct partition_table* pt) { return pt->count; }
 
+uint32_t partitions_block_device_count(void) {
+    uint32_t n = 0;
+    for (uint64_t i = 0; i < MAX_BLOCK_DEVICES; i++) {
+        if (block_devices[i].sector_count > 0 && block_devices[i].name[0] != 0 &&
+            block_devices[i].read != NULL) n++;
+    }
+    return n;
+}
+
 void partitions_level_init(void) {
     part_tables_count = 0;
+    uint32_t found = 0;
     for (uint64_t i = 0; i < MAX_BLOCK_DEVICES; i++) {
         if (block_devices[i].sector_count > 0 && block_devices[i].name[0] != 0 && block_devices[i].read != NULL) {
+            found++;
+            console_print_string("[DISK] ");
+            console_print_string(block_devices[i].name);
+            console_print_string(" sectors=");
+            console_print_num(block_devices[i].sector_count);
+            console_print_string(" bps=");
+            console_print_num(block_devices[i].sector_size);
+            console_print_string("\n");
             struct partition_table* pt = osdev_get_partition_struct(block_devices[i].name);
             if (pt) {
+                console_print_string("[DISK] ");
+                console_print_string(block_devices[i].name);
+                console_print_string(" partitions=");
+                console_print_num(pt->count);
+                console_print_string("\n");
                 part_tables[part_tables_count++] = pt;
+            } else {
+                console_print_string("[DISK] ");
+                console_print_string(block_devices[i].name);
+                console_print_string(" partition table unreadable\n");
             }
         }
     }
+    console_print_string("[DISK] block devices at boot: ");
+    console_print_num(found);
+    console_print_string("\n");
+    if (!found)
+        console_print_string("[DISK] no storage yet; USB enumeration may finish in hotplug after sti\n");
 }
 
 static int gpt_add_partition(const char *name,
@@ -888,5 +920,54 @@ const char *partitions_detect_fs(const char *dev, uint64_t lba) {
         else if (is_ext4_sector(raw + 1024)) result = "ext4";
     }
     pmm_free_page(page);
+    return result;
+}
+
+static volatile uint32_t root_mount_guard;
+
+static bool root_partition_mounted(const char *dev, uint64_t lba) {
+    for (char c = 'A'; c <= 'Z'; c++) {
+        vfs_mount_t *m = vfs_get_mount(c);
+        if (!m || m->dead) continue;
+        if (m->start_lba == lba && strcmp(m->device, dev) == 0) return true;
+    }
+    return false;
+}
+
+int partitions_try_mount_root(const char *dev) {
+    if (vfs_get_mount('C')) return 0;
+    if (__sync_lock_test_and_set(&root_mount_guard, 1)) return -1;
+
+    int result = -2;
+    for (int pass = 0; pass < 3 && result != 0; pass++) {
+        for (uint64_t ti = 0; ti < part_tables_count && result != 0; ti++) {
+            struct partition_table *pt = part_tables[ti];
+            if (!pt || !pt->block_device_name) continue;
+            if (dev && dev[0] && strcmp(pt->block_device_name, dev) != 0) continue;
+            for (uint32_t pi = 0; pi < pt->count; pi++) {
+                struct partition *p = &pt->parts[pi];
+                if (p->sector_count == 0) continue;
+                if (pass == 0 && !partition_is_boot(p)) continue;
+                if (root_partition_mounted(pt->block_device_name, p->start_lba)) continue;
+                const char *fs = partitions_detect_fs(pt->block_device_name, p->start_lba);
+                if (!fs) continue;
+                if (pass == 1 && strcmp(fs, "ext4") != 0) continue;
+                if (vfs_mount_fs(fs, pt->block_device_name, 'C', (void *)p->start_lba) == 0) {
+                    vfs_set_boot_drive('C');
+                    console_print_string("[ROOT] C: mounted from ");
+                    console_print_string(pt->block_device_name);
+                    console_print_string(" partition ");
+                    console_print_num(pi + 1);
+                    console_print_string(" (");
+                    console_print_string(fs);
+                    console_print_string(")\n");
+                    result = 0;
+                    break;
+                }
+            }
+        }
+    }
+
+    __sync_lock_release(&root_mount_guard);
     return result;
 }

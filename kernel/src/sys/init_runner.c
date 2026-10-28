@@ -6,6 +6,20 @@
 #include <memory.h>
 #include <gconsole.h>
 #include <inout/inout.h>
+#include <disk/partitions.h>
+
+static void init_no_root_hint(void) {
+    console_print_string("\n============================================================\n");
+    console_print_string("[INIT] root filesystem C: is still not mounted\n");
+    console_print_string("[INIT] block devices: ");
+    console_print_num(partitions_block_device_count());
+    console_print_string("\n");
+    console_print_string("[INIT] expected /bin/sh and /etc/init.sh on C: (ext4 or FAT32)\n");
+    console_print_string("[INIT] check main.img is written to USB, osdata/ is not empty,\n");
+    console_print_string("[INIT] and the kernel was rebuilt (make check-image)\n");
+    console_print_string("[INIT] waiting for a disk, hotplug will retry automatically\n");
+    console_print_string("============================================================\n\n");
+}
 
 static void pty_input_task(void) {
     while (1) {
@@ -111,14 +125,21 @@ void launch_init_process(void) {
         NULL
     };
 
+    if (!vfs_get_mount('C')) {
+        init_no_root_hint();
+        while (!vfs_get_mount('C')) schedule_yield();
+        console_print_string("[INIT] root appeared, continuing boot\n");
+    }
+
     console_print_string("[INIT] Starting /etc/init.sh...\n");
     sys_execve("/bin/sh", argv, envp);
 
-    /* Если /etc/init.sh не найден, пробуем запустить просто sh */
     char *fallback_argv[] = { "/bin/sh", NULL };
     sys_execve("/bin/sh", fallback_argv, envp);
 
     console_print_string("[INIT] Failed to start shell!\n");
+    console_print_string("[INIT] C: is mounted but /bin/sh or /etc/init.sh is missing\n");
+    console_print_string("[INIT] check that osdata/bin/sh and osdata/etc/init.sh exist\n");
     while (1) {
         schedule_yield();
     }

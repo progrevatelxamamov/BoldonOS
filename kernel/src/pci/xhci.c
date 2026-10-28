@@ -896,6 +896,7 @@ void init_usb_mass_storage(xhci_controller_t *hc, uint8_t slot_id, uint8_t speed
     msd->bulk_in_ring[COUNT_OF_TRB-1].control = (TRB_LINK << 10) | (1u << 1) | 1u;
 
     if (xhci_configure_bulk_endpoints(hc, msd, ep_out_addr, ep_in_addr, mps) != 0) {
+        console_print_string("[MSD] bulk endpoint configuration failed\n");
         pmm_free_pages((void*)msd->cmd_page_phys, 1);
         pmm_free_pages((void*)msd->bulk_out_ring_phys, 1);
         pmm_free_pages((void*)msd->bulk_in_ring_phys, 1);
@@ -916,6 +917,7 @@ void init_usb_mass_storage(xhci_controller_t *hc, uint8_t slot_id, uint8_t speed
     }
 
     if (inquiry_res != 0) {
+        console_print_string("[MSD] SCSI INQUIRY failed, disk not available\n");
         pmm_free_pages((void*)msd->cmd_page_phys, 1);
         pmm_free_pages((void*)msd->bulk_out_ring_phys, 1);
         pmm_free_pages((void*)msd->bulk_in_ring_phys, 1);
@@ -934,6 +936,7 @@ void init_usb_mass_storage(xhci_controller_t *hc, uint8_t slot_id, uint8_t speed
     }
 
     if (cap_res != 0) {
+        console_print_string("[MSD] SCSI READ CAPACITY failed, disk not available\n");
         pmm_free_pages((void*)msd->cmd_page_phys, 1);
         pmm_free_pages((void*)msd->bulk_out_ring_phys, 1);
         pmm_free_pages((void*)msd->bulk_in_ring_phys, 1);
@@ -943,6 +946,7 @@ void init_usb_mass_storage(xhci_controller_t *hc, uint8_t slot_id, uint8_t speed
 
     struct block_device *bd = (struct block_device *)malloc_alloc(sizeof(*bd));
     if (!bd) {
+        console_print_string("[MSD] out of memory for block device\n");
         pmm_free_pages((void*)msd->cmd_page_phys, 1);
         pmm_free_pages((void*)msd->bulk_out_ring_phys, 1);
         pmm_free_pages((void*)msd->bulk_in_ring_phys, 1);
@@ -960,7 +964,9 @@ void init_usb_mass_storage(xhci_controller_t *hc, uint8_t slot_id, uint8_t speed
 
     msd->bd = bd;
     register_device(bd);
-    console_print_string("[MSD] Registered successfully.\n");
+    console_print_string("[MSD] Registered successfully as ");
+    console_print_string(bd->name);
+    console_print_string("\n");
 }
 
 typedef struct {
@@ -2391,6 +2397,26 @@ void handle_port_disconnect(xhci_controller_t *hc, uint8_t port) {
     }
 }
 
+static uint32_t enum_fail_reported;
+
+static void usb_enum_fail(xhci_controller_t *hc, uint8_t port, const char *stage) {
+    if (port < 1 || port > 32) return;
+    uint32_t bit = 1u << (port - 1);
+    if (enum_fail_reported & bit) return;
+    enum_fail_reported |= bit;
+    console_print_string("[USB] ");
+    console_print_num(hc->bus);
+    console_print_string(":");
+    console_print_num(hc->slot);
+    console_print_string(":");
+    console_print_num(hc->func);
+    console_print_string(" port ");
+    console_print_num(port);
+    console_print_string(" failed: ");
+    console_print_string(stage);
+    console_print_string("\n");
+}
+
 void handle_port_connect(xhci_controller_t *hc, uint8_t port) {
     volatile uint8_t *port_base = hc->op_regs + 0x400;
     volatile uint8_t *portsc_reg = port_base + (port - 1) * 0x10;
@@ -2416,15 +2442,27 @@ void handle_port_connect(xhci_controller_t *hc, uint8_t port) {
 
     portsc = xhci_read32(portsc_reg, 0x00);
     uint8_t speed = (portsc >> 10) & 0xF;
-    if (!(portsc & XHCI_PORTSC_CCS)) return;
+    if (!(portsc & XHCI_PORTSC_CCS)) {
+        usb_enum_fail(hc, port, "device gone after port reset");
+        return;
+    }
 
     struct xhci_trb evt;
-    if (xhci_submit_command(hc, 0, 0, TRB_ENABLE_SLOT << 10, &evt) != 0) return;
+    if (xhci_submit_command(hc, 0, 0, TRB_ENABLE_SLOT << 10, &evt) != 0) {
+        usb_enum_fail(hc, port, "enable slot command timed out");
+        return;
+    }
 
     uint8_t code = (evt.status >> 24) & 0xFF;
     uint8_t slot_id = (evt.control >> 24) & 0xFF;
-    if (code != 1) return;
-    if (slot_id == 0 || slot_id >= MAX_XHCI_SLOTS) return;
+    if (code != 1) {
+        usb_enum_fail(hc, port, "enable slot rejected");
+        return;
+    }
+    if (slot_id == 0 || slot_id >= MAX_XHCI_SLOTS) {
+        usb_enum_fail(hc, port, "invalid slot id");
+        return;
+    }
 
     /* Слот мог остаться после аварийного отключения — чистим все его очереди. */
     xhci_drain_slot_events(hc, slot_id);
@@ -2469,12 +2507,14 @@ void handle_port_connect(xhci_controller_t *hc, uint8_t port) {
                             (TRB_ADDRESS_DEVICE << 10) |
                             ((uint32_t)slot_id << 24), &evt) != 0) {
         pmm_free_pages((void*)input_ctx_phys, 1);
+        usb_enum_fail(hc, port, "address device command timed out");
         xhci_destroy_slot(hc, slot_id);
         return;
     }
     code = (evt.status >> 24) & 0xFF;
     pmm_free_pages((void*)input_ctx_phys, 1);
     if (code != 1) {
+        usb_enum_fail(hc, port, "address device rejected");
         xhci_destroy_slot(hc, slot_id);
         return;
     }
@@ -2492,6 +2532,7 @@ void handle_port_connect(xhci_controller_t *hc, uint8_t port) {
 
     if (xhci_control_transfer(hc, slot_id, hc->ep0_ring[slot_id], &hc->ep0_enqueue[slot_id], &hc->ep0_cycle[slot_id], &setup, desc_phys, 8) != 0) {
         pmm_free_pages((void*)desc_phys, 1);
+        usb_enum_fail(hc, port, "short device descriptor failed");
         xhci_destroy_slot(hc, slot_id);
         return;
     }
@@ -2511,6 +2552,7 @@ void handle_port_connect(xhci_controller_t *hc, uint8_t port) {
     setup.wLength = 18;
     if (xhci_control_transfer(hc, slot_id, hc->ep0_ring[slot_id], &hc->ep0_enqueue[slot_id], &hc->ep0_cycle[slot_id], &setup, desc_phys, 18) != 0) {
         pmm_free_pages((void*)desc_phys, 1);
+        usb_enum_fail(hc, port, "full device descriptor failed");
         xhci_destroy_slot(hc, slot_id);
         return;
     }
@@ -2521,6 +2563,7 @@ void handle_port_connect(xhci_controller_t *hc, uint8_t port) {
 }
 
 void listing_all_ports(xhci_controller_t *hc) {
+    enum_fail_reported = 0;
     uint32_t hcsparams1 = xhci_read32(hc->cap_regs, 0x04);
     uint8_t max_ports = (hcsparams1 >> 24) & 0xFF;
     if (max_ports == 0 || max_ports > 32) max_ports = 32;
@@ -2549,16 +2592,23 @@ void listing_all_ports(xhci_controller_t *hc) {
         __asm__ volatile("pause");
     }
 
+    uint32_t connected = 0;
     for (uint8_t port = 1; port <= max_ports; port++) {
         volatile uint8_t *portsc_reg = port_base + (port - 1) * 0x10;
         uint32_t portsc = xhci_read32(portsc_reg, 0x00);
         if (portsc & XHCI_PORTSC_CCS) {
+            connected++;
             console_print_string("[XHCI] port ");
             console_print_num(port);
             console_print_string(" connected\n");
             handle_port_connect(hc, port);
         }
     }
+    console_print_string("[XHCI] devices connected on this controller: ");
+    console_print_num(connected);
+    console_print_string("\n");
+    if (!connected)
+        console_print_string("[XHCI] no ports report a device; check BIOS xHCI/EHCI hand-off settings\n");
 }
 
 void xhci_init(pci_device_t *dev) {

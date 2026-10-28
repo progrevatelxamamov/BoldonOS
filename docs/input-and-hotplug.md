@@ -163,3 +163,108 @@ lwext4 в дереве использует один общий mount point `/`,
 на реальном ПК должен быть USB (или NVMe). Устройства за внешним USB-хабом
 пока не перечисляются — если флешка/мышь/клавиатура висят на хабе, их нужно
 воткнуть напрямую в порт материнской платы.
+
+## Загрузка до shell на реальном ПК
+
+Симптом: экран доходит до `[MOUNT] Boot Drive C: NOT MOUNTED (FAIL)` и
+`[INIT] Failed to start shell`, после чего «зависает». Это не зависание ядра —
+ядро работает, но не нашло корневую файловую систему, поэтому некому запустить
+`/bin/sh`.
+
+Причины и что делать по порядку.
+
+### 1. Проверьте, что загружен свежий образ
+
+В репозитории лежит готовый `template.iso`, но это **старый бинарный снимок**:
+`git pull` обновляет исходники, а не пересобирает ISO. Новое ядро печатает
+маркеры `[BOOT] ...`, `[XHCI] probing controller`, `[XHCI] port N connected`.
+Если их на экране нет — грузится старое ядро.
+
+```bash
+git pull origin main
+sh kernel/get-deps
+make clean
+make -j"$(nproc)"
+make check-image
+```
+
+`make check-image` проверяет наличие строки `[BOOT] PCI scan` внутри
+`kernel/bin/kernel` и `template.iso`. Если проверка ругается — удалите
+`template.iso` и повторите сборку. Для сборки нужны `nasm`, `xorriso`, `curl`,
+`cc`; для `main.img` ещё `sgdisk`, `mkfs.fat`, `mkfs.ext4`, `mtools`, `sudo`.
+
+### 2. Грузитесь с `main.img`, а не с `template.iso`
+
+`template.iso` содержит только ядро, Limine и заставку. В нём **нет корневой
+файловой системы** — `/etc/init.sh` и `/bin/sh` там отсутствуют по определению.
+Полный загрузочный диск собирается отдельно:
+
+```bash
+make usb-image
+sudo dd if=main.img of=/dev/sdX bs=4M status=progress conv=fsync
+```
+
+`main.img` — GPT-образ на 1 ГиБ: BIOS Boot, EFI System (FAT32) и `BOLDON_ROOT`
+(ext4). Корень ext4 наполняется из каталога `osdata/`, который намеренно
+исключён из git (`.gitignore`). Минимально в нём должны быть `bin/sh` и
+`etc/init.sh`; без них даже смонтированный `C:` не даст shell.
+`make usb-image` и `make check-osdata` предупреждают об отсутствии этих файлов.
+
+Если вы записывали `template.iso` на флешку через Rufus/dd, ядро видит
+ISO9660/защитный MBR, не находит ни FAT32, ни ext4 и печатает
+`[DEBUG] Total valid candidates found: 0`.
+
+`limine.conf` содержит `boot_serial=D291F02E-...` — это GUID раздела из
+исходного `main.img`. При пересоздании образа `sgdisk` генерирует новые GUID,
+поэтому совпадения не будет; это не критично, потому что
+`mount_all_partitions()` и `partitions_try_mount_root()` имеют запасные сценарии
+(любой ext4, затем любой найденный раздел). Если разделов ext4 несколько,
+обновите GUID командой `sgdisk -i 3 main.img`.
+
+### 3. Новые диагностические маркеры
+
+После пересборки экран говорит сам, где именно проблема:
+
+```
+[DISK] usb0 sectors=... bps=512
+[DISK] usb0 partitions=3
+[DISK] block devices at boot: 1
+[XHCI] port 3 connected
+[USB] device VID=0x... PID=0x...
+[MSD] Init USB Mass Storage...
+[MSD] Registered successfully as usb0
+[XHCI] devices connected on this controller: 2
+[ROOT] C: mounted from usb0 partition 3 (ext4)
+[HOTPLUG] root filesystem became available as C:
+[INIT] Starting /etc/init.sh...
+```
+
+| Маркер | Что означает |
+|---|---|
+| `[DISK] block devices at boot: 0` | USB-флешка не определена как накопитель |
+| `[XHCI] devices connected on this controller: 0` | контроллер не видит ни одного порта с устройством |
+| `[USB] ... failed: address device rejected` | устройство не отвечает на перечисление |
+| `[MSD] SCSI INQUIRY failed` | флешка есть, но SCSI-команды не проходят |
+| `[DISK] usb0 partitions=0` | диск виден, но таблица разделов не читается |
+| `[INIT] root filesystem C: is still not mounted` | ждём диск; hotplug повторяет попытку каждые 2 с |
+| `[INIT] C: is mounted but /bin/sh or /etc/init.sh is missing` | диск смонтирован, но `osdata/` пуст |
+
+### 4. Если диски всё ещё не видны
+
+* В BIOS включите **xHCI Hand-off** и **EHCI Hand-off**, а режим xHCI поставьте
+  в `Enabled`, не `Auto`/`Smart Auto`. На платах времён Windows 7 USB 2.0 порты
+  часто остаются за EHCI, и xHCI их не видит — тогда будет
+  `[XHCI] no ports report a device`.
+* Вставьте флешку напрямую в порт материнской платы (хабы не поддерживаются).
+* SATA-диск с Windows не определяется: драйвера AHCI в ядре нет. Это ожидаемо.
+* Два `[XHCI] Controller Initialized` — это два контроллера на плате, норма.
+
+### 5. Позднее появление диска
+
+Перечисление USB до `sti` ограничено бюджетом таймаутов, поэтому накопитель
+может появиться уже после включения прерываний. Раньше такой диск монтировался
+только в `/media/...`, а `C:` оставался пустым и init падал. Теперь hotplug при
+появлении нового диска и дополнительно раз в 2 секунды пытается смонтировать
+корень через `partitions_try_mount_root()`, а задача init ждёт `C:` вместо того,
+чтобы сразу завершиться ошибкой. Если вставить флешку позже, система
+продолжит загрузку сама.
