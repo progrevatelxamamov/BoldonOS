@@ -204,6 +204,7 @@ struct MADT_gicc {
 void acpi_init(void);
 void *acpi_find_table(const char *signature);
 
+uint64_t hpet_ticks_for_ms(uint32_t ms);
 uint64_t hpet_read_counter(void);
 void hpet_sleep_ms(uint64_t ms);
 

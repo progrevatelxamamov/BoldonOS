@@ -1,0 +1,11 @@
+--- a/src/drivers/mou_devmice.c
++++ b/src/drivers/mou_devmice.c
+@@ -74,7 +74,7 @@
+     /* switch the mouse to ImPS/2 protocol*/
+ 	if (write(mouse_fd, imps2, sizeof(imps2)) != sizeof(imps2))
+ 		EPRINTF("Can't switch to ImPS/2 protocol\n");
+-	if (read(mouse_fd, buf, 4) != 1 || buf[0] != 0xF4)
++	if (read(mouse_fd, buf, 4) != 1 || buf[0] != 0xFA)
+ 		EPRINTF("Failed to switch to ImPS/2 protocol.\n");
+ 
+ 	if (mouse_fd < 0)

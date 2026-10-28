@@ -16,7 +16,6 @@ void ps2mouse_resync(void) {
     packet_index = 0;
     prev_btns = 0;
     last_byte_ms = get_monotonic_ms();
-    stream_ready = true;
 }
 
 static int mouse_cmd(uint8_t cmd) {
@@ -78,6 +77,7 @@ void ps2mouse_init(void) {
     if (mouse_cmd(0xF4) != 0) return;
 
     ps2mouse_resync();
+    stream_ready = true;
 }
 
 static void emit_move(int dx, int dy, int dz) {
@@ -124,18 +124,6 @@ void ps2mouse_feed(uint8_t byte) {
         return;
     }
 
-    if (packet_index == 1 && (byte & 0xC0)) {
-        packet_index = 0;
-        return;
-    }
-
-    if (packet_index >= 1 && packet_index < packet_size &&
-        (byte & 0x08) && !(byte & 0xC0) && gap >= 3) {
-        packet[0] = byte;
-        packet_index = 1;
-        return;
-    }
-
     packet[packet_index++] = byte;
     if (packet_index < packet_size) return;
 
@@ -144,8 +132,8 @@ void ps2mouse_feed(uint8_t byte) {
     uint8_t flags = packet[0];
     if (flags & 0xC0) return;
 
-    int dx = (int8_t)packet[1];
-    int dy = (int8_t)packet[2];
+    int dx = (int)packet[1] - ((flags & 0x10) ? 256 : 0);
+    int dy = (int)packet[2] - ((flags & 0x20) ? 256 : 0);
     dy = -dy;
 
     int dz = 0;

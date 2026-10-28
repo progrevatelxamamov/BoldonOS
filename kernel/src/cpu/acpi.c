@@ -63,7 +63,12 @@ void hpet_init(void) {
 }
 
 uint64_t hpet_read_counter(void) {
-    return HPET_REG(0xF0);
+    return hpet_base ? HPET_REG(0xF0) : 0;
+}
+
+uint64_t hpet_ticks_for_ms(uint32_t ms) {
+    if (!hpet_base || !hpet_clock_period_fs) return 0;
+    return ((uint64_t)ms * 1000000000000ULL) / hpet_clock_period_fs;
 }
 
 void hpet_sleep_ms(uint64_t ms) {

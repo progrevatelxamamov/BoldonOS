@@ -54,9 +54,11 @@ bool ps2_read_any_timeout(uint8_t *out) {
 }
 
 void ps2_drain_quiet(uint32_t idle_spins) {
-    for (uint32_t idle = 0; idle < idle_spins; idle++) {
+    uint32_t drained = 0;
+    for (uint32_t idle = 0; idle < idle_spins && drained < 1024; idle++) {
         if (inb(PS2_STATUS) & STATUS_OUTPUT_FULL) {
             (void)inb(PS2_DATA);
+            drained++;
             idle = 0;
             continue;
         }
@@ -81,8 +83,10 @@ bool ps2_write_kbd(uint8_t val) {
 }
 
 bool ps2_write_mouse(uint8_t val) {
-    write_cmd(CMD_WRITE_MOUSE);
-    write_data(val);
+    if (!wait_write()) return false;
+    outb(PS2_CMD, CMD_WRITE_MOUSE);
+    if (!wait_write()) return false;
+    outb(PS2_DATA, val);
     return true;
 }
 
