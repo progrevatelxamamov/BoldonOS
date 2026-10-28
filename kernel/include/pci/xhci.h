@@ -218,7 +218,6 @@ struct usb_hid {
     volatile uint8_t report_qt;
     uint8_t  report_data[HID_REPORT_QUEUE][64];
     uint8_t  report_data_len[HID_REPORT_QUEUE];
-    uint32_t last_transfer_ms;
     uint32_t halt_recovery_ms;
     /* Hotplug: устройство отключено, задача должна освободить ресурсы и уснуть. */
     volatile uint8_t disconnected;

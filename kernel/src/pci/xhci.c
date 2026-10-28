@@ -195,7 +195,7 @@ int xhci_poll_event(xhci_controller_t *hc, struct xhci_trb *out_evt) {
 }
 
 static void hid_capture_report(struct usb_hid *hid, const struct xhci_trb *evt, uint32_t len) {
-    if (!hid || !evt || !hid->report || hid->disconnected || len == 0) return;
+    if (!hid || !evt || !hid->report || hid->disconnected) return;
     if (len > 64) len = 64;
     if (len > hid->report_size) len = hid->report_size;
 
@@ -205,6 +205,10 @@ static void hid_capture_report(struct usb_hid *hid, const struct xhci_trb *evt, 
         return;
     }
     hid->transfer_pending = 0;
+    if (len == 0) {
+        xhci_unlock(&hid->report_lock);
+        return;
+    }
 
     uint8_t next = (uint8_t)((hid->report_qh + 1) % HID_REPORT_QUEUE);
     if (next == hid->report_qt)
@@ -1562,8 +1566,6 @@ static void usb_hid_task(void *arg) {
     bool transfer_queued = false;
     uint8_t snap[64];
 
-    hid->last_transfer_ms = (uint32_t)get_monotonic_ms();
-
     for (;;) {
         if (hid->disconnected) {
             hid->stopped = 1;
@@ -1623,6 +1625,7 @@ static void usb_hid_task(void *arg) {
 
         uint8_t snap_len = 0;
         if (xhci_lock_timeout(&hid->report_lock, 200000)) {
+            if (!hid->transfer_pending) transfer_queued = false;
             if (hid->report_qt != hid->report_qh) {
                 snap_len = hid->report_data_len[hid->report_qt];
                 if (snap_len > 64) snap_len = 64;
@@ -1638,10 +1641,6 @@ static void usb_hid_task(void *arg) {
             if (hid->protocol == 1) handle_keyboard_report(hid, snap, snap_len);
             else if (hid->protocol == 2) handle_mouse_report(hid, snap, snap_len);
         }
-
-        if (transfer_queued &&
-            (uint32_t)get_monotonic_ms() - hid->last_transfer_ms > 500)
-            hid->halted = 1;
 
         if (!transfer_queued &&
             xhci_lock_timeout(&hc->ep_lock[hid->slot_id][hid->dci], 200000)) {
@@ -1668,7 +1667,6 @@ static void usb_hid_task(void *arg) {
 
                 hid->enqueue++;
                 transfer_queued = true;
-                hid->last_transfer_ms = (uint32_t)get_monotonic_ms();
 
                 __asm__ volatile("mfence" ::: "memory");
                 hc->db_regs[hid->slot_id] = hid->dci;
@@ -1775,7 +1773,6 @@ static void init_usb_hid(xhci_controller_t *hc, uint8_t slot_id, uint8_t speed,
     hid->report_qt = 0;
     hid->transfer_pending = 0;
     hid->report_lock = 0;
-    hid->last_transfer_ms = (uint32_t)get_monotonic_ms();
     hid->disconnected = 0;
     hid->stopped = 0;
     hid->active_keycode_count = 0;
