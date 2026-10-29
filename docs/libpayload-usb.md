@@ -204,3 +204,28 @@ objdump -d --start-address=0xffffffff8005aa44 --stop-address=0xffffffff8005aa74 
 After installing the diagnostic build, collect the new `[IRET]` lines and
 preserve its ELF too. Absolute RIP values from different builds are not
 interchangeable. Test: `python3 tests/test_iret_diagnostics.py`.
+
+### IRET frame reported unreadable on the physical PC
+
+The initial diagnostic used `vmm_get_phys`, whose old page walker assumed that
+all mappings ended in a 4-KiB PTE. `vmm_init` actually retains the Limine page
+tables, which may contain 2-MiB or 1-GiB leaves, including HHDM stack mappings.
+The old walker could interpret mapped RAM as another page table and report a
+valid stack as unmapped. An unreadable-frame message alone was therefore not
+proof of a missing stack mapping.
+
+The read-only translation walker now recognizes huge leaves, checks present
+bits at every level and rejects noncanonical addresses. `vmm_get_phys` retains
+its existing contract: the physical base of the containing **4-KiB page**, not
+the byte address or the entire huge-page base. `vmm_is_mapped` uses the same
+walk and can distinguish a valid mapping to physical page zero from absence.
+The mapper, unmapper and address-space cloning are not changed by this patch.
+
+The panic dump also reports the failed stack slot and emits GDTR plus the
+fault-code-selected descriptor even when target-stack reading fails. This is
+still not a confirmed fix for the underlying `sh` IRETQ fault.
+
+Run `python3 tests/test_vmm_translation.py`: the actual VMM object is exercised
+with synthetic 4-KiB/2-MiB/1-GiB tables, a stack-like HHDM address ending in
+`0x501FE8`, high physical addresses, huge-page PAT bits, physical zero,
+non-present entries, reserved top-level PS and noncanonical pointers.
