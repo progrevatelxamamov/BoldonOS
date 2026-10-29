@@ -14,7 +14,7 @@ prefix = r'''
 #include <string.h>
 typedef struct { int unused; } page_table_t;
 typedef struct { page_table_t *pml4; } process_t;
-struct interrupt_frame { uint64_t isr_number, cs, rip, rsp; };
+struct interrupt_frame { uint64_t isr_number, cs, rip, rsp, error_code; };
 struct gdt_ptr { uint16_t limit; uint64_t base; };
 static struct gdt_ptr test_gdtr = {55, 0x5000};
 static page_table_t user, kernel;
@@ -43,19 +43,19 @@ int main(void) {
     assert(!panic_read_word(&user, 0xFFFF7FFFFFFFFFE0ULL, &value));
     assert(!panic_read_word(&user, 0x6000, &value));
     process_t proc = {&user};
-    struct interrupt_frame f = {13, 8, 0x1000, 0x3000};
+    struct interrupt_frame f = {13, 8, 0x1000, 0x3000, 0x18};
     pages[1][0] = 0x48; pages[1][1] = 0xcf;
     uint64_t target[] = {0x4002756e, 0x23, 0x246, 0x7fffffe788, 0x1b};
     memcpy(pages[3], target, sizeof(target));
     uint64_t cs = 0x00affa000000ffff, ss = 0x0080f2000000ffff;
     memcpy(pages[5] + 0x20, &cs, 8); memcpy(pages[5] + 0x18, &ss, 8);
     dump_iret_target(&f, &proc);
-    assert(count == 9 && values[0] == target[0] && values[4] == 0x1b);
-    assert(values[7] == cs && values[8] == ss);
+    assert(count == 10 && values[0] == target[0] && values[4] == 0x1b);
+    assert(values[7] == ss && values[8] == cs && values[9] == ss);
     unsigned before = messages;
     f.isr_number = 14; dump_iret_target(&f, &proc); assert(messages == before);
     f.isr_number = 13; f.rsp = 0x6000; count = 0;
-    dump_iret_target(&f, &proc); assert(messages > before && count == 0);
+    dump_iret_target(&f, &proc); assert(messages > before && count == 5);
     return 0;
 }
 '''

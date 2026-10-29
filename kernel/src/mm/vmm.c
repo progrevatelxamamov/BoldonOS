@@ -102,52 +102,36 @@ void vmm_unmap_page(page_table_t *pml4, uint64_t virt) {
     }
 }
 
+static bool vmm_lookup_page(page_table_t *pml4, uint64_t virt, uint64_t *phys) {
+    uint64_t upper = virt >> 47;
+    if (!pml4 || !phys || (upper != 0 && upper != 0x1FFFF)) return false;
+    page_table_t *table = pml4;
+    for (unsigned shift = 39; ; shift -= 9) {
+        uint64_t entry = table->entries[(virt >> shift) & 0x1FF];
+        if (!(entry & PTE_PRESENT)) return false;
+        if (shift == 12) {
+            *phys = pte_get_addr(entry);
+            return true;
+        }
+        if (entry & PTE_HUGE) {
+            if (shift == 39) return false;
+            uint64_t offset_mask = (1ULL << shift) - 1;
+            *phys = (pte_get_addr(entry) & ~offset_mask) |
+                    (virt & offset_mask & ~0xFFFULL);
+            return true;
+        }
+        table = (page_table_t *)(pte_get_addr(entry) + get_bootinfo().hhdm->offset);
+    }
+}
+
 bool vmm_is_mapped(page_table_t *pml4, uint64_t virt) {
-    if (!pml4) return false;
-
-    uint64_t pml4_indx = pml4_index(virt);
-    uint64_t pdpt_indx = pdpt_index(virt);
-    uint64_t pd_indx = pd_index(virt);
-    uint64_t pt_indx = pt_index(virt);
-
-    page_table_t *pdpt;
-    page_table_t *pd;
-    page_table_t *pt;
-
-    if (pml4->entries[pml4_indx] == 0) return false;
-    pdpt = (page_table_t*)(pte_get_addr(pml4->entries[pml4_indx]) + get_bootinfo().hhdm->offset);
-    
-    if (pdpt->entries[pdpt_indx] == 0) return false;
-    pd = (page_table_t*)(pte_get_addr(pdpt->entries[pdpt_indx]) + get_bootinfo().hhdm->offset);
-
-    if (pd->entries[pd_indx] == 0) return false;
-    pt = (page_table_t*)(pte_get_addr(pd->entries[pd_indx]) + get_bootinfo().hhdm->offset);
-
-    return pte_is_present(pt->entries[pt_indx]);
+    uint64_t phys;
+    return vmm_lookup_page(pml4, virt, &phys);
 }
 
 uint64_t vmm_get_phys(page_table_t *pml4, uint64_t virt) {
-    if (!pml4) return 0;
-
-    uint64_t pml4_indx = pml4_index(virt);
-    uint64_t pdpt_indx = pdpt_index(virt);
-    uint64_t pd_indx = pd_index(virt);
-    uint64_t pt_indx = pt_index(virt);
-
-    page_table_t *pdpt;
-    page_table_t *pd;
-    page_table_t *pt;
-
-    if (pml4->entries[pml4_indx] == 0) return 0;
-    pdpt = (page_table_t*)(pte_get_addr(pml4->entries[pml4_indx]) + get_bootinfo().hhdm->offset);
-    
-    if (pdpt->entries[pdpt_indx] == 0) return 0;
-    pd = (page_table_t*)(pte_get_addr(pdpt->entries[pdpt_indx]) + get_bootinfo().hhdm->offset);
-
-    if (pd->entries[pd_indx] == 0) return 0;
-    pt = (page_table_t*)(pte_get_addr(pd->entries[pd_indx]) + get_bootinfo().hhdm->offset);
-
-    return pte_get_addr(pt->entries[pt_indx]);
+    uint64_t phys;
+    return vmm_lookup_page(pml4, virt, &phys) ? phys : 0;
 }
 
 #define PTE_PHYS_MASK 0x000FFFFFFFFFF000ULL
