@@ -27,13 +27,18 @@ with tempfile.TemporaryDirectory() as directory:
                     str(ROOT / 'tests/libpayload_msc.c'),
                     str(wrapper), '-o', str(msc)], check=True)
     subprocess.run([str(msc)], check=True)
+    ehci = pathlib.Path(directory) / 'ehci-cleanup.o'
+    subprocess.run(['cc', '-std=gnu11', '-fno-pie', '-ffunction-sections',
+                    '-fdata-sections', *INCLUDES, '-c',
+                    str(ROOT / 'tests/libpayload_ehci_cleanup.c'),
+                    '-o', str(ehci)], check=True)
     memory = pathlib.Path(directory) / 'libpayload-memory-test'
     subprocess.run(['cc', '-std=gnu11', '-no-pie', '-ffunction-sections',
                     '-fdata-sections', '-Wl,--gc-sections',
                     '-I' + str(KERNEL / 'include'),
                     '-I' + str(KERNEL / 'limine-protocol/include'),
                     str(ROOT / 'tests/libpayload_memory.c'),
-                    str(KERNEL / objects[3]), '-o', str(memory)], check=True)
+                    str(KERNEL / objects[3]), str(ehci), '-o', str(memory)], check=True)
     subprocess.run([str(memory)], check=True)
 
 pci = (KERNEL / 'src/pci/pci.c').read_text()

@@ -136,3 +136,21 @@ The debug xHCI startup test now sends one NOOP rather than 32. Completion code
 1 is success; CRCR.CRR can be zero after the command queue has drained. The log
 therefore prints the completion code and running bit separately, without calling
 an idle command ring an initialization failure.
+
+## Follow-up: EHCI cleanup panic with a nonzero HHDM
+
+The physical-to-virtual shim must preserve zero as NULL, just as its inverse
+preserves NULL as physical zero. Returning the HHDM base for physical zero
+made an EHCI descriptor-chain end look like another allocation. Freeing that
+false pointer inspected allocation metadata at HHDM minus 32 bytes; with HHDM
+`0xFFFF800000000000`, that is the noncanonical `0xFFFF7FFFFFFFFFE0`, consistent
+with a General Protection Fault rather than a page fault.
+
+The shim now returns NULL for physical zero. EHCI cleanup also obeys the qTD
+terminate bit even if ignored address bits are nonzero. Regression tests run
+the actual upstream cleanup function against the native page-backed allocator:
+empty chains, one/multiple descriptors and terminated nonzero links. All
+allocated pages must be freed exactly once. The null-translation assertion
+failed before the shim fix; the terminated-nonzero-link case still failed with
+only that fix and passes with the EHCI terminate-bit fix too. This reproduces
+the software defects but is not a hardware boot confirmation.

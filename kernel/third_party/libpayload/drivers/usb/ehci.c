@@ -240,7 +240,9 @@ static void free_qh_and_tds(ehci_qh_t *qh, qtd_t *cur)
 {
 	qtd_t *next;
 	while (cur) {
-		next = (qtd_t*)phys_to_virt(cur->next_qtd & ~31);
+		u32 link = cur->next_qtd;
+		next = (link & QTD_TERMINATE) ? NULL :
+			(qtd_t *)phys_to_virt(link & ~31u);
 		free((void *)cur);
 		cur = next;
 	}
