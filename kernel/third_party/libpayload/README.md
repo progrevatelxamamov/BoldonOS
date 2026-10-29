@@ -33,3 +33,10 @@ in `LICENSES.md` and retained in the sources. Include `LICENSES.md` with binary
 distributions; the repository's GPL license does not replace those notices.
 BoldonOS-specific environment shims are in `kernel/usb-compat`; OS bindings
 are in `kernel/src/usb`. Details and limitations: `docs/libpayload-usb.md`.
+
+Additional generic-hub changes: `drivers/usb/generic_hub.c` and
+`drivers/usb/generic_hub.h` stop enumeration when the post-reset port-enable
+wait expires, and maintain per-port retry deadlines with exponential backoff
+(1–30 seconds). Repeated disabled-port messages are suppressed until recovery
+or observed disconnection. Pending retries are serviced even without a new hub
+change event; other ports continue polling. Retry storage is freed on teardown.

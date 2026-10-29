@@ -55,6 +55,7 @@ generic_hub_destroy(usbdev_t *const dev)
 			hub->ops->disable_port(dev, port);
 	}
 
+	free(hub->retry);
 	free(hub->ports);
 	free(hub);
 }
@@ -145,6 +146,13 @@ generic_hub_detach_dev(usbdev_t *const dev, const int port)
 	return 0;
 }
 
+static u64 hub_time_ms(void)
+{
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (u64)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
+
 static int
 generic_hub_attach_dev(usbdev_t *const dev, const int port)
 {
@@ -171,9 +179,12 @@ generic_hub_attach_dev(usbdev_t *const dev, const int port)
 			dev, port, 1, hub->ops->port_enabled, 1000, 10);
 		if (ret < 0)
 			return -1;
-		else if (!ret)
-			usb_debug("generic_hub: Port %d still "
-				  "disabled after 10ms\n", port);
+		else if (!ret) {
+			if (!hub->retry[port].failures)
+				usb_debug("generic_hub: Port %d still "
+					  "disabled after 10ms; delaying retries\n", port);
+			return -2;
+		}
 	}
 
 	const usb_speed speed = hub->ops->port_speed(dev, port);
@@ -192,6 +203,16 @@ int
 generic_hub_scanport(usbdev_t *const dev, const int port)
 {
 	generic_hub_t *const hub = GEN_HUB(dev);
+	int connected = hub->ops->port_connected(dev, port);
+	if (connected < 0)
+		return -1;
+	struct hub_port_retry *retry = &hub->retry[port];
+	if (!connected) {
+		retry->deadline_ms = 0;
+		retry->failures = 0;
+	} else if (retry->deadline_ms && hub_time_ms() < retry->deadline_ms) {
+		return 0;
+	}
 
 	if (hub->ports[port] >= 0) {
 		usb_debug("generic_hub: Detachment at port %d\n", port);
@@ -201,10 +222,20 @@ generic_hub_scanport(usbdev_t *const dev, const int port)
 			return ret;
 	}
 
-	if (hub->ops->port_connected(dev, port)) {
-		usb_debug("generic_hub: Attachment at port %d\n", port);
-
-		return generic_hub_attach_dev(dev, port);
+	if (connected) {
+		if (!retry->failures)
+			usb_debug("generic_hub: Attachment at port %d\n", port);
+		int result = generic_hub_attach_dev(dev, port);
+		if (result == -2) {
+			if (retry->failures < 6) retry->failures++;
+			u64 delay = 1000ULL << (retry->failures - 1);
+			retry->deadline_ms = hub_time_ms() + MIN(delay, 30000);
+			return 0;
+		}
+		if (result < 0) return result;
+		retry->deadline_ms = 0;
+		retry->failures = 0;
+		return 0;
 	}
 
 	return 0;
@@ -217,19 +248,22 @@ generic_hub_poll(usbdev_t *const dev)
 	if (!hub)
 		return;
 
+	int changed = 1;
 	if (!(dev->quirks & USB_QUIRK_HUB_NO_USBSTS_PCD) &&
-	    hub->ops->hub_status_changed &&
-	    hub->ops->hub_status_changed(dev) != 1) {
-		return;
+	    hub->ops->hub_status_changed) {
+		changed = hub->ops->hub_status_changed(dev);
+		if (changed < 0) return;
 	}
 
 	int port;
 	for (port = 1; port <= hub->num_ports; ++port) {
-		const int ret = hub->ops->port_status_changed(dev, port);
+		const int ret = changed ? hub->ops->port_status_changed(dev, port) : 0;
 		if (ret < 0) {
 			return;
-		} else if (ret == 1) {
-			usb_debug("generic_hub: Port change at %d\n", port);
+		} else if (ret == 1 || (hub->retry[port].deadline_ms &&
+			   hub_time_ms() >= hub->retry[port].deadline_ms)) {
+			if (!hub->retry[port].failures)
+				usb_debug("generic_hub: Port change at %d\n", port);
 			if (generic_hub_scanport(dev, port) < 0)
 				return;
 		}
@@ -253,9 +287,12 @@ generic_hub_init(usbdev_t *const dev, const int num_ports,
 	generic_hub_t *const hub = GEN_HUB(dev);
 	hub->num_ports = num_ports;
 	hub->ports = malloc(sizeof(*hub->ports) * (num_ports + 1));
+	hub->retry = calloc(num_ports + 1, sizeof(*hub->retry));
 	hub->ops = ops;
-	if (!hub->ports) {
+	if (!hub->ports || !hub->retry) {
 		usb_debug("generic_hub: ERROR: Out of memory\n");
+		free(hub->ports);
+		free(hub->retry);
 		free(dev->data);
 		dev->data = NULL;
 		return -1;

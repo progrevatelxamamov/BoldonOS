@@ -154,3 +154,26 @@ allocated pages must be freed exactly once. The null-translation assertion
 failed before the shim fix; the terminated-nonzero-link case still failed with
 only that fix and passes with the EHCI terminate-bit fix too. This reproduces
 the software defects but is not a hardware boot confirmation.
+
+## Follow-up: repeated disabled-port reset loop
+
+A post-reset port-enable timeout now aborts attachment before any device/EP0
+requests. The generic hub previously logged the timeout and continued down the
+speed/enumeration path. Repeated reset-related change notifications could keep
+retrying this path without a per-port limit.
+
+Each timed-out port now has a monotonic retry deadline: 1, 2, 4, 8, 16, then
+30 seconds between failed attempts. It logs the disabled-port failure once per
+failure episode instead of on each reset. The hub acknowledges status changes
+while waiting; scheduled retries run even without a fresh change event. A failed
+port does not abort the scan of other ports, and HID polling is not paused for
+the backoff interval. Observed disconnection clears the retry state; successful
+attachment clears it as well. A reconnect not observed as disconnected may wait
+for the current deadline (up to 30 seconds).
+
+The host regression invokes the real generic hub code with a fake clock and
+port callbacks. It checks no EP0/device attachment on a disabled port, no repeated
+reset before the deadline despite 10,000 change notifications, retries without
+hub-change events, capped backoff, one warning, other-port enumeration and
+reconnection. This addresses the retry/logging defect; it does not establish
+why a specific physical port fails to enable or diagnose a separate panic.
