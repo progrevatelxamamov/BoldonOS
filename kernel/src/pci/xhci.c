@@ -26,6 +26,7 @@ static void hid_capture_report(struct usb_hid *hid, const struct xhci_trb *evt, 
 static void hid_capture_fail(struct usb_hid *hid, const struct xhci_trb *evt);
 void handle_port_connect(xhci_controller_t *hc, uint8_t port);
 void handle_port_disconnect(xhci_controller_t *hc, uint8_t port);
+void listing_all_ports(xhci_controller_t *hc);
 static void xhci_ack_port_changes(volatile uint8_t *portsc_reg);
 static uint8_t xhci_find_slot_by_port(xhci_controller_t *hc, uint8_t port);
 
@@ -63,6 +64,10 @@ static inline void xhci_lock(volatile uint32_t *lock) {
 
 static inline void xhci_unlock(volatile uint32_t *lock) {
     __sync_lock_release(lock);
+}
+
+static void *xhci_dma_alloc_pages(uint64_t pages) {
+    return pmm_alloc_pages_below(pages, 0x100000000ULL);
 }
 
 static void delay_loop(uint32_t count) {
@@ -128,18 +133,81 @@ static void cooperative_delay(uint32_t ms_ticks)
     }
 }
 
-static bool wait_controller_ready(volatile uint8_t *op_regs) {
-    for (int i = 0; i < 100000; i++)
-        if (!(xhci_read32(op_regs, 0x04) & (1u << 11))) return true;
+static bool xhci_wait_bits(volatile uint8_t *base, uint32_t off,
+                           uint32_t mask, uint32_t expected, uint32_t ms) {
+    uint64_t start = hpet_read_counter();
+    uint64_t ticks = hpet_ticks_for_ms(ms);
+    for (uint32_t i = 0; i < 2000000; i++) {
+        uint32_t value = xhci_read32(base, off);
+        if (value == 0xFFFFFFFFu) return false;
+        if ((value & mask) == expected) return true;
+        if (ticks && hpet_read_counter() - start >= ticks) return false;
+        for (uint32_t j = 0; j < 32; j++) __asm__ volatile("pause");
+    }
     return false;
 }
 
+static bool wait_controller_ready(volatile uint8_t *op_regs) {
+    return xhci_wait_bits(op_regs, 0x04, 1u << 11, 0, 1000);
+}
+
 static bool wait_hchalt(volatile uint8_t *op_regs, bool halted) {
-    for (int i = 0; i < 100000; i++) {
-        bool is_halted = (xhci_read32(op_regs, 0x04) & 1u) != 0;
-        if (is_halted == halted) return true;
+    return xhci_wait_bits(op_regs, 0x04, 1u, halted ? 1u : 0, 1000);
+}
+
+static void xhci_intel_route_ports(pci_device_t *dev) {
+    uint32_t id = pci_read_config(dev->bus, dev->slot, dev->func, 0);
+    if ((id & 0xFFFF) != 0x8086) return;
+    switch (id >> 16) {
+    case 0x1E31: case 0x8C31: case 0x8CB1: case 0x8D31:
+    case 0x9C31: case 0x9CB1:
+        break;
+    default:
+        return;
     }
-    return false;
+    uint32_t subsystem = pci_read_config(dev->bus, dev->slot, dev->func, 0x2C);
+    if (subsystem == 0x90A8104D) return;
+    uint32_t usb2 = pci_read_config(dev->bus, dev->slot, dev->func, 0xD4);
+    uint32_t usb3 = pci_read_config(dev->bus, dev->slot, dev->func, 0xDC);
+    if (usb2 != 0xFFFFFFFFu)
+        pci_write_config(dev->bus, dev->slot, dev->func, 0xD0, usb2);
+    if (usb3 != 0xFFFFFFFFu)
+        pci_write_config(dev->bus, dev->slot, dev->func, 0xD8, usb3);
+    console_print_string("[XHCI] Intel switchable USB ports routed to xHCI\n");
+}
+
+static bool xhci_extended_caps(xhci_controller_t *hc, uint32_t hccparams1) {
+    uint32_t off = (hccparams1 >> 16) * 4;
+    for (uint32_t n = 0; off && n < 256; n++) {
+        if (off < 0x20 || off > 0x100000 - 16) return false;
+        uint32_t cap = xhci_read32(hc->cap_regs, off);
+        if (cap == 0xFFFFFFFFu) return false;
+        uint8_t id = cap & 0xFF;
+        if (id == 1) {
+            xhci_write32(hc->cap_regs, off, cap | (1u << 24));
+            if (!xhci_wait_bits(hc->cap_regs, off, 1u << 16, 0, 1000)) {
+                console_print_string("[XHCI] BIOS handoff timeout, forcing OS ownership\n");
+                xhci_write32(hc->cap_regs, off,
+                             (cap | (1u << 24)) & ~(1u << 16));
+            }
+            uint32_t ctl = xhci_read32(hc->cap_regs, off + 4);
+            ctl &= (0x7u << 1) | (0xFFu << 5) | (0x7u << 17);
+            xhci_write32(hc->cap_regs, off + 4, ctl | (0x7u << 29));
+        } else if (id == 2) {
+            uint32_t ports = xhci_read32(hc->cap_regs, off + 8);
+            uint32_t first = ports & 0xFF;
+            uint32_t count = (ports >> 8) & 0xFF;
+            uint8_t type = xhci_read32(hc->cap_regs, off + 12) & 0x1F;
+            for (uint32_t p = first; first && p < first + count && p <= 32; p++) {
+                hc->port_major[p] = cap >> 24;
+                hc->port_slot_type[p] = type;
+            }
+        }
+        uint32_t next = (cap >> 8) & 0xFF;
+        if (!next) return true;
+        off += next * 4;
+    }
+    return off == 0;
 }
 
 static struct xhci_trb *cmd_ring_enqueue(xhci_controller_t *hc, uint8_t *out_cycle) {
@@ -306,7 +374,7 @@ static bool xhci_boot_exhausted(void) {
 static int wait_event_from(xhci_controller_t *hc, struct evt_queue *q,
                            struct xhci_trb *out_evt)
 {
-    if (xhci_boot_exhausted()) return -1;
+    if (hc->command_failed || xhci_boot_exhausted()) return -1;
     bool boot = !xhci_boot_done && !interrupts_enabled();
     uint64_t start = hpet_read_counter();
     uint64_t ticks = hpet_ticks_for_ms(boot ? 100 : 1000);
@@ -374,7 +442,8 @@ static int xhci_submit_command(xhci_controller_t *hc,
     struct xhci_trb evt;
     memset(&evt, 0, sizeof(evt));
 
-    if (!xhci_cmd_exec_lock(hc)) return -1;
+    if (hc->command_failed || !xhci_cmd_exec_lock(hc)) return -1;
+    if (hc->command_failed) { xhci_cmd_exec_unlock(hc); return -1; }
     evtq_drain(&hc->cmd_evt_q);
 
     uint8_t cyc;
@@ -386,7 +455,33 @@ static int xhci_submit_command(xhci_controller_t *hc,
     __asm__ volatile("mfence" ::: "memory");
     hc->db_regs[0] = 0;
 
-    int res = xhci_wait_cmd(hc, &evt);
+    uint64_t expected = hc->cmd_ring_phys + (uint64_t)(trb - hc->cmd_ring) * sizeof(*trb);
+    uint32_t kind = (control_no_cycle >> 10) & 0x3F;
+    uint64_t start = hpet_read_counter();
+    uint64_t ticks = hpet_ticks_for_ms(kind == TRB_ADDRESS_DEVICE ? 5000 : 1000);
+    int res = -1;
+    for (uint32_t i = 0; i < 4000000; i++) {
+        xhci_poll(hc);
+        if (evtq_pop(&hc->cmd_evt_q, &evt) && evt.param == expected) {
+            res = 0;
+            break;
+        }
+        if (ticks && hpet_read_counter() - start >= ticks) break;
+        schedule_yield_safe();
+        for (uint32_t j = 0; j < 32; j++) __asm__ volatile("pause");
+    }
+    if (res != 0) {
+        hc->command_failed = true;
+        xhci_write32(hc->op_regs, 0, xhci_read32(hc->op_regs, 0) & ~1u);
+        if (!wait_hchalt(hc->op_regs, true)) {
+            console_print_string("[XHCI] command timeout, controller could not halt\n");
+        } else {
+            console_print_string("[XHCI] command timeout, controller halted\n");
+        }
+        uint32_t cmd = pci_read_config(hc->bus, hc->slot, hc->func, 0x04) & 0xFFFF;
+        pci_write_config(hc->bus, hc->slot, hc->func, 0x04, cmd & ~(1u << 2));
+        (void)pci_read_config(hc->bus, hc->slot, hc->func, 0x04);
+    }
     xhci_cmd_exec_unlock(hc);
 
     if (out_evt) *out_evt = evt;
@@ -411,7 +506,10 @@ int xhci_control_transfer(xhci_controller_t *hc, uint8_t slot_id,
                           volatile struct xhci_trb *ep0_ring, uint32_t *ep0_enqueue, uint8_t *ep0_cycle,
                           struct usb_setup_packet *setup, uint64_t data_buf_phys, uint16_t transfer_len)
 {
-    if (!hc || !setup || slot_id >= MAX_XHCI_SLOTS) return -1;
+    if (!hc || !setup || slot_id >= MAX_XHCI_SLOTS || hc->command_failed) return -1;
+    if (!hc->dma64 && transfer_len &&
+        (data_buf_phys >= 0x100000000ULL || transfer_len > 0x100000000ULL - data_buf_phys))
+        return -EOVERFLOW;
     if (!xhci_lock_timeout(&hc->ep0_lock[slot_id], 2000000)) return -1;
 
     int result = -2;
@@ -501,6 +599,10 @@ int xhci_bulk_transfer(xhci_controller_t *hc, uint8_t slot_id,
                        uint8_t db_target, uint64_t data_phys, uint32_t length, uint8_t dir_in)
 {
     (void)dir_in;
+    if (hc->command_failed) return -ENODEV;
+    if (!hc->dma64 && length &&
+        (data_phys >= 0x100000000ULL || length > 0x100000000ULL - data_phys))
+        return -EOVERFLOW;
     if (length == 0) return 0;
 
     if (!xhci_lock_timeout(&hc->ep_lock[slot_id][db_target], 2000000)) return -EBUSY;
@@ -570,6 +672,10 @@ int xhci_bulk_transfer_len(xhci_controller_t *hc, uint8_t slot_id,
 {
     (void)dir_in;
     if (out_actual) *out_actual = 0;
+    if (hc->command_failed) return -ENODEV;
+    if (!hc->dma64 && length &&
+        (data_phys >= 0x100000000ULL || length > 0x100000000ULL - data_phys))
+        return -EOVERFLOW;
     if (length == 0) return 0;
 
     if (!xhci_lock_timeout(&hc->ep_lock[slot_id][db_target], 2000000)) return -EBUSY;
@@ -763,7 +869,8 @@ int xhci_configure_bulk_endpoints(xhci_controller_t *hc, usb_msd_t *msd,
     uint8_t dci_in  = (ep_in_addr  & 0x0F) * 2 + 1;
     uint8_t max_dci = (dci_out > dci_in) ? dci_out : dci_in;
 
-    uint64_t input_phys = (uint64_t)pmm_alloc_pages(1);
+    uint64_t input_phys = (uint64_t)xhci_dma_alloc_pages(1);
+    if (!input_phys) return -ENOMEM;
     uint8_t *input_virt = (uint8_t *)phys_to_virt(input_phys);
     memset(input_virt, 0, 4096);
 
@@ -810,7 +917,8 @@ int xhci_configure_endpoints_multi(xhci_controller_t *hc, uint8_t slot_id,
     uint8_t dci_in = (in_addr & 0x0F) * 2 + 1;
     uint8_t max_dci = dci_in;
 
-    uint64_t input_phys = (uint64_t)pmm_alloc_pages(1);
+    uint64_t input_phys = (uint64_t)xhci_dma_alloc_pages(1);
+    if (!input_phys) return -ENOMEM;
     uint8_t *input_virt = (uint8_t *)phys_to_virt(input_phys);
     memset(input_virt, 0, 4096);
 
@@ -885,6 +993,7 @@ void init_usb_mass_storage(xhci_controller_t *hc, uint8_t slot_id, uint8_t speed
     console_print_string("[MSD] Init USB Mass Storage...\n");
 
     usb_msd_t *msd = (usb_msd_t *)malloc_alloc(sizeof(usb_msd_t));
+    if (!msd) return;
     memset(msd, 0, sizeof(usb_msd_t));
 
     msd->hc = hc;
@@ -895,18 +1004,30 @@ void init_usb_mass_storage(xhci_controller_t *hc, uint8_t slot_id, uint8_t speed
     uint8_t dci_out = (ep_out_addr & 0x0F) * 2 + 0;
     uint8_t dci_in  = (ep_in_addr  & 0x0F) * 2 + 1;
 
-    msd->cmd_page_phys = (uint64_t)pmm_alloc_pages(1);
+    msd->cmd_page_phys = (uint64_t)xhci_dma_alloc_pages(1);
+    if (!msd->cmd_page_phys) { malloc_free(msd); return; }
     msd->cmd_page_virt = phys_to_virt(msd->cmd_page_phys);
     memset(msd->cmd_page_virt, 0, 4096);
 
-    msd->bulk_out_ring_phys = (uint64_t)pmm_alloc_pages(1);
+    msd->bulk_out_ring_phys = (uint64_t)xhci_dma_alloc_pages(1);
+    if (!msd->bulk_out_ring_phys) {
+        pmm_free_pages((void*)msd->cmd_page_phys, 1);
+        malloc_free(msd);
+        return;
+    }
     msd->bulk_out_ring = (volatile struct xhci_trb *)phys_to_virt(msd->bulk_out_ring_phys);
     memset((void*)msd->bulk_out_ring, 0, 4096);
     msd->bulk_out_enqueue = 0; msd->bulk_out_cycle = 1; msd->bulk_out_db = dci_out;
     msd->bulk_out_ring[COUNT_OF_TRB-1].param   = msd->bulk_out_ring_phys;
     msd->bulk_out_ring[COUNT_OF_TRB-1].control = (TRB_LINK << 10) | (1u << 1) | 1u;
 
-    msd->bulk_in_ring_phys = (uint64_t)pmm_alloc_pages(1);
+    msd->bulk_in_ring_phys = (uint64_t)xhci_dma_alloc_pages(1);
+    if (!msd->bulk_in_ring_phys) {
+        pmm_free_pages((void*)msd->cmd_page_phys, 1);
+        pmm_free_pages((void*)msd->bulk_out_ring_phys, 1);
+        malloc_free(msd);
+        return;
+    }
     msd->bulk_in_ring = (volatile struct xhci_trb *)phys_to_virt(msd->bulk_in_ring_phys);
     memset((void*)msd->bulk_in_ring, 0, 4096);
     msd->bulk_in_enqueue = 0; msd->bulk_in_cycle = 1; msd->bulk_in_db = dci_in;
@@ -1685,7 +1806,8 @@ static bool xhci_configure_hid_endpoint(xhci_controller_t *hc, struct usb_hid *h
     uint8_t dci = hid->dci;
     uint8_t max_dci = dci;
 
-    uint64_t input_phys = (uint64_t)pmm_alloc_pages(1);
+    uint64_t input_phys = (uint64_t)xhci_dma_alloc_pages(1);
+    if (!input_phys) return -ENOMEM;
     uint8_t *input_virt = (uint8_t *)phys_to_virt(input_phys);
     memset(input_virt, 0, 4096);
 
@@ -1734,6 +1856,7 @@ static void init_usb_hid(xhci_controller_t *hc, uint8_t slot_id, uint8_t speed,
                          uint16_t report_desc_len)
 {
     struct usb_hid *hid = (struct usb_hid *)malloc_alloc(sizeof(struct usb_hid));
+    if (!hid) return;
     memset(hid, 0, sizeof(struct usb_hid));
 
     hid->hc = hc;
@@ -1755,14 +1878,20 @@ static void init_usb_hid(xhci_controller_t *hc, uint8_t slot_id, uint8_t speed,
         else          hid->protocol = 2;
     }
 
-    hid->ring_phys = (uint64_t)pmm_alloc_pages(1);
+    hid->ring_phys = (uint64_t)xhci_dma_alloc_pages(1);
+    if (!hid->ring_phys) { malloc_free(hid); return; }
     hid->ring = (volatile struct xhci_trb *)phys_to_virt(hid->ring_phys);
     memset((void*)hid->ring, 0, 4096);
     hid->enqueue = 0; hid->cycle = 1;
     hid->ring[COUNT_OF_TRB-1].param   = hid->ring_phys;
     hid->ring[COUNT_OF_TRB-1].control = (TRB_LINK << 10) | (1u << 1) | 1u;
 
-    hid->report_phys = (uint64_t)pmm_alloc_pages(1);
+    hid->report_phys = (uint64_t)xhci_dma_alloc_pages(1);
+    if (!hid->report_phys) {
+        pmm_free_pages((void*)hid->ring_phys, 1);
+        malloc_free(hid);
+        return;
+    }
     hid->report = (uint8_t *)phys_to_virt(hid->report_phys);
     memset(hid->report, 0, 4096);
 
@@ -1789,7 +1918,7 @@ static void init_usb_hid(xhci_controller_t *hc, uint8_t slot_id, uint8_t speed,
     if (report_desc_len > 0) {
         uint16_t fetch_len = report_desc_len > 4096 ? 4096 : report_desc_len;
         uint32_t desc_pages = (fetch_len + 4095) / 4096;
-        uint64_t desc_phys = (uint64_t)pmm_alloc_pages(desc_pages);
+        uint64_t desc_phys = (uint64_t)xhci_dma_alloc_pages(desc_pages);
         if (desc_phys) {
             uint8_t *desc_buf = (uint8_t *)phys_to_virt(desc_phys);
             memset(desc_buf, 0, desc_pages * 4096);
@@ -1945,8 +2074,16 @@ static void xhci_rescan_ports(xhci_controller_t *hc) {
 static void xhci_hotplug_task(void *arg) {
     xhci_controller_t *hc = (xhci_controller_t *)arg;
     uint64_t last_rescan = 0;
+    while (!xhci_boot_done) schedule_yield_safe();
+    xhci_enum_begin();
+    listing_all_ports(hc);
+    xhci_enum_end();
 
     for (;;) {
+        if (hc->command_failed) {
+            schedule_yield_safe();
+            continue;
+        }
         if (hc->port_change_head != hc->port_change_tail) {
             uint8_t port = hc->port_change_queue[hc->port_change_head];
             hc->port_change_head = (hc->port_change_head + 1) % 16;
@@ -1978,7 +2115,8 @@ void parse_and_configure_device(xhci_controller_t *hc, uint8_t slot_id, uint8_t 
     console_print_hex(pid);
     console_print_string("\n");
 
-    uint64_t temp_phys = (uint64_t)pmm_alloc_pages(1);
+    uint64_t temp_phys = (uint64_t)xhci_dma_alloc_pages(1);
+    if (!temp_phys) return;
     struct usb_configuration_descriptor *cfg = (struct usb_configuration_descriptor *)phys_to_virt(temp_phys);
     memset(cfg, 0, 4096);
 
@@ -2002,7 +2140,7 @@ void parse_and_configure_device(xhci_controller_t *hc, uint8_t slot_id, uint8_t 
     }
     uint32_t full_pages = (total_length + 4095) / 4096;
 
-    uint64_t full_phys = (uint64_t)pmm_alloc_pages(full_pages);
+    uint64_t full_phys = (uint64_t)xhci_dma_alloc_pages(full_pages);
     if (!full_phys) {
         pmm_free_pages((void*)temp_phys, 1);
         return;
@@ -2206,7 +2344,8 @@ int xhci_evaluate_ep0_mps(xhci_controller_t *hc, uint8_t slot_id, uint16_t mps) 
     uint32_t hccparams1 = xhci_read32(hc->cap_regs, 0x10);
     uint32_t ctx_size = (hccparams1 & (1u << 2)) ? 64 : 32;
 
-    uint64_t input_phys = (uint64_t)pmm_alloc_pages(1);
+    uint64_t input_phys = (uint64_t)xhci_dma_alloc_pages(1);
+    if (!input_phys) return -ENOMEM;
     uint8_t *input_virt = (uint8_t *)phys_to_virt(input_phys);
     memset(input_virt, 0, 4096);
 
@@ -2236,29 +2375,31 @@ static void xhci_ack_port_changes(volatile uint8_t *portsc_reg) {
                  (portsc & XHCI_PORTSC_PRESERVE_MASK) | XHCI_PORTSC_CHANGE_MASK);
 }
 
-void xhci_port_reset(volatile uint8_t *portsc_reg) {
-    uint32_t portsc = xhci_read32(portsc_reg, 0x00);
-    xhci_write32(portsc_reg, 0x00, (portsc & XHCI_PORTSC_PRESERVE_MASK) | XHCI_PORTSC_PR);
-
-    for (int i = 0; i < 1000000; i++) {
-        portsc = xhci_read32(portsc_reg, 0x00);
-        if (!(portsc & XHCI_PORTSC_PR)) break;
+static bool xhci_reset_port(xhci_controller_t *hc, uint8_t port) {
+    volatile uint8_t *reg = hc->op_regs + 0x400 + (port - 1) * 0x10;
+    uint32_t status = xhci_read32(reg, 0);
+    uint32_t state = (status >> 5) & 0xF;
+    bool warm = hc->port_major[port] >= 3 && (state == 6 || state == 8);
+    uint32_t reset = warm ? (1u << 31) : XHCI_PORTSC_PR;
+    xhci_write32(reg, 0, (status & XHCI_PORTSC_PRESERVE_MASK) | reset);
+    if (!xhci_wait_bits(reg, 0, reset, 0, 1000) ||
+        !xhci_wait_bits(reg, 0, XHCI_PORTSC_PED | XHCI_PORTSC_CCS,
+                        XHCI_PORTSC_PED | XHCI_PORTSC_CCS, 1000)) return false;
+    xhci_ack_port_changes(reg);
+    uint64_t start = hpet_read_counter();
+    uint64_t ticks = hpet_ticks_for_ms(10);
+    for (uint32_t i = 0; i < 100000; i++) {
+        if (ticks && hpet_read_counter() - start >= ticks) break;
         __asm__ volatile("pause");
     }
-    for (int i = 0; i < 1000000; i++) {
-        portsc = xhci_read32(portsc_reg, 0x00);
-        if (portsc & XHCI_PORTSC_PED) break;
-        __asm__ volatile("pause");
-    }
-    xhci_ack_port_changes(portsc_reg);
-    delay_loop(2000000);
+    return true;
 }
 
 /* Выкидываем все события старого устройства из очередей слота:
    при повторном использовании номера слота они иначе попадут
    новому устройству (в том числе в control transfer'ы). */
 static void xhci_drain_slot_events(xhci_controller_t *hc, uint8_t slot_id) {
-    if (slot_id == 0 || slot_id >= MAX_XHCI_SLOTS) return;
+    if (slot_id == 0 || slot_id > hc->max_slots || slot_id >= MAX_XHCI_SLOTS) return;
     for (int dci = 0; dci < 32; dci++)
         evtq_drain(&hc->transfer_evt_q[slot_id][dci]);
 }
@@ -2426,6 +2567,7 @@ static void usb_enum_fail(xhci_controller_t *hc, uint8_t port, const char *stage
 }
 
 void handle_port_connect(xhci_controller_t *hc, uint8_t port) {
+    if (hc->command_failed || port < 1 || port > 32) return;
     volatile uint8_t *port_base = hc->op_regs + 0x400;
     volatile uint8_t *portsc_reg = port_base + (port - 1) * 0x10;
 
@@ -2446,7 +2588,13 @@ void handle_port_connect(xhci_controller_t *hc, uint8_t port) {
         handle_port_disconnect(hc, port);
     }
 
-    if (!(portsc & XHCI_PORTSC_PED)) xhci_port_reset(portsc_reg);
+    if (!(portsc & XHCI_PORTSC_PED) && !xhci_reset_port(hc, port)) {
+        console_print_string("[USB] port reset failed, PORTSC=");
+        console_print_hex(xhci_read32(portsc_reg, 0));
+        console_print_string("\n");
+        usb_enum_fail(hc, port, "port reset/enable timeout");
+        return;
+    }
 
     portsc = xhci_read32(portsc_reg, 0x00);
     uint8_t speed = (portsc >> 10) & 0xF;
@@ -2456,7 +2604,7 @@ void handle_port_connect(xhci_controller_t *hc, uint8_t port) {
     }
 
     struct xhci_trb evt;
-    if (xhci_submit_command(hc, 0, 0, TRB_ENABLE_SLOT << 10, &evt) != 0) {
+    if (xhci_submit_command(hc, 0, 0, (TRB_ENABLE_SLOT << 10) | ((uint32_t)hc->port_slot_type[port] << 16), &evt) != 0) {
         usb_enum_fail(hc, port, "enable slot command timed out");
         return;
     }
@@ -2467,7 +2615,7 @@ void handle_port_connect(xhci_controller_t *hc, uint8_t port) {
         usb_enum_fail(hc, port, "enable slot rejected");
         return;
     }
-    if (slot_id == 0 || slot_id >= MAX_XHCI_SLOTS) {
+    if (slot_id == 0 || slot_id > hc->max_slots || slot_id >= MAX_XHCI_SLOTS) {
         usb_enum_fail(hc, port, "invalid slot id");
         return;
     }
@@ -2479,11 +2627,13 @@ void handle_port_connect(xhci_controller_t *hc, uint8_t port) {
     uint32_t hccparams1 = xhci_read32(hc->cap_regs, 0x10);
     uint32_t ctx_size = (hccparams1 & (1u << 2)) ? 64 : 32;
 
-    uint64_t dev_ctx_phys = (uint64_t)pmm_alloc_pages(1);
+    uint64_t dev_ctx_phys = (uint64_t)xhci_dma_alloc_pages(1);
+    if (!dev_ctx_phys) { xhci_destroy_slot(hc, slot_id); return; }
     memset(phys_to_virt(dev_ctx_phys), 0, 4096);
     ((uint64_t *)hc->dcbaa)[slot_id] = dev_ctx_phys;
 
-    uint64_t ep0_ring_phys = (uint64_t)pmm_alloc_pages(1);
+    uint64_t ep0_ring_phys = (uint64_t)xhci_dma_alloc_pages(1);
+    if (!ep0_ring_phys) { xhci_destroy_slot(hc, slot_id); return; }
     volatile struct xhci_trb *ep0_ring = (volatile struct xhci_trb *)phys_to_virt(ep0_ring_phys);
     memset((void*)ep0_ring, 0, 4096);
     ep0_ring[COUNT_OF_TRB-1].param   = ep0_ring_phys;
@@ -2493,7 +2643,8 @@ void handle_port_connect(xhci_controller_t *hc, uint8_t port) {
     hc->ep0_enqueue[slot_id] = 0;
     hc->ep0_cycle[slot_id] = 1;
 
-    uint64_t input_ctx_phys = (uint64_t)pmm_alloc_pages(1);
+    uint64_t input_ctx_phys = (uint64_t)xhci_dma_alloc_pages(1);
+    if (!input_ctx_phys) { xhci_destroy_slot(hc, slot_id); return; }
     uint8_t *input_ctx_virt = (uint8_t *)phys_to_virt(input_ctx_phys);
     memset(input_ctx_virt, 0, 4096);
 
@@ -2522,12 +2673,16 @@ void handle_port_connect(xhci_controller_t *hc, uint8_t port) {
     code = (evt.status >> 24) & 0xFF;
     pmm_free_pages((void*)input_ctx_phys, 1);
     if (code != 1) {
+        console_print_string("[USB] Address Device completion code: ");
+        console_print_num(code);
+        console_print_string("\n");
         usb_enum_fail(hc, port, "address device rejected");
         xhci_destroy_slot(hc, slot_id);
         return;
     }
 
-    uint64_t desc_phys = (uint64_t)pmm_alloc_pages(1);
+    uint64_t desc_phys = (uint64_t)xhci_dma_alloc_pages(1);
+    if (!desc_phys) { xhci_destroy_slot(hc, slot_id); return; }
     struct usb_device_descriptor *desc = (struct usb_device_descriptor *)phys_to_virt(desc_phys);
     memset(desc, 0, 4096);
 
@@ -2545,12 +2700,16 @@ void handle_port_connect(xhci_controller_t *hc, uint8_t port) {
         return;
     }
 
-    // ДОСТАЁМ И СОХРАНЯЕМ VID И PID СРАЗУ
-    uint16_t vid = desc->idVendor;
-    uint16_t pid = desc->idProduct;
 
     uint16_t real_mps = desc->bMaxPacketSize0;
-    if (speed >= 4) real_mps = 1u << desc->bMaxPacketSize0;
+    if (speed >= 4) real_mps = desc->bMaxPacketSize0 == 9 ? 512 : 0;
+    if (real_mps != 8 && real_mps != 16 && real_mps != 32 &&
+        real_mps != 64 && real_mps != 512) {
+        pmm_free_pages((void*)desc_phys, 1);
+        xhci_destroy_slot(hc, slot_id);
+        usb_enum_fail(hc, port, "invalid EP0 max packet size");
+        return;
+    }
     if (real_mps > 0 && real_mps != mps) {
         xhci_evaluate_ep0_mps(hc, slot_id, real_mps);
         delay_loop(2000000);
@@ -2566,7 +2725,7 @@ void handle_port_connect(xhci_controller_t *hc, uint8_t port) {
     }
 
     // Передаём их в парсер дескрипторов конфигурации
-    parse_and_configure_device(hc, slot_id, speed, vid, pid);
+    parse_and_configure_device(hc, slot_id, speed, desc->idVendor, desc->idProduct);
     pmm_free_pages((void*)desc_phys, 1);
 }
 
@@ -2585,7 +2744,7 @@ void listing_all_ports(xhci_controller_t *hc) {
             xhci_write32(portsc_reg, 0x00, portsc | XHCI_PORTSC_PP);
         }
     }
-    console_print_string("[XHCI] waiting for ports (");
+    console_print_string("[XHCI] root ports (");
     console_print_num(max_ports);
     console_print_string(")\n");
 
@@ -2595,6 +2754,19 @@ void listing_all_ports(xhci_controller_t *hc) {
     for (uint8_t port = 1; port <= max_ports; port++) {
         volatile uint8_t *portsc_reg = port_base + (port - 1) * 0x10;
         uint32_t portsc = xhci_read32(portsc_reg, 0x00);
+        console_print_string("[XHCI] controller ");
+        console_print_num(hc->bus);
+        console_print_string(":");
+        console_print_num(hc->slot);
+        console_print_string(":");
+        console_print_num(hc->func);
+        console_print_string(" port ");
+        console_print_num(port);
+        console_print_string(" USB major=");
+        console_print_num(hc->port_major[port]);
+        console_print_string(" PORTSC=");
+        console_print_hex(portsc);
+        console_print_string("\n");
         if (portsc & XHCI_PORTSC_CCS) {
             connected++;
             console_print_string("[XHCI] port ");
@@ -2620,11 +2792,12 @@ void xhci_init(pci_device_t *dev) {
     console_print_string("\n");
 
     xhci_controller_t *hc = (xhci_controller_t *)malloc_alloc(sizeof(xhci_controller_t));
+    if (!hc) return;
     memset(hc, 0, sizeof(*hc));
 
     uint64_t bar0_phys = (dev->bars[0] & 0xFFFFFFF0);
     if ((dev->bars[0] & 0x6) == 0x4) bar0_phys |= ((uint64_t)dev->bars[1] << 32);
-    if (!bar0_phys) {
+    if (!bar0_phys || (dev->bars[0] & 1)) {
         console_print_string("[XHCI] invalid BAR0, skipping controller\n");
         malloc_free(hc);
         return;
@@ -2636,11 +2809,11 @@ void xhci_init(pci_device_t *dev) {
     hc->slot = dev->slot;
     hc->func = dev->func;
 
-    uint32_t pci_cmd = pci_read_config(dev->bus, dev->slot, dev->func, 0x04);
+    uint32_t pci_cmd = pci_read_config(dev->bus, dev->slot, dev->func, 0x04) & 0xFFFF;
     pci_cmd |= (1u << 1) | (1u << 2) | (1u << 10);
     pci_write_config(dev->bus, dev->slot, dev->func, 0x04, pci_cmd);
 
-    for (uint64_t off = 0; off < 0x10000; off += 0x1000)
+    for (uint64_t off = 0; off < 0x100000; off += 0x1000)
         vmm_map_page(get_kernel_pml4(), bar0_phys + off, bar0_virt + off,
                      PTE_PRESENT | PTE_WRITABLE | PTE_PCD | PTE_PWT);
 
@@ -2654,84 +2827,103 @@ void xhci_init(pci_device_t *dev) {
     hc->op_regs = hc->cap_regs + caplength;
 
     uint32_t rtsoff = xhci_read32(hc->cap_regs, 0x18) & ~0x1F;
+    if (rtsoff > 0x100000 - 0x40) { malloc_free(hc); return; }
     hc->rt_regs = hc->cap_regs + rtsoff;
 
     uint32_t dboff = xhci_read32(hc->cap_regs, 0x14) & ~0x3;
+    if (dboff > 0x100000 - 1024) { malloc_free(hc); return; }
     hc->db_regs = (volatile uint32_t *)(hc->cap_regs + dboff);
 
     uint32_t hccparams1 = xhci_read32(hc->cap_regs, 0x10);
-    uint16_t xecp = (uint16_t)(hccparams1 >> 16);
-    if (xecp != 0) {
-        uint32_t off = xecp * 4;
-        while (off != 0) {
-            uint32_t cap = xhci_read32(hc->cap_regs, off);
-            uint8_t cap_id = cap & 0xFF;
-            uint8_t next = (cap >> 8) & 0xFF;
-            if (cap_id == 1) {
-                uint32_t legsup = xhci_read32(hc->cap_regs, off);
-                xhci_write32(hc->cap_regs, off, legsup | (1u << 24));
-                for (int i = 0; i < 1000000; i++)
-                    if (!(xhci_read32(hc->cap_regs, off) & (1u << 16))) break;
-            }
-            if (next == 0) break;
-            off += next * 4;
-        }
-    }
-
-    xhci_write32(hc->op_regs, 0x00, xhci_read32(hc->op_regs, 0x00) & ~1u);
-    wait_hchalt(hc->op_regs, true);
-
-    xhci_write32(hc->op_regs, 0x00, 1u << 1);
-    bool reset_ok = false;
-    for (uint32_t i = 0; i < 10000000; i++) {
-        if (!(xhci_read32(hc->op_regs, 0x00) & (1u << 1))) { reset_ok = true; break; }
-        __asm__ volatile("pause");
-    }
-    if (!reset_ok) {
-        console_print_string("[XHCI] controller reset timed out, skipping controller\n");
+    hc->dma64 = (hccparams1 & 1) != 0;
+    console_print_string("[XHCI] version=");
+    console_print_hex(hciversion);
+    console_print_string(" PCI ID=");
+    console_print_hex(pci_read_config(dev->bus, dev->slot, dev->func, 0));
+    console_print_string(" DMA bits=");
+    console_print_num(hc->dma64 ? 64 : 32);
+    console_print_string(" context bytes=");
+    console_print_num((hccparams1 & 4) ? 64 : 32);
+    console_print_string("\n");
+    if (!xhci_extended_caps(hc, hccparams1)) {
+        console_print_string("[XHCI] malformed extended capabilities, skipping\n");
         malloc_free(hc);
         return;
     }
-    if (!wait_controller_ready(hc->op_regs))
-        console_print_string("[XHCI] warning: controller not ready after reset\n");
+    xhci_intel_route_ports(dev);
+    if (!wait_controller_ready(hc->op_regs)) {
+        console_print_string("[XHCI] CNR timeout before reset\n");
+        malloc_free(hc);
+        return;
+    }
+    xhci_write32(hc->op_regs, 0, xhci_read32(hc->op_regs, 0) & ~5u);
+    if (!wait_hchalt(hc->op_regs, true)) {
+        console_print_string("[XHCI] halt timeout before reset\n");
+        malloc_free(hc);
+        return;
+    }
+    xhci_write32(hc->op_regs, 0, 1u << 1);
+    if (!xhci_wait_bits(hc->op_regs, 0, 1u << 1, 0, 1000) ||
+        !wait_controller_ready(hc->op_regs)) {
+        console_print_string("[XHCI] reset/CNR timeout, skipping controller\n");
+        malloc_free(hc);
+        return;
+    }
+    if (!(xhci_read32(hc->op_regs, 0x08) & 1)) {
+        console_print_string("[XHCI] controller does not support 4KiB pages\n");
+        malloc_free(hc);
+        return;
+    }
 
     uint32_t hcsparams1 = xhci_read32(hc->cap_regs, 0x04);
     uint8_t max_slots = hcsparams1 & 0xFF;
+    if (!max_slots) { malloc_free(hc); return; }
+    if (max_slots >= MAX_XHCI_SLOTS) max_slots = MAX_XHCI_SLOTS - 1;
+    hc->max_slots = max_slots;
     xhci_write32(hc->op_regs, 0x38, max_slots);
 
-    uint64_t dcbaa_bytes = (max_slots + 1) * sizeof(uint64_t);
-    hc->dcbaa = (uint64_t*)phys_to_virt((uint64_t)pmm_alloc_pages((dcbaa_bytes + 4095) / 4096));
-    hc->dcbaa_phys = virt_to_phys(hc->dcbaa);
+    uint64_t dcbaa_bytes = MAX_XHCI_SLOTS * sizeof(uint64_t);
+    hc->dcbaa_phys = (uint64_t)xhci_dma_alloc_pages((dcbaa_bytes + 4095) / 4096);
+    if (!hc->dcbaa_phys) { malloc_free(hc); return; }
+    hc->dcbaa = (uint64_t*)phys_to_virt(hc->dcbaa_phys);
     memset(hc->dcbaa, 0, (dcbaa_bytes + 4095) / 4096 * 4096);
 
     uint32_t hcsparams2 = xhci_read32(hc->cap_regs, 0x08);
     uint32_t max_scratchpads = (((hcsparams2 >> 21) & 0x1F) << 5) | ((hcsparams2 >> 27) & 0x1F);
     if (max_scratchpads > 0) {
-        uint64_t *sp_array = (uint64_t*)phys_to_virt((uint64_t)pmm_alloc_pages(1));
-        memset(sp_array, 0, 4096);
+        uint64_t sp_pages = (max_scratchpads * sizeof(uint64_t) + 4095) / 4096;
+        uint64_t sp_phys = (uint64_t)xhci_dma_alloc_pages(sp_pages);
+        if (!sp_phys) return;
+        uint64_t *sp_array = (uint64_t*)phys_to_virt(sp_phys);
+        memset(sp_array, 0, sp_pages * 4096);
         for (uint32_t i = 0; i < max_scratchpads; i++) {
-            void *sp_page = (void*)pmm_alloc_pages(1);
+            void *sp_page = (void*)xhci_dma_alloc_pages(1);
+            if (!sp_page) return;
             sp_array[i] = (uint64_t)sp_page;
+            memset(phys_to_virt((uint64_t)sp_page), 0, 4096);
         }
         hc->dcbaa[0] = virt_to_phys(sp_array);
     }
     xhci_write64(hc->op_regs, 0x30, hc->dcbaa_phys);
 
-    hc->cmd_ring = (struct xhci_trb*)phys_to_virt((uint64_t)pmm_alloc_pages(1));
-    hc->cmd_ring_phys = virt_to_phys(hc->cmd_ring);
+    hc->cmd_ring_phys = (uint64_t)xhci_dma_alloc_pages(1);
+    if (!hc->cmd_ring_phys) return;
+    hc->cmd_ring = (struct xhci_trb*)phys_to_virt(hc->cmd_ring_phys);
     memset(hc->cmd_ring, 0, 4096);
     hc->cmd_enqueue = 0; hc->cmd_cycle = 1;
     hc->cmd_ring[COUNT_OF_TRB-1].param   = hc->cmd_ring_phys;
     hc->cmd_ring[COUNT_OF_TRB-1].control = (TRB_LINK << 10) | (1u << 1) | 1u;
     xhci_write64(hc->op_regs, 0x18, hc->cmd_ring_phys | 1u);
 
-    hc->evt_ring = (struct xhci_trb*)phys_to_virt((uint64_t)pmm_alloc_pages(1));
-    hc->evt_ring_phys = virt_to_phys(hc->evt_ring);
+    hc->evt_ring_phys = (uint64_t)xhci_dma_alloc_pages(1);
+    if (!hc->evt_ring_phys) return;
+    hc->evt_ring = (struct xhci_trb*)phys_to_virt(hc->evt_ring_phys);
     memset(hc->evt_ring, 0, 4096);
     hc->evt_dequeue = 0; hc->evt_cycle = 1;
 
-    hc->erst = (struct xhci_erst_entry*)phys_to_virt((uint64_t)pmm_alloc_pages(1));
-    hc->erst_phys = virt_to_phys(hc->erst);
+    hc->erst_phys = (uint64_t)xhci_dma_alloc_pages(1);
+    if (!hc->erst_phys) return;
+    hc->erst = (struct xhci_erst_entry*)phys_to_virt(hc->erst_phys);
     memset(hc->erst, 0, 4096);
     hc->erst[0].base = hc->evt_ring_phys;
     hc->erst[0].size = COUNT_OF_TRB;
@@ -2746,19 +2938,24 @@ void xhci_init(pci_device_t *dev) {
     usbcmd &= ~(1u << 2);
     usbcmd |= (1u << 0);
     xhci_write32(hc->op_regs, 0x00, usbcmd);
-    wait_hchalt(hc->op_regs, false);
+    if (!wait_hchalt(hc->op_regs, false)) {
+        console_print_string("[XHCI] controller failed to start\n");
+        return;
+    }
 
     struct xhci_trb evt;
-    xhci_submit_command(hc, 0, 0, TRB_CMD_NOOP << 10, &evt);
-
-    xhci_register_controller(hc);
-
-    xhci_enum_begin();
-    listing_all_ports(hc);
-    xhci_enum_end();
+    if (xhci_submit_command(hc, 0, 0, TRB_CMD_NOOP << 10, &evt) != 0 ||
+        ((evt.status >> 24) & 0xFF) != 1) {
+        console_print_string("[XHCI] command ring self-test failed, enumeration disabled\n");
+        return;
+    }
+    if (xhci_register_controller(hc) < 0) {
+        xhci_write32(hc->op_regs, 0, 0);
+        return;
+    }
 
     create_task_kernel_arg((void *)xhci_hotplug_task, (uint64_t)hc, "xhci-hotplug");
     create_task_kernel_arg((void *)xhci_pool_task, (uint64_t)hc, "xhci-pool");
 
-    console_print_string("[XHCI] Controller Initialized\n");
+    console_print_string("[XHCI] Controller Initialized; device scan deferred to scheduler\n");
 }

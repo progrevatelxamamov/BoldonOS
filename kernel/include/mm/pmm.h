@@ -7,6 +7,7 @@
 void pmm_init(void);
 void* pmm_alloc_page(void);
 void* pmm_alloc_pages(uint64_t count);
+void* pmm_alloc_pages_below(uint64_t count, uint64_t limit);
 void* pmm_alloc_page_and_clear(void);
 void pmm_free_page(void* page);
 void pmm_free_pages(void* addr, uint64_t count);

@@ -130,6 +130,27 @@ void* pmm_alloc_pages(uint64_t count) {
     return NULL;
 }
 
+void* pmm_alloc_pages_below(uint64_t count, uint64_t limit) {
+    uint64_t end = limit / 4096;
+    if (end > total_pages) end = total_pages;
+    if (!count || count >= end) return NULL;
+    uint64_t flags;
+    spin_lock_irqsave(&pmm_lock, &flags);
+    uint64_t run = 0;
+    for (uint64_t i = 1; i < end; i++) {
+        if (bitmap_test(i)) { run = 0; continue; }
+        if (++run == count) {
+            uint64_t start = i + 1 - count;
+            for (uint64_t j = start; j <= i; j++) bitmap_set(j);
+            free_pages -= count;
+            spin_unlock_irqrestore(&pmm_lock, flags);
+            return (void *)(start * 4096);
+        }
+    }
+    spin_unlock_irqrestore(&pmm_lock, flags);
+    return NULL;
+}
+
 void* pmm_alloc_page_and_clear(void) {
     void *phys = pmm_alloc_page();
     if (phys == NULL) return NULL;
