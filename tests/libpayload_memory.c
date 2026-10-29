@@ -6,6 +6,7 @@
 #include <mm/vmm.h>
 #include <assert.h>
 extern int puts(const char *);
+extern void test_ehci_cleanup(unsigned count, int nonzero_terminated_link);
 extern void *lp_memalign(size_t, size_t);
 extern void *lp_calloc(size_t, size_t);
 extern void lp_free(void *);
@@ -41,10 +42,16 @@ int main(void) {
         lp_free(p);
     }
     assert(!lp_virt_to_phys(NULL));
+    assert(!lp_phys_to_virt(0));
+    lp_free(lp_phys_to_virt(0));
+    test_ehci_cleanup(0, 0);
+    test_ehci_cleanup(1, 0);
+    test_ehci_cleanup(4, 0);
+    test_ehci_cleanup(3, 1);
     assert(!lp_memalign(24, 16));
     assert(!lp_memalign(16, SIZE_MAX));
     assert(!lp_calloc(SIZE_MAX, 2));
     assert(freed == used);
-    puts("libpayload below-4GiB allocator, HHDM, alignment, zeroing and overflow tests passed");
+    puts("libpayload allocator, null/HHDM translation, EHCI cleanup and overflow tests passed");
     return 0;
 }

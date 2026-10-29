@@ -24,6 +24,9 @@ match those hashes. Local changes:
   Rate-limit media polling to once per second; ready media use a quiet TUR,
   with spin-up/capacity discovery only on readiness recovery or command error.
 - `include/usb/usbmsc.h`: per-device monotonic media-poll deadline.
+- `drivers/usb/ehci.c`: descriptor cleanup stops at the qTD terminate bit
+  instead of following the ignored address bits of a terminated link. The OS
+  physical-address shim preserves null pointers in both directions.
 
 The upstream files use BSD-style redistribution notices, reproduced in full
 in `LICENSES.md` and retained in the sources. Include `LICENSES.md` with binary

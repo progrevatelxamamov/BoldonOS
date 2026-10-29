@@ -36,6 +36,7 @@ uintptr_t lp_virt_to_phys(const volatile void *ptr) {
 }
 
 void *lp_phys_to_virt(uintptr_t phys) {
+    if (!phys) return NULL;
     return (void *)(phys + get_bootinfo().hhdm->offset);
 }
 
