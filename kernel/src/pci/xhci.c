@@ -2959,3 +2959,86 @@ void xhci_init(pci_device_t *dev) {
 
     console_print_string("[XHCI] Controller Initialized; device scan deferred to scheduler\n");
 }
+void *boldon_usb_input_create(int protocol, const uint8_t *descriptor,
+                              uint32_t length, int *report_mode) {
+    struct usb_hid *hid = malloc_alloc(sizeof(*hid));
+    if (!hid) return NULL;
+    memset(hid, 0, sizeof(*hid));
+    hid->protocol = protocol;
+    hid->report_size = 64;
+    if (descriptor && length) hid_parse_report_descriptor(hid, descriptor, length);
+    if (!hid->protocol) {
+        if (hid->mouse_layout_valid) hid->protocol = 2;
+        else if (hid->kbd_layout_valid) hid->protocol = 1;
+    }
+    if (hid->protocol != 1 && hid->protocol != 2) {
+        malloc_free(hid);
+        return NULL;
+    }
+    int mode = hid->protocol == 1 ? hid->kbd_layout_valid : hid->mouse_layout_valid;
+    hid->report_protocol_active = mode;
+    hid->boot_protocol_active = !mode;
+    *report_mode = mode;
+    return hid;
+}
+
+void boldon_usb_input_protocol(void *context, int report_mode) {
+    struct usb_hid *hid = context;
+    if (!hid) return;
+    hid->report_protocol_active = report_mode != 0;
+    hid->boot_protocol_active = report_mode == 0;
+    if (!report_mode) {
+        hid->kbd_layout_valid = false;
+        hid->mouse_layout_valid = false;
+    }
+}
+
+void boldon_usb_input_report(void *context, const uint8_t *data, uint32_t length) {
+    struct usb_hid *hid = context;
+    if (!hid) return;
+    if (hid->protocol == 1) handle_keyboard_report(hid, data, length);
+    else if (hid->protocol == 2) handle_mouse_report(hid, data, length);
+}
+
+void boldon_usb_input_destroy(void *context) {
+    struct usb_hid *hid = context;
+    if (!hid) return;
+    if (hid->protocol == 1) {
+        static const uint8_t codes[8] = {
+            KEY_LCTRL, KEY_LSHIFT, KEY_LALT, KEY_LGUI,
+            KEY_RCTRL, KEY_RSHIFT, KEY_RALT, KEY_RGUI
+        };
+        for (uint32_t i = 0; i < 8; i++)
+            if (hid->prev_modifiers & (1u << i)) inout_set_key_state(codes[i], false);
+        for (uint8_t i = 0; i < hid->active_keycode_count; i++)
+            inout_set_key_state(hid->active_keycodes[i], false);
+    } else if (hid->protocol == 2) {
+        uint8_t released[3] = {0};
+        hid->mouse_layout_valid = false;
+        hid->report_protocol_active = false;
+        hid->boot_protocol_active = true;
+        handle_mouse_report(hid, released, sizeof(released));
+    }
+    malloc_free(hid);
+}
+
+int boldon_usb_input_led_report(void *context, uint8_t leds, uint8_t *data, uint8_t *id) {
+    struct usb_hid *hid = context;
+    if (!hid || hid->protocol != 1) return 0;
+    memset(data, 0, 64);
+    if (hid->report_protocol_active && hid->desc_led_layout_valid) {
+        *id = hid->desc_led_report_id;
+        uint16_t n = hid->desc_led_report_len;
+        uint32_t off = *id ? 1 : 0;
+        if (n <= off || n > 64) return 0;
+        if (off) data[0] = *id;
+        hid_set_output_value(data + off, n - off, &hid->led_num, !!(leds & 1));
+        hid_set_output_value(data + off, n - off, &hid->led_caps, !!(leds & 2));
+        hid_set_output_value(data + off, n - off, &hid->led_scroll, !!(leds & 4));
+        return n;
+    }
+    if (hid->report_protocol_active) return 0;
+    *id = 0;
+    data[0] = leds;
+    return 1;
+}

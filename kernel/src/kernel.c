@@ -142,8 +142,6 @@ void kstart(bootloader_t blinfo) {
     scheduler_init();
     time_init();
     tcpip_init(NULL, NULL);
-    /* Драйверы Wi-Fi должны быть зарегистрированы ДО pci_init():
-       xhci_init() сразу перечисляет порты и ищет VID:PID в реестре. */
     console_print_string("[BOOT] PCI scan...\n");
     wifi_subsystem_init();
     pci_init();
@@ -195,10 +193,12 @@ void kstart(bootloader_t blinfo) {
     extern void launch_init_process(void);
     create_task_kernel((void *)launch_init_process, "init");
 
+    extern void libpayload_usb_start(void);
+    libpayload_usb_start();
     console_print_string("[BOOT] enabling interrupts\n");
     __asm__ volatile ("sti");
-    extern void xhci_mark_boot_complete(void);
-    xhci_mark_boot_complete();
+    extern void libpayload_usb_ready(void);
+    libpayload_usb_ready();
     console_print_string("[BOOT] interrupts enabled, scheduler running\n");
 
     while (1) {

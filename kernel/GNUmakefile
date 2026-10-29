@@ -214,7 +214,7 @@ endif
 
 # Use "find" to glob all *.c, *.S, and *.asm files in the tree and obtain the
 # object and header dependency file names.
-override SRCFILES := $(shell find -L src cc-runtime/src -type f 2>/dev/null | LC_ALL=C sort)
+override SRCFILES := $(shell find -L src cc-runtime/src third_party/libpayload/drivers/usb -type f 2>/dev/null | LC_ALL=C sort)
 override CFILES := $(filter %.c,$(SRCFILES))
 override ASFILES := $(filter %.S,$(SRCFILES))
 override NASMFILES := $(filter %.asm,$(SRCFILES))
@@ -236,6 +236,9 @@ bin/$(OUTPUT): GNUmakefile linker-scripts/x86_64.lds $(OBJ)
 # The compiler may emit calls to the memory functions and the compiler
 # runtime that LTO does not account for, so never build those with LTO.
 obj/src/memory.c.o obj/cc-runtime/src/cc-runtime.c.o: override CFLAGS += -fno-lto
+
+LP_OBJS := $(filter obj/third_party/libpayload/% obj/src/usb/lp/%,$(OBJ))
+$(LP_OBJS): override CPPFLAGS := -I usb-compat -I third_party/libpayload/include -I third_party/libpayload/drivers/usb $(CPPFLAGS)
 
 # Compilation rules for *.c files.
 obj/%.c.o: %.c GNUmakefile

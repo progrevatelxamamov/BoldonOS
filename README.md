@@ -23,3 +23,10 @@ sudo dd if=main.img of=/dev/sdX bs=4M status=progress conv=fsync
 
 Подробная диагностика загрузки на реальном железе — в
 [docs/input-and-hotplug.md](docs/input-and-hotplug.md).
+
+USB теперь использует настоящий coreboot libpayload (xHCI/EHCI/OHCI/UHCI),
+а не прежний контроллер из `pci/xhci.c`. Подключены ввод Nano-X/inout,
+блочные устройства и hotplug. Порт ещё требует проверки на реальном железе;
+USB-сеть/RTL8192EU к новому backend пока **не подключены**.
+Устройство composite может работать только первым интерфейсом.
+Подробности, лицензии и тесты — [docs/libpayload-usb.md](docs/libpayload-usb.md).
