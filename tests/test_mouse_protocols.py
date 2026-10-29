@@ -94,7 +94,7 @@ run_c('''
 #include <stdbool.h>
 #include <assert.h>
 #define __ATOMIC_RELAXED 0
-typedef struct { int unused; } xhci_controller_t;
+typedef struct { bool command_failed; } xhci_controller_t;
 struct xhci_trb { int unused; };
 struct evt_queue { int ready; };
 static uint64_t clock_ticks;

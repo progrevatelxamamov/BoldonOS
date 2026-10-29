@@ -60,6 +60,11 @@ typedef struct {
     uint8_t  bus;
     uint8_t  slot;
     uint8_t  func;
+    uint8_t max_slots;
+    uint8_t port_major[33];
+    uint8_t port_slot_type[33];
+    bool command_failed;
+    bool dma64;
     struct evt_queue  cmd_evt_q;
     struct evt_queue  transfer_evt_q[MAX_XHCI_SLOTS][32];
     volatile uint8_t port_change_queue[16];
@@ -283,7 +288,7 @@ struct usb_hid {
 #define XHCI_PORTSC_PEC        (1u << 18)
 #define XHCI_PORTSC_OCC        (1u << 20)
 #define XHCI_PORTSC_PRC        (1u << 21)
-#define XHCI_PORTSC_PRESERVE_MASK (XHCI_PORTSC_PP)
+#define XHCI_PORTSC_PRESERVE_MASK (XHCI_PORTSC_PP | (3u << 14) | (7u << 25))
 /* Write-1-to-clear биты PORTSC. Их обязательно сбрасывать и на
    отключении, иначе CSC остаётся в 1 и контроллер не пришлёт новое
    Port Status Change Event при следующем подключении. */
