@@ -31,6 +31,7 @@
 typedef struct {
 	unsigned int blocksize;
 	unsigned int numblocks;
+	u64 next_poll_ms;
 	endpoint_t *bulk_in;
 	endpoint_t *bulk_out;
 	u8 quirks		: 7;

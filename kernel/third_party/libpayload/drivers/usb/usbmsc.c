@@ -472,7 +472,6 @@ static int request_sense_no_media(usbdev_t *dev)
 
 	/* No media is present. Return MSC_COMMAND_OK while marking the disk
 	 * not ready. */
-	usb_debug("Empty media found.\n");
 	MSC_INST(dev)->ready = USB_MSC_NOT_READY;
 	return MSC_COMMAND_OK;
 }
@@ -703,11 +702,24 @@ static void
 usb_msc_poll(usbdev_t *dev)
 {
 	usbmsc_inst_t *msc = MSC_INST(dev);
+	struct timeval tv;
+	gettimeofday(&tv, NULL);
+	u64 now = (u64)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+	if (now < msc->next_poll_ms)
+		return;
+	msc->next_poll_ms = now + 1000;
 	int prev_ready = msc->ready;
 	unsigned int prev_blocksize = msc->blocksize;
 	unsigned int prev_numblocks = msc->numblocks;
 
-	if (usb_msc_test_unit_ready(dev) == USB_MSC_DETACHED)
+	msc->ready = USB_MSC_READY;
+	int status = test_unit_ready(dev);
+	if (status == MSC_COMMAND_DETACHED)
+		return;
+	if (status == MSC_COMMAND_OK && msc->ready == USB_MSC_READY && prev_ready)
+		return;
+	if ((status != MSC_COMMAND_OK || msc->ready == USB_MSC_READY) &&
+	    usb_msc_test_unit_ready(dev) == USB_MSC_DETACHED)
 		return;
 
 	if (!prev_ready && msc->ready) {

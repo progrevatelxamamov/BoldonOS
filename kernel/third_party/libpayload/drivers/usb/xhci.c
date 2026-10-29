@@ -412,9 +412,8 @@ xhci_reinit(hci_t *controller)
 	xhci_start(controller);
 
 #ifdef USB_DEBUG
-	int i;
-	for (i = 0; i < 32; ++i) {
-		xhci_debug("NOOP run #%d\n", i);
+	{
+		xhci_debug("Checking command ring with NOOP\n");
 		trb_t *const cmd = xhci_next_command_trb(xhci);
 		TRB_SET(TT, cmd, TRB_CMD_NOOP);
 
@@ -423,8 +422,8 @@ xhci_reinit(hci_t *controller)
 		/* Wait for result in event ring */
 		int cc = xhci_wait_for_command_done(xhci, cmd, 1);
 
-		xhci_debug("Command ring is %srunning: cc: %d\n",
-			   (xhci->opreg->crcr_lo & CRCR_CRR) ? "" : "not ", cc);
+		xhci_debug("NOOP completion: cc: %d (CRCR.CRR=%u)\n",
+			   cc, !!(xhci->opreg->crcr_lo & CRCR_CRR));
 		if (cc != CC_SUCCESS)
 			xhci_debug("noop command failed.\n");
 	}
