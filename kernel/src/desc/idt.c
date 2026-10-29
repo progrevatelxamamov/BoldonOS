@@ -149,6 +149,60 @@ static void dump_code_bytes(uint64_t rip, uint64_t cs, process_t *proc) {
     console_print_string("\n");
 }
 
+static bool panic_read_word(page_table_t *table, uint64_t address, uint64_t *value) {
+    if (!table || !value || address > UINT64_MAX - 7) return false;
+    uint64_t result = 0;
+    for (unsigned i = 0; i < 8; i++) {
+        uint64_t at = address + i;
+        uint64_t upper = at >> 47;
+        if (upper != 0 && upper != 0x1FFFF) return false;
+        uint64_t phys = vmm_get_phys(table, at & ~0xFFFULL);
+        if (!phys) return false;
+        uint8_t byte = *(const uint8_t *)(phys + get_bootinfo().hhdm->offset + (at & 0xFFF));
+        result |= (uint64_t)byte << (i * 8);
+    }
+    *value = result;
+    return true;
+}
+
+static void dump_iret_target(struct interrupt_frame *frame, process_t *proc) {
+    if (frame->isr_number != 13 || (frame->cs & 3)) return;
+    page_table_t *table = proc && proc->pml4 ? proc->pml4 : get_kernel_pml4();
+    uint64_t instruction;
+    if (!panic_read_word(table, frame->rip, &instruction)) return;
+    if ((instruction & 0xFFFF) != 0xCF48) return;
+    uint64_t target[5];
+    for (unsigned i = 0; i < 5; i++) {
+        if (frame->rsp > UINT64_MAX - i * 8 ||
+            !panic_read_word(table, frame->rsp + i * 8, &target[i])) {
+            console_print_string("\n[IRET] target frame unreadable\n");
+            return;
+        }
+    }
+    const char *names[] = {" RIP=", " CS=", " FLAGS=", " RSP=", " SS="};
+    console_print_string("\n[IRET] rejected frame:");
+    for (unsigned i = 0; i < 5; i++) {
+        console_print_string(names[i]);
+        console_print_hex(target[i]);
+    }
+    struct gdt_ptr gdtr;
+    __asm__ volatile("sgdt %0" : "=m"(gdtr));
+    console_print_string("\n[IRET] GDT base="); console_print_hex(gdtr.base);
+    console_print_string(" limit="); console_print_hex(gdtr.limit);
+    for (unsigned i = 1; i <= 4; i += 3) {
+        uint64_t offset = target[i] & ~7ULL;
+        console_print_string(i == 1 ? "\n[IRET] CS descriptor=" : "\n[IRET] SS descriptor=");
+        uint64_t descriptor;
+        if ((target[i] & 4) || offset + 7 > gdtr.limit || gdtr.base > UINT64_MAX - offset ||
+            !panic_read_word(table, gdtr.base + offset, &descriptor)) {
+            console_print_string("unavailable");
+        } else {
+            console_print_hex(descriptor);
+        }
+    }
+    console_print_string("\n");
+}
+
 static void dump_frame_raw(struct interrupt_frame *frame) {
     uint64_t w[22];
     memcpy(w, frame, sizeof(w));
@@ -256,6 +310,7 @@ void execption_handlerer(struct interrupt_frame *frame) {
         console_print_string(" - "); console_print_hex(thr->kernel_stack_top);
         console_print_string("\nCur rsp: "); console_print_hex(rsp_now);
     }
+    dump_iret_target(frame, proc);
     dump_frame_raw(frame);
     dump_code_bytes(frame->rip, frame->cs, proc);
 
