@@ -800,7 +800,8 @@ void update_keyboard_leds(void) {
     if (scroll) usb_leds |= (1u << 2);
 
     ps2kbd_set_leds(ps2_leds);
-    xhci_set_keyboard_leds(usb_leds);
+    extern void libpayload_usb_set_leds(uint8_t leds);
+    libpayload_usb_set_leds(usb_leds);
 }
 
 char key_to_ascii(int key, bool shift, bool caps_lock, bool num_lock) {

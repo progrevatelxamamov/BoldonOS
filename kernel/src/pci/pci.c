@@ -3,7 +3,7 @@
 #include <io.h>
 #include <pci/pci.h>
 #include <pci/nvme.h>
-#include <pci/xhci.h>
+#include <usb/libpayload.h>
 #include <mm/malloc.h>
 
 uint64_t pci_count = 0;
@@ -117,9 +117,7 @@ void pci_init(void) {
             }
 
             if (devices[dev]->base_class == 0x0C && devices[dev]->subclass == 0x03) {
-                if (devices[dev]->prog_if == 0x30) { // xhci
-                    xhci_init(devices[dev]);
-                }
+                libpayload_pci_register(devices[dev]);
             }
         }
     }

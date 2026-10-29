@@ -94,6 +94,7 @@ EFI_DIR := /boot
 .PHONY: run-real-pc
 run-real-pc: kernel
 	sudo cp -v kernel/bin/kernel $(EFI_DIR)/boldonoskernel
+	sudo cp -v kernel/third_party/libpayload/LICENSES.md $(EFI_DIR)/libpayload-LICENSES.md
 	@echo
 	@echo "Ядро скопировано в $(EFI_DIR)/boldonoskernel"
 	@echo "Убедитесь, что в limine.conf есть запись:"
@@ -176,6 +177,7 @@ $(IMAGE_NAME).iso: limine-binary/limine kernel
 	mkdir -p iso_root/boot
 	cp -v boldonsplash.bmp iso_root/boot/
 	cp -v kernel/bin/kernel iso_root/boot/
+	cp -v kernel/third_party/libpayload/LICENSES.md iso_root/boot/libpayload-LICENSES.md
 	mkdir -p iso_root/boot/limine
 	cp -v limine.conf limine-binary/limine-bios.sys limine-binary/limine-bios-cd.bin limine-binary/limine-uefi-cd.bin iso_root/boot/limine/
 	mkdir -p iso_root/EFI/BOOT
@@ -197,6 +199,7 @@ $(IMAGE_NAME).hdd: limine-binary/limine kernel
 	mformat -i $(IMAGE_NAME).hdd@@$(HDD_PART_OFFSET) -T $(HDD_PART_SECTORS) -h $(HDD_HEADS) -s $(HDD_SECTORS_PER_TRACK) ::
 	mmd -i $(IMAGE_NAME).hdd@@$(HDD_PART_OFFSET) ::/EFI ::/EFI/BOOT ::/boot ::/boot/limine
 	mcopy -i $(IMAGE_NAME).hdd@@$(HDD_PART_OFFSET) kernel/bin/kernel ::/boot
+	mcopy -i $(IMAGE_NAME).hdd@@$(HDD_PART_OFFSET) kernel/third_party/libpayload/LICENSES.md ::/boot/libpayload-LICENSES.md
 	mcopy -i $(IMAGE_NAME).hdd@@$(HDD_PART_OFFSET) limine.conf limine-binary/limine-bios.sys ::/boot/limine
 	mcopy -i $(IMAGE_NAME).hdd@@$(HDD_PART_OFFSET) limine-binary/BOOTX64.EFI ::/EFI/BOOT
 	mcopy -i $(IMAGE_NAME).hdd@@$(HDD_PART_OFFSET) limine-binary/BOOTIA32.EFI ::/EFI/BOOT
@@ -240,6 +243,7 @@ main.img: limine-binary/limine kernel
 	sudo mkdir -p .mnt_boot/boot/limine .mnt_boot/EFI/BOOT; \
 	sudo cp -v boldonsplash.bmp .mnt_boot/boot/ 2>/dev/null || true; \
 	sudo cp -v kernel/bin/kernel .mnt_boot/boot/; \
+	sudo cp -v kernel/third_party/libpayload/LICENSES.md .mnt_boot/boot/libpayload-LICENSES.md; \
 	sudo cp -v limine.conf limine-binary/limine-bios.sys .mnt_boot/boot/limine/; \
 	sudo cp -v limine-binary/BOOTX64.EFI .mnt_boot/EFI/BOOT/; \
 	sudo cp -v limine-binary/BOOTIA32.EFI .mnt_boot/EFI/BOOT/ 2>/dev/null || true; \
