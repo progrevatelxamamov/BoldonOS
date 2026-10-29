@@ -15,10 +15,15 @@ match those hashes. Local changes:
 
 - `drivers/usb/xhci.c`: cap enabled slots at the size of the USB core's device
   array minus the root-hub slot; do not use a bit mask as a numerical limit.
+  Run one diagnostic NOOP instead of 32; report completion separately from the
+  command-ring running bit (which can clear when the queue becomes idle).
 - `drivers/usb/usbmsc.c`: use byte-sized START STOP UNIT bitfields so the
   anonymous command union remains one byte on x86-64. Compile-time assertions
   enforce CDB6/CDB10/CBW/CSW wire sizes. Export cache synchronization through
   SYNCHRONIZE CACHE(10), and chunked read/write with unsigned 32-bit LBAs.
+  Rate-limit media polling to once per second; ready media use a quiet TUR,
+  with spin-up/capacity discovery only on readiness recovery or command error.
+- `include/usb/usbmsc.h`: per-device monotonic media-poll deadline.
 
 The upstream files use BSD-style redistribution notices, reproduced in full
 in `LICENSES.md` and retained in the sources. Include `LICENSES.md` with binary

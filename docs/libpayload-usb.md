@@ -120,3 +120,19 @@ PCI`, `controller ready`, HID/disk registration and the first upstream failure.
 Test both controllers, hubs, long keyboard/mouse idle, unplug/replug, Nano-X,
 and a disposable storage device including reads/writes/flush/eject. Do not use
 important data for first write testing.
+
+## Follow-up: repeated MSC capacity messages
+
+Media polling now has a per-device one-second deadline, independent of HID
+polling. A ready disk is checked with TEST UNIT READY only: it is not spun up
+and its capacity is not rediscovered on every USB worker iteration. Empty
+readers stay quiet. Readiness recovery or a failed TUR triggers the existing
+initialization/capacity path; removal/reinsertion still notify block hotplug.
+The regression harness checks repeated calls without time advancing, the exact
+one-second deadline, quiet ready/empty states, media reinsertion, and immediate
+return when transport failure detaches the USB device.
+
+The debug xHCI startup test now sends one NOOP rather than 32. Completion code
+1 is success; CRCR.CRR can be zero after the command queue has drained. The log
+therefore prints the completion code and running bit separately, without calling
+an idle command ring an initialization failure.
