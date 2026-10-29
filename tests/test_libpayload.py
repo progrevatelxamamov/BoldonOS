@@ -18,6 +18,11 @@ with tempfile.TemporaryDirectory() as directory:
                     str(ROOT / 'tests/libpayload_backend.c'),
                     *(str(KERNEL / p) for p in objects[:2]), '-o', str(binary)], check=True)
     subprocess.run([str(binary)], check=True)
+    hub = pathlib.Path(directory) / 'libpayload-hub-test'
+    subprocess.run(['cc', '-std=gnu11', '-no-pie', '-ffunction-sections',
+                    '-fdata-sections', '-Wl,--gc-sections', *INCLUDES,
+                    str(ROOT / 'tests/libpayload_hub.c'), '-o', str(hub)], check=True)
+    subprocess.run([str(hub)], check=True)
     wrapper = pathlib.Path(directory) / 'msc-wrapper.c'
     wrapper.write_text('#include "' + str(KERNEL / 'third_party/libpayload/drivers/usb/usbmsc.c') +
                        '"\nvoid test_msc_poll(usbdev_t *dev) { usb_msc_poll(dev); }\n')

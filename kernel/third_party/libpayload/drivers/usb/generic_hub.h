@@ -58,8 +58,14 @@ typedef struct generic_hub_ops {
 	int (*reset_port)(usbdev_t *, int port);
 } generic_hub_ops_t;
 
+struct hub_port_retry {
+	u64 deadline_ms;
+	unsigned failures;
+};
+
 typedef struct generic_hub {
 	int num_ports;
+	struct hub_port_retry *retry;
 	/* port numbers are always 1 based,
 	   so we waste one int for convenience */
 	int *ports; /* allocated to sizeof(*ports)*(num_ports+1) */
