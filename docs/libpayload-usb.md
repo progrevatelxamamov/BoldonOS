@@ -177,3 +177,30 @@ reset before the deadline despite 10,000 change notifications, retries without
 hub-change events, capped backoff, one warning, other-port enumeration and
 reconnection. This addresses the retry/logging defect; it does not establish
 why a specific physical port fails to enable or diagnose a separate panic.
+
+## User-process #GP at IRETQ
+
+The supplied `sh` panic shows bytes `48 CF` at the faulting instruction and
+error code `0x18`. This identifies an IRETQ segment-validation failure, not
+an endpoint-control instruction. The error indexes GDT entry 3 (selector base
+0x18); it does not by itself establish which saved state or descriptor is wrong.
+The address cannot be mapped reliably to a source line without the exact ELF
+that produced it.
+
+A kernel-mode #GP at IRETQ now prints `[IRET] rejected frame` with the five
+return slots (RIP, CS, FLAGS, RSP, SS), the live GDTR base/limit, and the selected
+CS/SS descriptors. Memory is inspected through validated page translations;
+unavailable stack or descriptor data is reported without directly dereferencing
+an untrusted return pointer. Existing exception handling is unchanged. This is
+diagnostic instrumentation, not a confirmed fix for the user-process crash.
+
+Save the exact `kernel/bin/kernel` before rebuilding. For that original ELF:
+
+```sh
+addr2line -e kernel/bin/kernel -f -C 0xffffffff8005aa5c
+objdump -d --start-address=0xffffffff8005aa44 --stop-address=0xffffffff8005aa74 kernel/bin/kernel
+```
+
+After installing the diagnostic build, collect the new `[IRET]` lines and
+preserve its ELF too. Absolute RIP values from different builds are not
+interchangeable. Test: `python3 tests/test_iret_diagnostics.py`.
