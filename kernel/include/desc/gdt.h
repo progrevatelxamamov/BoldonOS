@@ -60,11 +60,8 @@ struct tss_entry {
                       SEG_LONG(1)     | SEG_SIZE(0) | SEG_GRAN(1) | \
                       SEG_PRIV(0)     | SEG_CODE_EXRD)
 
-/* 
- * 64-bit Kernel Data: Long=0, Size=0 (or Size=1, ignored by hardware in 64-bit mode)
- */
 #define GDT_DATA_PL0 (SEG_DESCTYPE(1) | SEG_PRES(1) | SEG_SAVL(0) | \
-                      SEG_LONG(0)     | SEG_SIZE(0) | SEG_GRAN(1) | \
+                      SEG_LONG(0)     | SEG_SIZE(1) | SEG_GRAN(1) | \
                       SEG_PRIV(0)     | SEG_DATA_RDWR)
 
 /* 
@@ -74,11 +71,8 @@ struct tss_entry {
                       SEG_LONG(1)     | SEG_SIZE(0) | SEG_GRAN(1) | \
                       SEG_PRIV(3)     | SEG_CODE_EXRD)
 
-/* 
- * 64-bit User Data: Long=0, Size=0, Priv=3
- */
 #define GDT_DATA_PL3 (SEG_DESCTYPE(1) | SEG_PRES(1) | SEG_SAVL(0) | \
-                      SEG_LONG(0)     | SEG_SIZE(0) | SEG_GRAN(1) | \
+                      SEG_LONG(0)     | SEG_SIZE(1) | SEG_GRAN(1) | \
                       SEG_PRIV(3)     | SEG_DATA_RDWR)
 
 struct gdt_ptr {
