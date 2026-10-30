@@ -463,11 +463,20 @@ static int register_partition_nodes(const char *dev, struct partition_table *pt,
     return 0;
 }
 
+static bool partition_already_mounted(const char *dev, uint64_t lba) {
+    for (char letter = 'A'; letter <= 'Z'; letter++) {
+        vfs_mount_t *mnt = vfs_get_mount(letter);
+        if (mnt && !mnt->dead && mnt->start_lba == lba &&
+            strcmp(mnt->device, dev) == 0) return true;
+    }
+    return false;
+}
+
 static void auto_mount_partitions(const char *dev, struct partition_table *pt,
                                   const char *alias) {
     for (uint32_t i = 0; i < pt->count; i++) {
         uint64_t lba = pt->parts[i].start_lba;
-        if (pt->parts[i].sector_count == 0) continue;
+        if (pt->parts[i].sector_count == 0 || partition_already_mounted(dev, lba)) continue;
         const char *fs = partitions_detect_fs(dev, lba);
         if (!fs) continue;
 
@@ -521,7 +530,9 @@ static int device_add(const char *dev, bool auto_mount) {
     int root_res = -1;
     if (!vfs_get_mount('C')) root_res = partitions_try_mount_root(dev);
     if (root_res == 0) console_print_string("[HOTPLUG] root filesystem became available as C:\n");
-    if (auto_mount && root_res != 0) auto_mount_partitions(dev, pt, alias);
+    /* Do not take a potential root partition for /media before C: is ready.
+       The root probe skips mounted partitions, so that would defeat retries. */
+    if (auto_mount && vfs_get_mount('C')) auto_mount_partitions(dev, pt, alias);
     return 0;
 }
 
@@ -651,6 +662,16 @@ int partitions_proc_partitions(char *buf, uint32_t len) {
     return (int)pos;
 }
 
+/* Once C: is available, attach partitions seen before the root device.
+   Never mount a partition twice (especially not the root itself). */
+static void auto_mount_known_partitions(void) {
+    if (!vfs_get_mount('C')) return;
+    for (int i = 0; i < known_count; i++) {
+        struct partition_table *pt = get_partition_struct(known[i]);
+        if (pt) auto_mount_partitions(known[i], pt, disk_alias[i]);
+    }
+}
+
 static void hotplug_scan(void) {
     for (int k = 0; k < known_count;) {
         if (find_device(known[k])) { k++; continue; }
@@ -674,6 +695,7 @@ static void hotplug_task(void) {
     uint64_t start = get_monotonic_ms();
     uint64_t next = start + 200;
     uint64_t next_root = start + 2000;
+    bool media_scanned = false;
     for (;;) {
         uint64_t now = get_monotonic_ms();
         if (hotplug_ready && now >= next) {
@@ -684,6 +706,11 @@ static void hotplug_task(void) {
             next_root = now + 2000;
             if (partitions_try_mount_root(NULL) == 0)
                 console_print_string("[HOTPLUG] root filesystem became available as C:\n");
+        }
+        if (!vfs_get_mount('C')) media_scanned = false;
+        else if (hotplug_ready && !media_scanned) {
+            auto_mount_known_partitions();
+            media_scanned = true;
         }
         schedule_yield();
     }
