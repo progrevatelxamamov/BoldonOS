@@ -7,6 +7,15 @@
 #include <gconsole.h>
 #include <inout/inout.h>
 #include <disk/partitions.h>
+#include <errno.h>
+
+static void init_exec_failure(const char *attempt, int error) {
+    console_print_string("[INIT] execve /bin/sh (");
+    console_print_string(attempt);
+    console_print_string(") failed, errno=");
+    console_print_num((uint64_t)error);
+    console_print_string("\n");
+}
 
 static void init_no_root_hint(void) {
     console_print_string("\n============================================================\n");
@@ -131,15 +140,35 @@ void launch_init_process(void) {
         console_print_string("[INIT] root appeared, continuing boot\n");
     }
 
+    vfs_mount_t *root = vfs_get_mount('C');
+    if (root) {
+        console_print_string("[INIT] C: device=");
+        console_print_string(root->device);
+        console_print_string(" fs=");
+        console_print_string(root->fs_name);
+        console_print_string(" start_lba=");
+        console_print_num(root->start_lba);
+        console_print_string("\n");
+    }
+
+    vfs_stat_t st;
+    console_print_string("[INIT] C:/bin/sh: ");
+    console_print_string(vfs_stat("C:/bin/sh", &st) == 0 ? "present\n" : "not found\n");
+    console_print_string("[INIT] C:/etc/init.sh: ");
+    console_print_string(vfs_stat("C:/etc/init.sh", &st) == 0 ? "present\n" : "not found\n");
+
     console_print_string("[INIT] Starting /etc/init.sh...\n");
     sys_execve("/bin/sh", argv, envp);
+    int script_error = errno;
+    init_exec_failure("/etc/init.sh", script_error);
 
     char *fallback_argv[] = { "/bin/sh", NULL };
     sys_execve("/bin/sh", fallback_argv, envp);
+    int fallback_error = errno;
+    init_exec_failure("fallback", fallback_error);
 
-    console_print_string("[INIT] Failed to start shell!\n");
-    console_print_string("[INIT] C: is mounted but /bin/sh or /etc/init.sh is missing\n");
-    console_print_string("[INIT] check that osdata/bin/sh and osdata/etc/init.sh exist\n");
+    console_print_string("[INIT] Failed to start shell; C: may be the wrong partition,\n");
+    console_print_string("[INIT] /bin/sh or its ELF interpreter may be missing or invalid.\n");
     while (1) {
         schedule_yield();
     }
