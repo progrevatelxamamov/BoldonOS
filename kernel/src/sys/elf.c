@@ -93,7 +93,12 @@ static int load_interp(page_table_t *pml4, const char *interp_path,
                        uint64_t interp_base, uint64_t *entry_out)
 {
     vfs_file_t *ifile = vfs_open(interp_path, VFS_O_READ);
-    if (!ifile) return -ENOENT;
+    if (!ifile) {
+        console_print_string("[EXEC] ELF interpreter not found: ");
+        console_print_string(interp_path);
+        console_print_string("\n");
+        return -ENOENT;
+    }
 
     Elf64_Ehdr iehdr;
     if (vfs_read(ifile, &iehdr, sizeof(iehdr)) != sizeof(iehdr)) {
