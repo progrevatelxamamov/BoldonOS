@@ -19,11 +19,15 @@ full new photo before changing the GDT. The follow-up photo has that boot
 marker, but the rejected frame's SS still appears to be 0x18 (the blurred
 photo does not resolve the last digit conclusively), with #GP(0x18) on CPU 2.
 The marker only proves that the new code reached the logging call, **not** the
-value present in the stack frame at IRETQ. The IRET diagnostic now compares the
-process address space with the actual CR3 loaded on the failing CPU, and reads
-both its active SS stack slot and fault descriptor. A fresh boot photo showing
-those lines is needed before attributing this to a stale image, changed stack,
-wrong page table, GDT, or SMP.
+value present in the stack frame at IRETQ. The next hardware photo confirmed
+`target SS RPL=0` and `active-frame SS=0x18 RPL=0`, with active CR3 matching
+process CR3. Its CODE bytes immediately before `iretq` are the ISR epilogue
+(`pop r14; pop r15; add rsp,16; iretq`), **not** the `sys_execve` initial IRET.
+The scheduler can restore a user frame containing bare `USER_DATA` (0x18).
+It now repairs only this exact user-CS/user-SS combination to 0x1B and updates
+the saved frame. Look for `[SCHED] repaired user SS 0x18 -> 0x1B` on the next
+boot. This is a targeted workaround; the source of the lost RPL bits and
+successful boot on the old PC remain to be confirmed.
 
 The GDT definitions previously specified D/B=0 for both kernel and user data.
 They now use the conventional flat data/stack encoding with D/B=1, L=0 and
