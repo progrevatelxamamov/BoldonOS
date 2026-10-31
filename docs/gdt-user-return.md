@@ -1,14 +1,27 @@
 # Flat data descriptors and the hardware IRETQ fault
 
-The latest hardware diagnostic reports a rejected user return with CS 0x23,
-SS 0x1B, canonical user RIP/RSP and error code 0x18. The selected descriptors
-are 0x00AFFB000000FFFF for code and 0x008FF3000000FFFF for data/stack. The
-accessed bits have already been set by the processor.
+The old-PC photo was initially misread: the rejected frame shows **CS 0x23,
+SS 0x18** (not 0x1B), with error code 0x18. CS has RPL=3 but SS has RPL=0;
+IRETQ cannot return to CPL3 with that SS. The displayed *fault handler*'s
+CS 0x08 and SS 0x10 are both CPL0 and belong to a different frame. The GDT
+entry at 0x18 may have DPL=3, but the selector itself must still have RPL=3
+(`0x1B`). Do not confuse the error-code selector index (0x18) with a valid
+user SS selector.
+
+The current source had already specified `USER_DATA | 3` for `sys_execve` and
+the compiled object pushed 0x1B. We now encode the initial SS push explicitly
+as `pushq $0x1B` and verify that immediate in the built object. A boot marker
+`[EXEC] IRET target SS=0x1B` helps distinguish a newly built image from an old
+kernel/ISO. If the marker appears but the rejected frame still has SS=0x18,
+the cause is elsewhere (a different IRET path or frame corruption); record the
+full new photo before changing the GDT. This is **not** yet a confirmed fix on
+the old PC.
 
 The GDT definitions previously specified D/B=0 for both kernel and user data.
 They now use the conventional flat data/stack encoding with D/B=1, L=0 and
-G=1. Code descriptors retain L=1 and D/B=0. Selectors, privilege levels, limits,
-bases and the IRETQ/syscall paths are unchanged. The user data descriptor
+G=1. Code descriptors retain L=1 and D/B=0. That earlier change did not
+alter selector values or the IRETQ/syscall paths; the explicit initial-IRETQ
+SS immediate described above is a separate follow-up. The user data descriptor
 should appear as 0x00CFF2000000FFFF, or 0x00CFF3000000FFFF after access.
 
 This is a narrow descriptor-normalization/compatibility change to try on the
