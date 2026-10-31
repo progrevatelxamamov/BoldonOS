@@ -7,6 +7,8 @@ source = (root / 'kernel/src/desc/idt.c').read_text()
 start = source.index('static bool panic_read_word(')
 end = source.index('static void dump_frame_raw(', start)
 functions = source[start:end].replace('__asm__ volatile("sgdt %0" : "=m"(gdtr));', 'gdtr = test_gdtr;')
+functions = functions.replace('__asm__ volatile("mov %%cr3, %0" : "=r"(active_cr3));', 'active_cr3 = 0x1000;')
+functions = functions.replace('page_table_t *active = (page_table_t *)((active_cr3 & 0x000FFFFFFFFFF000ULL) + hhdm);', 'page_table_t *active = &user;')
 prefix = r'''
 #include <stdint.h>
 #include <stdbool.h>
@@ -50,12 +52,16 @@ int main(void) {
     uint64_t cs = 0x00affa000000ffff, ss = 0x0080f2000000ffff;
     memcpy(pages[5] + 0x20, &cs, 8); memcpy(pages[5] + 0x18, &ss, 8);
     dump_iret_target(&f, &proc);
-    assert(count == 10 && values[0] == target[0] && values[4] == 0x1b);
-    assert(values[7] == ss && values[8] == cs && values[9] == ss);
+    assert(count == 16 && values[0] == target[0] && values[4] == 0x1b);
+    assert(values[5] == 3 && values[8] == 0x1000 && values[10] == 0x1b && values[11] == 3);
+    assert(values[12] == ss && values[13] == ss && values[14] == cs && values[15] == ss);
+    target[4] = 0x18; memcpy(pages[3], target, sizeof(target)); count = 0;
+    dump_iret_target(&f, &proc);
+    assert(values[4] == 0x18 && values[5] == 0 && values[10] == 0x18 && values[11] == 0);
     unsigned before = messages;
     f.isr_number = 14; dump_iret_target(&f, &proc); assert(messages == before);
     f.isr_number = 13; f.rsp = 0x6000; count = 0;
-    dump_iret_target(&f, &proc); assert(messages > before && count == 5);
+    dump_iret_target(&f, &proc); assert(messages > before && count == 8);
     return 0;
 }
 '''

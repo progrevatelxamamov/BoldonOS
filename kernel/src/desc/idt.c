@@ -190,11 +190,30 @@ static void dump_iret_target(struct interrupt_frame *frame, process_t *proc) {
             console_print_string(names[i]);
             console_print_hex(target[i]);
         }
+        console_print_string("\n[IRET] target SS RPL=");
+        console_print_hex(target[4] & 3);
     }
     struct gdt_ptr gdtr;
     __asm__ volatile("sgdt %0" : "=m"(gdtr));
     console_print_string("\n[IRET] GDT base="); console_print_hex(gdtr.base);
     console_print_string(" limit="); console_print_hex(gdtr.limit);
+    /* A descriptor read through proc->pml4 need not be the one the CPU saw:
+       the CPU uses the page table actually loaded in CR3. Check both. */
+    uint64_t active_cr3;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(active_cr3));
+    uint64_t hhdm = get_bootinfo().hhdm->offset;
+    page_table_t *active = (page_table_t *)((active_cr3 & 0x000FFFFFFFFFF000ULL) + hhdm);
+    console_print_string("\n[IRET] active CR3="); console_print_hex(active_cr3);
+    if (proc && proc->pml4 && (uint64_t)proc->pml4 >= hhdm) {
+        console_print_string(" process CR3=");
+        console_print_hex((uint64_t)proc->pml4 - hhdm);
+    }
+    uint64_t active_ss;
+    if (readable && frame->rsp <= UINT64_MAX - 32 &&
+        panic_read_word(active, frame->rsp + 32, &active_ss)) {
+        console_print_string("\n[IRET] active-frame SS="); console_print_hex(active_ss);
+        console_print_string(" RPL="); console_print_hex(active_ss & 3);
+    }
     uint64_t fault_offset = frame->error_code & 0xFFF8;
     uint64_t fault_descriptor;
     console_print_string("\n[IRET] fault selector descriptor=");
@@ -203,6 +222,12 @@ static void dump_iret_target(struct interrupt_frame *frame, process_t *proc) {
         !panic_read_word(table, gdtr.base + fault_offset, &fault_descriptor)) {
         console_print_string("unavailable");
     } else {
+        console_print_hex(fault_descriptor);
+    }
+    if (!(frame->error_code & 6) && fault_offset + 7 <= gdtr.limit &&
+        gdtr.base <= UINT64_MAX - fault_offset &&
+        panic_read_word(active, gdtr.base + fault_offset, &fault_descriptor)) {
+        console_print_string("\n[IRET] active fault descriptor=");
         console_print_hex(fault_descriptor);
     }
     for (unsigned i = 1; readable && i <= 4; i += 3) {
