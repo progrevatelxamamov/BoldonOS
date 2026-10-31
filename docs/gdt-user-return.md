@@ -27,7 +27,15 @@ The scheduler can restore a user frame containing bare `USER_DATA` (0x18).
 It now repairs only this exact user-CS/user-SS combination to 0x1B and updates
 the saved frame. Look for `[SCHED] repaired user SS 0x18 -> 0x1B` on the next
 boot. This is a targeted workaround; the source of the lost RPL bits and
-successful boot on the old PC remain to be confirmed.
+successful boot on the old PC remain to be confirmed. After the workaround,
+the old PC produced repeated short messages, then a kernel #GP and a fast
+reboot. The repair message is now emitted only on the first occurrence. A
+kernel-mode #GP (even while a user process is current) now prints a short
+`[GP-HALT]` line with RIP, ERR, CS, RSP and CPU and halts with interrupts
+disabled instead of trying to exit the user process or run the lengthy panic
+dump. This sacrifices the full dump for a stable photo; a reboot that still
+occurs before `[GP-HALT]` suggests an earlier nested/double/triple fault or
+external reset, not a confirmed cause of the original SS problem.
 
 The GDT definitions previously specified D/B=0 for both kernel and user data.
 They now use the conventional flat data/stack encoding with D/B=1, L=0 and

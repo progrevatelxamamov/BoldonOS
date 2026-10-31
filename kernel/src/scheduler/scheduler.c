@@ -534,7 +534,10 @@ void schedule(struct interrupt_frame *frame) {
         restore->ss = frame->ss;
         if (thr->regs && thr->regs->cs == (USER_CODE | 3) && thr->regs->ss == USER_DATA)
             thr->regs->ss = USER_DATA | 3;
-        console_print_string("[SCHED] repaired user SS 0x18 -> 0x1B\n");
+        /* Do not flood the display if the same bad frame is produced again. */
+        static bool repair_reported = false;
+        if (!__atomic_exchange_n(&repair_reported, true, __ATOMIC_RELAXED))
+            console_print_string("[SCHED] repaired user SS 0x18 -> 0x1B (first occurrence)\n");
     }
     if (restore_syscall) {
         thr->syscall_frame->rip = 0;
