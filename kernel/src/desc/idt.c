@@ -255,6 +255,12 @@ static void dump_frame_raw(struct interrupt_frame *frame) {
     console_print_string("\n");
 }
 
+/* A fault in kernel code is not a recoverable user-process exception,
+   even if a user process happened to be the current task. */
+static bool exception_is_kernel_gp(const struct interrupt_frame *frame) {
+    return frame && frame->isr_number == 13 && (frame->cs & 3) == 0;
+}
+
 void execption_handlerer(struct interrupt_frame *frame) {
     if (frame->isr_number > 31) return;
     if (frame->isr_number == 22 || frame->isr_number == 23) return;
@@ -266,7 +272,7 @@ void execption_handlerer(struct interrupt_frame *frame) {
     process_t *proc = get_current_process();
     bool kernel_proc = proc && proc->is_kernel_process;
     bool user_mode = (frame->cs & 3) == 3;
-    bool exit_process = user_mode || !kernel_proc;
+    bool exit_process = user_mode; /* kernel-mode faults must not re-enter the scheduler */
 
     if (__atomic_exchange_n(&panic_active, 1, __ATOMIC_SEQ_CST)) {
         console_print_string("\n[PANIC] nested exception vector=");
@@ -277,6 +283,21 @@ void execption_handlerer(struct interrupt_frame *frame) {
         while (1) {
             __asm__ volatile ("cli; hlt");
         }
+    }
+
+    /* Keep the first kernel #GP visible on real hardware. The long dump and
+       sys_exit/schedule path can fault again and trigger a reset before a
+       photo can be taken. This path touches only the CPU-saved frame. */
+    if (exception_is_kernel_gp(frame)) {
+        __asm__ volatile("cli" ::: "memory");
+        console_print_string("\n[GP-HALT] Kernel #GP; halted for diagnosis\nRIP=");
+        console_print_hex(frame->rip);
+        console_print_string(" ERR="); console_print_hex(frame->error_code);
+        console_print_string(" CS="); console_print_hex(frame->cs);
+        console_print_string(" RSP="); console_print_hex(frame->rsp);
+        console_print_string(" CPU="); console_print_num(get_cpu_id());
+        console_print_string("\n");
+        for (;;) __asm__ volatile("cli; hlt");
     }
 
     uint64_t fs  = rdmsr(0xC0000100);
