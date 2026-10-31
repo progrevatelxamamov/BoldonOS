@@ -19,7 +19,9 @@ sudo dd if=main.img of=/dev/sdX bs=4M status=progress conv=fsync
 
 `main.img` наполняется из каталога `osdata/` (он в `.gitignore`, поэтому в
 репозитории его нет). Минимально там должны быть `bin/sh` и `etc/init.sh`,
-иначе ядро смонтирует `C:`, но shell не запустится.
+иначе даже при смонтированном `C:` shell не запустится. `C:` выбирается только
+из ext4-раздела GPT с именем `BOLDON_ROOT`; FAT32-раздел EFI на NVMe не может
+стать корнем вместо флешки.
 
 Подробная диагностика загрузки на реальном железе — в
 [docs/input-and-hotplug.md](docs/input-and-hotplug.md).
