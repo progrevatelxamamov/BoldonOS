@@ -30,7 +30,22 @@ static void init_no_root_hint(void) {
     console_print_string("============================================================\n\n");
 }
 
+typedef struct {
+    bool left_ctrl, right_ctrl;
+    bool left_shift, right_shift;
+} pty_modifiers_t;
+
+static void pty_update_modifiers(pty_modifiers_t *mod, uint8_t code, bool down) {
+    if (code == KEY_LCTRL) mod->left_ctrl = down;
+    if (code == KEY_RCTRL) mod->right_ctrl = down;
+    if (code == KEY_LSHIFT) mod->left_shift = down;
+    if (code == KEY_RSHIFT) mod->right_shift = down;
+}
+
 static void pty_input_task(void) {
+    /* Apply modifiers in event order. Reading g_keyboard.down here loses a
+       short Ctrl+C when Ctrl has already been released before this task runs. */
+    pty_modifiers_t mod = {0};
     while (1) {
         uint8_t code;
         bool down;
@@ -44,6 +59,7 @@ static void pty_input_task(void) {
            бесконечным, и задача не должна монополизировать CPU. */
         int budget = 64;
         while (budget-- > 0 && inout_console_pop_event(&code, &down)) {
+            pty_update_modifiers(&mod, code, down);
             int kbd_mode = pty_console_kbd_mode();
             if (kbd_mode == PTY_KBD_OFF) continue;
 
@@ -60,9 +76,9 @@ static void pty_input_task(void) {
                'code >= KEY_MAX' всегда ложна, она не нужна. */
             if (!down) continue;
 
-            bool shift = g_keyboard.shift_pressed;
+            bool shift = mod.left_shift || mod.right_shift;
             bool caps  = g_keyboard.caps_lock;
-            bool ctrl  = g_keyboard.down[KEY_RCTRL] || g_keyboard.down[KEY_LCTRL];
+            bool ctrl  = mod.left_ctrl || mod.right_ctrl;
 
             if (code == KEY_ENTER)          pty_feed_input('\n');
             else if (code == KEY_BACKSPACE) pty_feed_input('\b');
@@ -151,7 +167,19 @@ void launch_init_process(void) {
         console_print_string("\n");
     }
 
+    /* Keep the real root layout usable for programs that inspect /proc,
+       while /proc/partitions and /proc/mounts are served by devfs. */
     vfs_stat_t st;
+    if (vfs_stat("C:/proc", &st) != 0) {
+        int rc = vfs_mkdir("C:/proc", 0755);
+        if (rc != 0 && rc != -EEXIST) {
+            console_print_string("[INIT] cannot create C:/proc, error=");
+            console_print_num((uint64_t)(-rc));
+            console_print_string("\n");
+        }
+    }
+    console_print_string("[INIT] /proc/partitions: ");
+    console_print_string(vfs_stat("/proc/partitions", &st) == 0 ? "ready\n" : "missing\n");
     console_print_string("[INIT] C:/bin/sh: ");
     console_print_string(vfs_stat("C:/bin/sh", &st) == 0 ? "present\n" : "not found\n");
     console_print_string("[INIT] C:/etc/init.sh: ");

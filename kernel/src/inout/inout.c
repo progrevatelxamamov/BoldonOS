@@ -44,7 +44,7 @@ typedef struct {
 } mouse_motion_t;
 
 static mouse_motion_t move_q[MOVE_Q_SIZE];
-static volatile uint32_t move_qh = 0, move_qt = 0;
+static uint64_t move_seq = 0;
 static spinlock_t input_q_lock = SPINLOCK_INIT;
 
 #define MOUSE_MODE_PS2   0
@@ -62,6 +62,7 @@ typedef struct {
     uint8_t imps_seq;
     uint8_t imex_seq;
     uint8_t reporting;
+    uint64_t next_seq; /* independent reader position in the motion ring */
 } mouse_client_t;
 
 static mouse_client_t default_mouse_client;
@@ -118,48 +119,42 @@ static inline void irq_restore(uint64_t flags) {
     __asm__ volatile("pushq %0; popfq" :: "r"(flags) : "memory", "cc");
 }
 
-static inline uint32_t move_q_count(void) {
-    return (move_qh >= move_qt) ? (move_qh - move_qt)
-                                : (MOVE_Q_SIZE - move_qt + move_qh);
+/* Readers must not steal each other's packets: Nano-X and a diagnostic
+   cat/od can have /dev/mice and /dev/psaux open at the same time. */
+static bool motion_pending_locked(const mouse_client_t *c) {
+    return c->next_seq != move_seq;
 }
 
 static int motion_push(int dx, int dy, int dz, uint8_t buttons) {
-    if (dx >  127) dx =  127; else if (dx < -127) dx = -127;
-    if (dy >  127) dy =  127; else if (dy < -127) dy = -127;
-    if (dz >  127) dz =  127; else if (dz < -127) dz = -127;
+    if (dx > 127) dx = 127; else if (dx < -127) dx = -127;
+    if (dy > 127) dy = 127; else if (dy < -127) dy = -127;
+    if (dz > 127) dz = 127; else if (dz < -127) dz = -127;
 
     uint64_t flags;
     spin_lock_irqsave(&input_q_lock, &flags);
-    uint32_t next = (move_qh + 1) % MOVE_Q_SIZE;
-    if (next == move_qt) move_qt = (move_qt + 1) % MOVE_Q_SIZE;
-    move_q[move_qh].dx = (int8_t)dx;
-    move_q[move_qh].dy = (int8_t)dy;
-    move_q[move_qh].dz = (int8_t)dz;
-    move_q[move_qh].buttons = buttons & 0x07;
-    move_qh = (move_qh + 1) % MOVE_Q_SIZE;
+    move_q[move_seq % MOVE_Q_SIZE] = (mouse_motion_t){
+        (int8_t)dx, (int8_t)dy, (int8_t)dz, (uint8_t)(buttons & 0x07)
+    };
+    move_seq++;
     spin_unlock_irqrestore(&input_q_lock, flags);
     return 0;
 }
 
-static bool motion_pop_locked(mouse_motion_t *out) {
-    if (move_qh == move_qt) return false;
-    *out = move_q[move_qt];
-    move_qt = (move_qt + 1) % MOVE_Q_SIZE;
+/* Caller holds input_q_lock. Drop only the overwritten history of this reader. */
+static bool motion_pop_locked(mouse_client_t *c, mouse_motion_t *out) {
+    if (!motion_pending_locked(c)) return false;
+    if (move_seq - c->next_seq > MOVE_Q_SIZE)
+        c->next_seq = move_seq - MOVE_Q_SIZE;
+    *out = move_q[c->next_seq % MOVE_Q_SIZE];
+    c->next_seq++;
     return true;
-}
-
-static bool motion_pop(mouse_motion_t *out) {
-    uint64_t flags;
-    spin_lock_irqsave(&input_q_lock, &flags);
-    bool ok = motion_pop_locked(out);
-    spin_unlock_irqrestore(&input_q_lock, flags);
-    return ok;
 }
 
 static void input_stream_reset(void) {
     uint64_t flags;
     spin_lock_irqsave(&input_q_lock, &flags);
-    move_qh = move_qt = 0;
+    move_seq = 0;
+    memset(&default_mouse_client, 0, sizeof(default_mouse_client));
     spin_unlock_irqrestore(&input_q_lock, flags);
 
     spin_lock_irqsave(&kbd_state_lock, &flags);
@@ -293,7 +288,7 @@ static void mouse_response(mouse_client_t *c, uint8_t cmd) {
         break;
     case 0xEB: {
         mouse_motion_t m = {0};
-        if (!motion_pop_locked(&m)) {
+        if (!motion_pop_locked(c, &m)) {
             c->pkt[0] = 0x08;
             c->pkt[1] = 0;
             c->pkt[2] = 0;
@@ -352,16 +347,16 @@ static int mouse_dev_read(vfs_file_t *f, void *buf, uint64_t count, uint32_t fla
 
         if (got > 0) return (int)got;
 
+        spin_lock_irqsave(&input_q_lock, &lf);
         mouse_motion_t m;
-        if (move_q_count() > 0 && motion_pop(&m)) {
-            spin_lock_irqsave(&input_q_lock, &lf);
+        if (motion_pop_locked(c, &m)) {
             mouse_encode_packet(c, &m);
             while (got < count && c->pkt_pos < c->pkt_len)
                 out[got++] = c->pkt[c->pkt_pos++];
             if (c->pkt_pos >= c->pkt_len) c->pkt_len = c->pkt_pos = 0;
-            spin_unlock_irqrestore(&input_q_lock, lf);
-            if (got > 0) return (int)got;
         }
+        spin_unlock_irqrestore(&input_q_lock, lf);
+        if (got > 0) return (int)got;
 
         if (flags & VFS_O_NONBLOCK) return -EAGAIN;
         schedule_yield();
@@ -390,6 +385,10 @@ static int mouse_open(vfs_file_t *f) {
     if (!c) return -ENOMEM;
     memset(c, 0, sizeof(*c));
     c->reporting = 1;
+    uint64_t lf;
+    spin_lock_irqsave(&input_q_lock, &lf);
+    c->next_seq = move_seq;
+    spin_unlock_irqrestore(&input_q_lock, lf);
     f->private_data = c;
     return 0;
 }
@@ -748,7 +747,7 @@ uint32_t input_poll_events(vfs_file_t *file, uint32_t events) {
             spin_lock_irqsave(&input_q_lock, &lf);
             bool ready = (c->resp_pos < c->resp_len) ||
                          (c->pkt_pos < c->pkt_len) ||
-                         (move_q_count() > 0);
+                         motion_pending_locked(c);
             spin_unlock_irqrestore(&input_q_lock, lf);
             if (ready) re |= POLLIN;
         } else {
