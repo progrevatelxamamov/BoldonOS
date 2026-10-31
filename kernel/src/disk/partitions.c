@@ -671,6 +671,14 @@ static bool partition_is_boot(struct partition *p) {
     return false;
 }
 
+/* C: is the OS root, not the EFI partition selected by boot_serial and not
+   the first filesystem on an internal drive. main.img names its GPT ext4
+   partition BOLDON_ROOT. Never use an arbitrary FAT32/ESP or ext4 as root. */
+static bool partition_is_root(const struct partition *part, const char *fs) {
+    return part && fs && strcmp(fs, "ext4") == 0 &&
+           strcmp(part->label, "BOLDON_ROOT") == 0;
+}
+
 void mount_all_partitions(void) {
     console_print_string("[DEBUG] Starting mount_all_partitions()...\n");
     vfs_init();
@@ -685,7 +693,7 @@ void mount_all_partitions(void) {
         const char *dev;
         uint64_t lba;
         struct partition *part;
-        bool is_boot;
+        bool is_root;
         const char *fs_type;
     } cand_t;
 
@@ -716,12 +724,12 @@ void mount_all_partitions(void) {
             console_print_string("] -> Start LBA: ");
             
             char lba_str[32];
-            snprintf(lba_str, sizeof(lba_str), "%llu", p->start_lba);
+            snprintf(lba_str, sizeof(lba_str), "%llu", (unsigned long long)p->start_lba);
             console_print_string(lba_str);
             console_print_string(", Sectors: ");
             
             char cnt_str[32];
-            snprintf(cnt_str, sizeof(cnt_str), "%llu", p->sector_count);
+            snprintf(cnt_str, sizeof(cnt_str), "%llu", (unsigned long long)p->sector_count);
             console_print_string(cnt_str);
             console_print_string("\n");
 
@@ -758,7 +766,9 @@ void mount_all_partitions(void) {
                 cands[cand_count].dev = pt->block_device_name;
                 cands[cand_count].lba = p->start_lba;
                 cands[cand_count].part = p;
-                cands[cand_count].is_boot = partition_is_boot(p);
+                cands[cand_count].is_root = partition_is_root(p, fst);
+                if (partition_is_boot(p))
+                    console_print_string("[ROOT] boot_serial identifies boot partition, not C:\n");
                 cands[cand_count].fs_type = fst;
                 cand_count++;
             }
@@ -771,76 +781,34 @@ void mount_all_partitions(void) {
     snprintf(cand_str, sizeof(cand_str), "[DEBUG] Total valid candidates found: %d\n", cand_count);
     console_print_string(cand_str);
 
-    // Этап 1: Попытка примонтировать Boot-раздел
-    console_print_string("[DEBUG] Phase 1: Mounting boot partition...\n");
+    /* An early scan may only see the NVMe ESP; leave C: free for the USB root
+       that can appear later through hotplug. A failed ext4 mount is retryable. */
+    console_print_string("[ROOT] searching for ext4 BOLDON_ROOT...\n");
     for (int i = 0; i < cand_count; i++) {
-        if (!cands[i].is_boot) continue;
-
-        console_print_string("[DEBUG] Trying boot cand: ");
-        console_print_string(cands[i].fs_type);
-        console_print_string(" on ");
-        console_print_string(cands[i].dev);
-        console_print_string("\n");
-
-        int res = vfs_mount_fs(cands[i].fs_type, cands[i].dev, 'C', (void *)cands[i].lba);
+        if (!cands[i].is_root) continue;
+        int res = vfs_mount_fs("ext4", cands[i].dev, 'C', (void *)cands[i].lba);
         if (res == 0) {
             vfs_set_boot_drive('C');
             c_mounted = true;
             boot_cand_idx = i;
-            console_print_string("[DEBUG] Success mounting C: (Boot flag candidate)\n");
+            console_print_string("[ROOT] C: mounted from ");
+            console_print_string(cands[i].dev);
+            console_print_string(" (ext4 BOLDON_ROOT)\n");
             break;
-        } else {
-            char err_str[32];
-            snprintf(err_str, sizeof(err_str), "[DEBUG] Fail code: %d\n", res);
-            console_print_string(err_str);
         }
+        console_print_string("[ROOT] mount failed, will retry via hotplug: ");
+        console_print_string(cands[i].dev);
+        console_print_string(" code=");
+        console_print_num((uint64_t)(-res));
+        console_print_string("\n");
     }
-
-    // Этап 2: Если с флагом boot не нашлось, ищем любой ext4
-    if (!c_mounted) {
-        console_print_string("[DEBUG] Phase 2: No boot flag found. Looking for any EXT4 partition...\n");
-        for (int i = 0; i < cand_count; i++) {
-            if (strcmp(cands[i].fs_type, "ext4") == 0) {
-                console_print_string("[DEBUG] Trying EXT4 cand on ");
-                console_print_string(cands[i].dev);
-                console_print_string("\n");
-
-                int res = vfs_mount_fs("ext4", cands[i].dev, 'C', (void *)cands[i].lba);
-                if (res == 0) {
-                    vfs_set_boot_drive('C');
-                    c_mounted = true;
-                    boot_cand_idx = i;
-                    console_print_string("[DEBUG] Success mounting C: (Fallback to first EXT4)\n");
-                    break;
-                } else {
-                    char err_str[32];
-                    snprintf(err_str, sizeof(err_str), "[DEBUG] Fail code: %d\n", res);
-                    console_print_string(err_str);
-                }
-            }
-        }
-    }
-
-    // Этап 3: Если всё ещё глухо, берем самый первый попавшийся
-    if (!c_mounted && cand_count > 0) {
-        console_print_string("[DEBUG] Phase 3: Absolute fallback. Trying candidate index 0...\n");
-        int res = vfs_mount_fs(cands[0].fs_type, cands[0].dev, 'C', (void *)cands[0].lba);
-        if (res == 0) {
-            vfs_set_boot_drive('C');
-            c_mounted = true;
-            boot_cand_idx = 0;
-            console_print_string("[DEBUG] Success mounting C: (Candidate 0)\n");
-        } else {
-            char err_str[32];
-            snprintf(err_str, sizeof(err_str), "[DEBUG] Absolute fail code: %d\n", res);
-            console_print_string(err_str);
-        }
-    }
+    if (!c_mounted)
+        console_print_string("[ROOT] BOLDON_ROOT not available yet; C: unmounted\n");
 
     // Этап 4: Монтируем всё остальное как D:, E: и т.д.
     console_print_string("[DEBUG] Phase 4: Mounting secondary partitions...\n");
     for (int i = 0; i < cand_count; i++) {
-        if (i == boot_cand_idx) continue;
+        if (i == boot_cand_idx || (!c_mounted && cands[i].is_root)) continue;
 
         if (next_letter > 'Z') {
             console_print_string("[DEBUG] Out of drive letters (Z reached)!\n");
@@ -939,31 +907,26 @@ int partitions_try_mount_root(const char *dev) {
     if (__sync_lock_test_and_set(&root_mount_guard, 1)) return -1;
 
     int result = -2;
-    for (int pass = 0; pass < 3 && result != 0; pass++) {
-        for (uint64_t ti = 0; ti < part_tables_count && result != 0; ti++) {
-            struct partition_table *pt = part_tables[ti];
-            if (!pt || !pt->block_device_name) continue;
-            if (dev && dev[0] && strcmp(pt->block_device_name, dev) != 0) continue;
-            for (uint32_t pi = 0; pi < pt->count; pi++) {
-                struct partition *p = &pt->parts[pi];
-                if (p->sector_count == 0) continue;
-                if (pass == 0 && !partition_is_boot(p)) continue;
-                if (root_partition_mounted(pt->block_device_name, p->start_lba)) continue;
-                const char *fs = partitions_detect_fs(pt->block_device_name, p->start_lba);
-                if (!fs) continue;
-                if (pass == 1 && strcmp(fs, "ext4") != 0) continue;
-                if (vfs_mount_fs(fs, pt->block_device_name, 'C', (void *)p->start_lba) == 0) {
-                    vfs_set_boot_drive('C');
-                    console_print_string("[ROOT] C: mounted from ");
-                    console_print_string(pt->block_device_name);
-                    console_print_string(" partition ");
-                    console_print_num(pi + 1);
-                    console_print_string(" (");
-                    console_print_string(fs);
-                    console_print_string(")\n");
-                    result = 0;
-                    break;
-                }
+    for (uint64_t ti = 0; ti < part_tables_count && result != 0; ti++) {
+        struct partition_table *pt = part_tables[ti];
+        if (!pt || !pt->block_device_name) continue;
+        if (dev && dev[0] && strcmp(pt->block_device_name, dev) != 0) continue;
+        for (uint32_t pi = 0; pi < pt->count; pi++) {
+            struct partition *p = &pt->parts[pi];
+            if (p->sector_count == 0) continue;
+            const char *fs = partitions_detect_fs(pt->block_device_name, p->start_lba);
+            if (!partition_is_root(p, fs)) continue;
+            if (root_partition_mounted(pt->block_device_name, p->start_lba)) continue;
+            if (vfs_mount_fs("ext4", pt->block_device_name, 'C',
+                             (void *)p->start_lba) == 0) {
+                vfs_set_boot_drive('C');
+                console_print_string("[ROOT] C: mounted from ");
+                console_print_string(pt->block_device_name);
+                console_print_string(" partition ");
+                console_print_num(pi + 1);
+                console_print_string(" (ext4 BOLDON_ROOT)\n");
+                result = 0;
+                break;
             }
         }
     }

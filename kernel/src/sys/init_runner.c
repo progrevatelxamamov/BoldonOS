@@ -23,7 +23,7 @@ static void init_no_root_hint(void) {
     console_print_string("[INIT] block devices: ");
     console_print_num(partitions_block_device_count());
     console_print_string("\n");
-    console_print_string("[INIT] expected /bin/sh and /etc/init.sh on C: (ext4 or FAT32)\n");
+    console_print_string("[INIT] expected ext4 BOLDON_ROOT on C: with /bin/sh and /etc/init.sh\n");
     console_print_string("[INIT] check main.img is written to USB, osdata/ is not empty,\n");
     console_print_string("[INIT] and the kernel was rebuilt (make check-image)\n");
     console_print_string("[INIT] waiting for a disk, hotplug will retry automatically\n");

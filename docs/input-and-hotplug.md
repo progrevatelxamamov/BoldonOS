@@ -168,9 +168,9 @@ lwext4 в дереве использует один общий mount point `/`,
 ## Загрузка до shell на реальном ПК
 
 Симптом: экран доходит до `[MOUNT] Boot Drive C: NOT MOUNTED (FAIL)` и
-`[INIT] Failed to start shell`, после чего «зависает». Это не зависание ядра —
-ядро работает, но не нашло корневую файловую систему, поэтому некому запустить
-`/bin/sh`.
+`[INIT] root filesystem C: is still not mounted`, после чего ждёт диск. Это
+не зависание ядра: пока ext4-раздел `BOLDON_ROOT` не обнаружен, init не
+запускает `/bin/sh`.
 
 Причины и что делать по порядку.
 
@@ -215,12 +215,14 @@ sudo dd if=main.img of=/dev/sdX bs=4M status=progress conv=fsync
 ISO9660/защитный MBR, не находит ни FAT32, ни ext4 и печатает
 `[DEBUG] Total valid candidates found: 0`.
 
-`limine.conf` содержит `boot_serial=D291F02E-...` — это GUID раздела из
-исходного `main.img`. При пересоздании образа `sgdisk` генерирует новые GUID,
-поэтому совпадения не будет; это не критично, потому что
-`mount_all_partitions()` и `partitions_try_mount_root()` имеют запасные сценарии
-(любой ext4, затем любой найденный раздел). Если разделов ext4 несколько,
-обновите GUID командой `sgdisk -i 3 main.img`.
+`limine.conf` содержит `boot_serial=D291F02E-...` — GUID загрузочного раздела
+исходного образа; он **не задаёт корень `C:`**. Теперь оба пути поиска корня
+выбирают только ext4-раздел с GPT-именем `BOLDON_ROOT`, которое создаёт
+`make usb-image`. Нельзя использовать первый попавшийся FAT32 (например, EFI
+на NVMe) или чужой ext4 в качестве `C:`. Если флешка ещё не видна, `C:` остаётся
+пустым до её подключения, а init ждёт корень. Для другого GPT-образа назовите
+его корневой ext4-раздел `BOLDON_ROOT` (имя GPT, не только метка ФС). Образы
+без GPT-раздела с этим именем намеренно не выбираются автоматически.
 
 ### 3. Новые диагностические маркеры
 
@@ -248,7 +250,8 @@ ISO9660/защитный MBR, не находит ни FAT32, ни ext4 и пе�
 | `[MSD] SCSI INQUIRY failed` | флешка есть, но SCSI-команды не проходят |
 | `[DISK] usb0 partitions=0` | диск виден, но таблица разделов не читается |
 | `[INIT] root filesystem C: is still not mounted` | ждём диск; hotplug повторяет попытку каждые 2 с |
-| `[INIT] C: is mounted but /bin/sh or /etc/init.sh is missing` | диск смонтирован, но `osdata/` пуст |
+| `[ROOT] BOLDON_ROOT not available yet; C: unmounted` | корень не найден; NVMe ESP не подменяет `C:` |
+| `[INIT] Failed to start shell` | `C:` смонтирован, но `execve` вернул ошибку; смотрите `errno` и наличие `/bin/sh` |
 
 ### 4. Если диски всё ещё не видны
 
