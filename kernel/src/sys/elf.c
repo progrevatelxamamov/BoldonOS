@@ -483,6 +483,8 @@ int sys_execve(const char *pathname, char *const argv[], char *const envp[])
     
     wrmsr(IA32_FS_BASE, 0);
 
+    _Static_assert((USER_DATA | 3) == 0x1B && (USER_CODE | 3) == 0x23,
+                   "update the IRETQ selector immediates when changing the GDT");
     uint64_t user_ds = USER_DATA | 3;
     uint64_t user_cs = USER_CODE | 3;
     uint64_t target_entry = has_interp ? interp_entry : entry_point;
@@ -508,11 +510,15 @@ int sys_execve(const char *pathname, char *const argv[], char *const envp[])
     wrmsr(IA32_GS_BASE, 0);
     wrmsr(IA32_KERNEL_GS_BASE, (uint64_t)get_current_local_data());
 
+    /* Distinguish this image from older boots which pushed SS=0x18. */
+    console_print_string("[EXEC] IRET target SS=0x1B\n");
     __asm__ volatile (
         "cli\n\t"
         "mov %0, %%ds\n\t"
         "mov %0, %%es\n\t"
-        "pushq %0\n\t"
+        /* IRETQ into CPL3 needs SS with RPL=3, not bare USER_DATA (0x18).
+           Use an immediate so the final image can be checked in objdump. */
+        "pushq $0x1B\n\t"
         "pushq %1\n\t"
         "pushq $0x202\n\t"
         "pushq %2\n\t"
