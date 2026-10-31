@@ -5,8 +5,9 @@ SS 0x18** (not 0x1B), with error code 0x18. CS has RPL=3 but SS has RPL=0;
 IRETQ cannot return to CPL3 with that SS. The displayed *fault handler*'s
 CS 0x08 and SS 0x10 are both CPL0 and belong to a different frame. The GDT
 entry at 0x18 may have DPL=3, but the selector itself must still have RPL=3
-(`0x1B`). Do not confuse the error-code selector index (0x18) with a valid
-user SS selector.
+(`0x1B`). The #GP error code `0x18` encodes the GDT index without selector
+RPL bits, so it can be reported for either SS=0x18 or SS=0x1B. It does not
+prove which full selector the CPU attempted to load.
 
 The current source had already specified `USER_DATA | 3` for `sys_execve` and
 the compiled object pushed 0x1B. We now encode the initial SS push explicitly
@@ -14,8 +15,15 @@ as `pushq $0x1B` and verify that immediate in the built object. A boot marker
 `[EXEC] IRET target SS=0x1B` helps distinguish a newly built image from an old
 kernel/ISO. If the marker appears but the rejected frame still has SS=0x18,
 the cause is elsewhere (a different IRET path or frame corruption); record the
-full new photo before changing the GDT. This is **not** yet a confirmed fix on
-the old PC.
+full new photo before changing the GDT. The follow-up photo has that boot
+marker, but the rejected frame's SS still appears to be 0x18 (the blurred
+photo does not resolve the last digit conclusively), with #GP(0x18) on CPU 2.
+The marker only proves that the new code reached the logging call, **not** the
+value present in the stack frame at IRETQ. The IRET diagnostic now compares the
+process address space with the actual CR3 loaded on the failing CPU, and reads
+both its active SS stack slot and fault descriptor. A fresh boot photo showing
+those lines is needed before attributing this to a stale image, changed stack,
+wrong page table, GDT, or SMP.
 
 The GDT definitions previously specified D/B=0 for both kernel and user data.
 They now use the conventional flat data/stack encoding with D/B=1, L=0 and
