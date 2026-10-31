@@ -34,7 +34,7 @@ run_c('''
 #define MOUSE_MODE_EXPS 2
 typedef struct { int8_t dx, dy, dz; uint8_t buttons; } mouse_motion_t;
 ''' + client + '''
-static bool motion_pop_locked(mouse_motion_t *m) { (void)m; return false; }
+static bool motion_pop_locked(mouse_client_t *c, mouse_motion_t *m) { (void)c; (void)m; return false; }
 static void mouse_encode_packet(mouse_client_t *c, const mouse_motion_t *m) {
     (void)c; (void)m;
 }
