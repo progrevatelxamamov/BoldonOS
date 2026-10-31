@@ -373,6 +373,16 @@ static void release_prev_held(int cpu, thread_t *except) {
     if (prev->state == TASK_RUNNING) prev->state = TASK_WAITING;
 }
 
+/* A saved user data selector may have lost its RPL bits (0x18 instead of
+   0x1B). IRETQ then faults with #GP(0x18). Never touch kernel return frames
+   or selectors for other GDT entries. */
+static bool scheduler_repair_user_ss(struct interrupt_frame *frame) {
+    if (!frame || frame->cs != (USER_CODE | 3) || frame->ss != USER_DATA)
+        return false;
+    frame->ss = USER_DATA | 3;
+    return true;
+}
+
 void schedule(struct interrupt_frame *frame) {
     if (!frame || !scheduler_ready) return;
 
@@ -518,6 +528,14 @@ void schedule(struct interrupt_frame *frame) {
     }
 
     *frame = *restore;
+    if (!proc->is_kernel_process && scheduler_repair_user_ss(frame)) {
+        /* Keep the saved frame consistent so later reschedules do not repeat
+           the invalid selector; report it once for hardware confirmation. */
+        restore->ss = frame->ss;
+        if (thr->regs && thr->regs->cs == (USER_CODE | 3) && thr->regs->ss == USER_DATA)
+            thr->regs->ss = USER_DATA | 3;
+        console_print_string("[SCHED] repaired user SS 0x18 -> 0x1B\n");
+    }
     if (restore_syscall) {
         thr->syscall_frame->rip = 0;
     }
