@@ -119,7 +119,7 @@ static void test_hid(int protocol) {
     if (protocol == 1) assert(!keys[KEY_LSHIFT] && !keys[KEY_A]);
     else assert(button_changes == 2);
 }
-static void test_report_mouse(void) {
+static void test_report_mouse(bool nonboot) {
     static const uint8_t descriptor[] = {
         5,1,9,2,0xA1,1,9,1,0xA1,0,5,9,0x19,1,0x29,3,0x15,0,0x25,1,
         0x95,3,0x75,1,0x81,2,0x95,1,0x75,5,0x81,1,5,1,9,0x30,9,0x31,
@@ -130,11 +130,12 @@ static void test_report_mouse(void) {
         .destroy_intr_queue = destroy_queue, .poll_intr_queue = poll_queue};
     uint8_t config[] = {9,2,27,0,1,1,0,0x80,50, 9,4,0,0,1,3,1,2,0,
         9,0x21,0x11,1,0,1,0x22,sizeof(descriptor),0};
+    if (nonboot) { config[15] = 0; config[16] = 0; protocol_value = 123; }
     device_descriptor_t dd = {0};
     usbdev_t dev = {.controller = &hc, .configuration = (void *)config, .descriptor = &dd, .num_endp = 2};
     dev.endpoints[1] = (endpoint_t){.dev = &dev, .type = INTERRUPT, .direction = IN, .maxpacketsize = 8};
     usb_hid_init(&dev);
-    assert(dev.data && protocol_value == 1);
+    assert(dev.data && protocol_value == (nonboot ? 123u : 1u));
     memset(packet, 0, sizeof(packet));
     packet[1] = (uint8_t)-2; packet[2] = 5; packet[3] = 1;
     packet_ready = true; dev.poll(&dev);
@@ -168,8 +169,9 @@ int main(void) {
     test_hid(1);
     test_hid(2);
     assert(queue_destroyed == 2);
-    test_report_mouse();
-    assert(queue_destroyed == 3);
+    test_report_mouse(false);
+    test_report_mouse(true);
+    assert(queue_destroyed == 4);
     test_disk();
     puts("libpayload HID, idle, LEDs, disconnect and block lifetime tests passed");
     return 0;

@@ -1291,7 +1291,7 @@ static void hid_parse_report_descriptor(struct usb_hid *hid, const uint8_t *desc
                     field.present = state.report_size != 0;
                     field.relative = is_relative;
 
-                    if (tag == 8 && hid->protocol == 2 && is_variable && have_usage) {
+                    if (tag == 8 && is_variable && have_usage) {
                         bool report_match = !mouse_id_known || report_id == mouse_id;
                         if (report_match && field_page == 0x09 && idx == 0 && usage == 1) {
                             if (!mouse_id_known) {
@@ -1314,7 +1314,7 @@ static void hid_parse_report_descriptor(struct usb_hid *hid, const uint8_t *desc
                         }
                     }
 
-                    if (tag == 8 && hid->protocol == 1 && have_usage && field_page == 0x07) {
+                    if (tag == 8 && have_usage && field_page == 0x07) {
                         if (is_variable && state.report_size == 1 && usage >= 0xE0 && usage <= 0xE7) {
                             if (!kbd_modifiers.present) {
                                 kbd_modifiers = field;
@@ -1327,7 +1327,7 @@ static void hid_parse_report_descriptor(struct usb_hid *hid, const uint8_t *desc
                         }
                     }
 
-                    if (tag == 9 && hid->protocol == 1 && is_variable && have_usage && field_page == 0x08) {
+                    if (tag == 9 && is_variable && have_usage && field_page == 0x08) {
                         if (!led_id_known) {
                             led_id = (uint8_t)report_id;
                             led_id_known = true;
@@ -1878,8 +1878,10 @@ static void init_usb_hid(xhci_controller_t *hc, uint8_t slot_id, uint8_t speed,
     } else if (protocol == 2) {
         hid->protocol = 2;
     } else {
-        if (mps >= 8) hid->protocol = 1;
-        else          hid->protocol = 2;
+        /* Non-boot HID protocol 0 cannot be classified by endpoint packet
+           size: many mice have 8- or 64-byte interrupt endpoints. Classify
+           using the report descriptor instead. */
+        hid->protocol = 0;
     }
 
     hid->ring_phys = (uint64_t)xhci_dma_alloc_pages(1);
@@ -1946,6 +1948,19 @@ static void init_usb_hid(xhci_controller_t *hc, uint8_t slot_id, uint8_t speed,
         }
     }
 
+    if (hid->protocol == 0) {
+        if (hid->mouse_layout_valid) hid->protocol = 2;
+        else if (hid->kbd_layout_valid) hid->protocol = 1;
+        else {
+            /* Protocol zero is not boot HID; packet size is not a safe
+               fallback when the descriptor is missing or unsupported. */
+            pmm_free_pages((void *)hid->report_phys, 1);
+            pmm_free_pages((void *)hid->ring_phys, 1);
+            malloc_free(hid);
+            return;
+        }
+    }
+
     if (hid->protocol == 2 && hid->mouse_layout_valid) {
         uint32_t needed = (uint32_t)((hid->mouse_report_bits + 7) / 8) + (hid->mouse_report_id ? 1 : 0);
         if (needed > hid->report_size && needed <= 64)
@@ -1966,12 +1981,16 @@ static void init_usb_hid(xhci_controller_t *hc, uint8_t slot_id, uint8_t speed,
     sp.wIndex = iface_num;
     sp.wLength = 0;
 
-    int pret = xhci_control_transfer(hc, slot_id,
+    /* SET_PROTOCOL is defined only for boot-subclass HID interfaces. A
+       report-only mouse may STALL this request on EP0. */
+    int pret = protocol == 0 ? -1 : xhci_control_transfer(hc, slot_id,
                           hc->ep0_ring[slot_id],
                           &hc->ep0_enqueue[slot_id],
                           &hc->ep0_cycle[slot_id],
                           &sp, 0, 0);
-    if (desired_protocol == 1) {
+    if (protocol == 0) {
+        hid->report_protocol_active = true;
+    } else if (desired_protocol == 1) {
         hid->report_protocol_active = pret == 0;
         if (pret != 0) {
             sp.wValue = 0;
@@ -2086,7 +2105,7 @@ static void xhci_hotplug_task(void *arg) {
 
     for (;;) {
         if (hc->command_failed) {
-            schedule_yield_safe();
+            task_sleep_ms(50);
             continue;
         }
         if (hc->port_change_head != hc->port_change_tail) {
@@ -2101,7 +2120,7 @@ static void xhci_hotplug_task(void *arg) {
             last_rescan = now;
             xhci_rescan_ports(hc);
         }
-        schedule_yield_safe();
+        task_sleep_ms(5);
     }
 }
 
@@ -2109,7 +2128,7 @@ static void xhci_pool_task(void *arg) {
     xhci_controller_t *hc = (xhci_controller_t *)arg;
     for (;;) {
         xhci_poll(hc);
-        schedule_yield_safe();
+        task_sleep_ms(2);
     }
 }
 
@@ -2168,7 +2187,7 @@ void parse_and_configure_device(xhci_controller_t *hc, uint8_t slot_id, uint8_t 
     set_cfg.wLength = 0;
     xhci_control_transfer(hc, slot_id, hc->ep0_ring[slot_id], &hc->ep0_enqueue[slot_id], &hc->ep0_cycle[slot_id], &set_cfg, 0, 0);
 
-    uint8_t  cur_iface_class = 0, cur_iface_sub = 0, cur_iface_proto = 0, cur_iface_num = 0;
+    uint8_t  cur_iface_class = 0, cur_iface_proto = 0, cur_iface_num = 0;
 
     // Переменные для MSD и HID
     uint8_t  is_msd = 0, is_hid = 0;
@@ -2216,7 +2235,6 @@ void parse_and_configure_device(xhci_controller_t *hc, uint8_t slot_id, uint8_t 
 
             struct usb_interface_descriptor *id = (struct usb_interface_descriptor *)&buffer[offset];
             cur_iface_class = id->bInterfaceClass;
-            cur_iface_sub   = id->bInterfaceSubClass;
             cur_iface_proto = id->bInterfaceProtocol;
             cur_iface_num   = id->bInterfaceNumber;
 

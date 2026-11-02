@@ -750,7 +750,7 @@ static void hotplug_task(void) {
             auto_mount_known_partitions();
             media_scanned = true;
         }
-        schedule_yield();
+        task_sleep_ms(20);
     }
 }
 

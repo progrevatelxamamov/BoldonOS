@@ -59,6 +59,7 @@ typedef struct process {
     uint64_t sigpending;
     uint64_t alarm_deadline_ms;
     uint64_t alarm_interval_ms;
+    uint64_t sleep_deadline_ms; /* 0 means indefinite sleep */
     char cwd[256];
     void *sigactions[64];
     int exit_code;
@@ -135,6 +136,9 @@ process_t* create_task_user(void *addr, page_table_t *pml4, void *stack, uint64_
 void task_free(process_t *proc);
 void schedule_yield(void);
 void task_sleep(process_t *proc);
+/* Block the current single-thread kernel worker until a timer tick reaches
+   the deadline. Unlike schedule_yield(), this lets the CPU enter idle/hlt. */
+void task_sleep_ms(uint64_t ms);
 void task_wake(process_t *proc);
 void task_sleep_thread(thread_t *t);
 void task_wake_thread(thread_t *t);

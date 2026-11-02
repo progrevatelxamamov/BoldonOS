@@ -13,6 +13,7 @@
 #include <memory.h>
 #include <io.h>
 #include <cpu/smp.h>
+#include <cpu/time.h>
 
 #define MAX_TASKS   512
 #define MAX_THREADS 256
@@ -324,16 +325,33 @@ void task_sleep(process_t *proc) {
     if (!proc) return;
     uint64_t flags;
     spin_lock_irqsave(&sched_lock, &flags);
+    proc->sleep_deadline_ms = 0;
     proc->state = TASK_SLEEPING;
     for (int i = 0; i < MAX_THREADS; i++)
         if (proc->threads[i]) proc->threads[i]->state = TASK_SLEEPING;
     spin_unlock_irqrestore(&sched_lock, flags);
 }
 
+void task_sleep_ms(uint64_t ms) {
+    process_t *proc = get_current_process();
+    thread_t *thread = get_current_thread();
+    if (!proc || !thread || !proc->is_kernel_process || proc == tasks[0]) return;
+    if (ms == 0) { schedule_yield(); return; }
+    uint64_t flags;
+    spin_lock_irqsave(&sched_lock, &flags);
+    uint64_t now = get_monotonic_ms();
+    proc->sleep_deadline_ms = now + ms;
+    proc->state = TASK_SLEEPING;
+    thread->state = TASK_SLEEPING;
+    spin_unlock_irqrestore(&sched_lock, flags);
+    schedule_yield();
+}
+
 void task_wake(process_t *proc) {
     if (!proc) return;
     uint64_t flags;
     spin_lock_irqsave(&sched_lock, &flags);
+    proc->sleep_deadline_ms = 0;
     if (proc->state == TASK_SLEEPING) proc->state = TASK_WAITING;
     for (int i = 0; i < MAX_THREADS; i++) {
         if (proc->threads[i] && proc->threads[i]->state == TASK_SLEEPING)
@@ -475,6 +493,20 @@ void schedule(struct interrupt_frame *frame) {
             curr_thr->fs_base = rdmsr(IA32_FS_BASE);
             curr_thr->switch_held = true;
         }
+    }
+
+    /* Timed kernel workers remain unrunnable until the BSP timer advances;
+       periodic scheduler interrupts wake them even when every CPU is idle. */
+    uint64_t now_ms = get_monotonic_ms();
+    for (uint64_t i = 1; i < MAX_TASKS; i++) {
+        process_t *p = tasks[i];
+        if (!p || p->state != TASK_SLEEPING || !p->sleep_deadline_ms ||
+            (int64_t)(now_ms - p->sleep_deadline_ms) < 0) continue;
+        p->sleep_deadline_ms = 0;
+        p->state = TASK_WAITING;
+        for (int j = 0; j < MAX_THREADS; j++)
+            if (p->threads[j] && p->threads[j]->state == TASK_SLEEPING)
+                p->threads[j]->state = TASK_WAITING;
     }
 
     /* Signals are consumed at the scheduler boundary, including when a
