@@ -215,6 +215,16 @@ static void normalize_path_raw(const char *path, char *norm, size_t cap) {
         return;
     }
 
+    if (path[0] == '/' && path[1] == 's' && path[2] == 'y' && path[3] == 's' &&
+        (path[4] == '/' || path[4] == '\0')) {
+        /* Minimal block sysfs lives under devfs, alongside procfs. */
+        norm[0] = 'D'; norm[1] = ':';
+        size_t j = 2;
+        for (size_t i = 0; path[i] && j < cap - 1; i++) norm[j++] = path[i];
+        norm[j] = 0;
+        return;
+    }
+
     if (path[0] == '/' && path[1] == 'd' && path[2] == 'e' && path[3] == 'v' &&
        (path[4] == '/' || path[4] == '\0')) {
         norm[0] = 'D';

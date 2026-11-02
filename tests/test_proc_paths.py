@@ -30,7 +30,7 @@ static char vfs_mountpoint_lookup(const char *p, uint32_t *len) {
     (void)p; *len = 0; return 0;
 }
 #define MAX_DEVFS_NODES 8
-typedef enum { VFS_TYPE_DIR, VFS_TYPE_FILE, VFS_TYPE_CHAR_DEV } vfs_node_type_t;
+typedef enum { VFS_TYPE_DIR, VFS_TYPE_FILE, VFS_TYPE_CHAR_DEV, VFS_TYPE_SYMLINK } vfs_node_type_t;
 typedef struct vfs_node vfs_node_t;
 typedef struct { int unused; } vfs_node_ops_t;
 typedef struct { int unused; } vfs_file_ops_t;
@@ -43,6 +43,8 @@ typedef struct { vfs_node_t *node; uint64_t offset; } vfs_file_t;
 typedef struct { char name[256]; uint64_t inode_num, size; vfs_node_type_t type; } vfs_dirent_t;
 typedef struct { char name[64]; vfs_node_t node; bool used; } devfs_node_entry_t;
 static devfs_node_entry_t dev_nodes[MAX_DEVFS_NODES];
+#define MAX_DEVFS_DIRS 16
+static struct { char prefix[64]; vfs_node_t node; } dev_dirs[MAX_DEVFS_DIRS];
 '''
 suffix = r'''
 static void check(const char *path, const char *expected) {
@@ -56,6 +58,8 @@ int main(void) {
     check("/proc/partitions", "D:/proc/partitions");
     check("/proc/mounts", "D:/proc/mounts");
     check("/proc/self/mountinfo", "D:/proc/mountinfo");
+    check("/sys/block/sda/dev", "D:/sys/block/sda/dev");
+    check("/sys/dev/block/8:1", "D:/sys/dev/block/8:1");
     check("/dev", "D:/");
     check("/dev/null", "D:/null");
     check("proc", "D:/proc");
@@ -79,6 +83,12 @@ int main(void) {
     dev_nodes[2].used = true;
     strcpy(dev_nodes[2].name, "null");
     dev_nodes[2].node.type = VFS_TYPE_CHAR_DEV;
+    dev_nodes[3].used = true;
+    strcpy(dev_nodes[3].name, "sys/block/sda/dev");
+    dev_nodes[3].node.type = VFS_TYPE_FILE;
+    dev_nodes[4].used = true;
+    strcpy(dev_nodes[4].name, "sys/dev/block/8:1");
+    dev_nodes[4].node.type = VFS_TYPE_SYMLINK;
     vfs_node_t *dir = devfs_vfs_lookup(&root, "proc");
     assert(dir && dir->type == VFS_TYPE_DIR);
     assert(devfs_vfs_lookup(dir, "partitions") == &dev_nodes[0].node);
@@ -93,6 +103,24 @@ int main(void) {
     file.node = &root; file.offset = 0;
     assert(devfs_vfs_readdir(&file, &ent) == 0);
     assert(strcmp(ent.name, "proc") == 0);
+    vfs_node_t *sys = devfs_vfs_lookup(&root, "sys");
+    vfs_node_t *block = devfs_vfs_lookup(sys, "block");
+    vfs_node_t *disk = devfs_vfs_lookup(block, "sda");
+    assert(sys && block && disk && disk->type == VFS_TYPE_DIR);
+    file.node = sys; file.offset = 0;
+    assert(devfs_vfs_readdir(&file, &ent) == 0);
+    assert(strcmp(ent.name, "block") == 0);
+    assert(devfs_vfs_readdir(&file, &ent) == 0);
+    assert(strcmp(ent.name, "dev") == 0);
+    assert(devfs_vfs_lookup(disk, "dev") == &dev_nodes[3].node);
+    file.node = disk; file.offset = 0;
+    assert(devfs_vfs_readdir(&file, &ent) == 0);
+    assert(strcmp(ent.name, "dev") == 0);
+    assert(devfs_vfs_readdir(&file, &ent) < 0);
+    vfs_node_t *dev = devfs_vfs_lookup(sys, "dev");
+    vfs_node_t *devblock = devfs_vfs_lookup(dev, "block");
+    assert(dev && devblock);
+    assert(devfs_vfs_lookup(devblock, "8:1") == &dev_nodes[4].node);
     return 0;
 }
 '''
