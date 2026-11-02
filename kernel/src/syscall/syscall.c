@@ -122,6 +122,7 @@ extern uint64_t sys_access_impl(uint64_t, uint64_t);
 extern uint64_t sys_setuid_impl(uint64_t);
 extern uint64_t sys_setgid_impl(uint64_t);
 extern uint64_t sys_pipe2_impl(uint64_t, uint64_t);
+extern uint64_t sys_splice_impl(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
 extern uint64_t sys_umask_impl(uint64_t);
 
 extern uint64_t sys_mkdir_impl(uint64_t, uint64_t);
@@ -297,6 +298,7 @@ uint64_t osdev_syscall_handler(uint64_t num,
     case 120: return sys_getresgid_impl(a1, a2, a3);
     case SYS_PIPE: return sys_pipe2_impl(a1, 0);
     case SYS_PIPE2: return sys_pipe2_impl(a1, a2);
+    case SYS_SPLICE: return sys_splice_impl(a1, a2, a3, a4, a5, a6);
 
     case SYS_SET_ROBUST_LIST: return 0;
     case 318:                 return sys_getrandom_impl(a1, a2, a3);

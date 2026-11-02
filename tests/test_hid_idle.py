@@ -26,7 +26,9 @@ typedef struct {
 ''' + structures + '''
 static jmp_buf finished;
 static struct usb_hid *active;
-static unsigned iterations, resets, mouse_reports;
+static unsigned iterations, resets, mouse_reports, hw_reports, mouse_polls;
+static void inout_note_usb_mouse_report(void) { hw_reports++; }
+static void inout_note_usb_mouse_poll(void) { mouse_polls++; }
 static uint32_t now;
 static uint64_t get_monotonic_ms(void) { return now; }
 static bool xhci_lock_timeout(volatile uint32_t *lock, uint32_t spins) {
@@ -109,7 +111,7 @@ int main(void) {
     hid.cycle = 1;
     active = &hid;
     if (setjmp(finished) == 0) usb_hid_task(&hid);
-    assert(iterations == 22);
+    assert(iterations == 22 && hw_reports == 1 && mouse_polls > 0);
     return 0;
 }
 '''

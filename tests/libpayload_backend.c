@@ -45,8 +45,11 @@ void inout_set_key_state(uint64_t code, bool down) {
     keys[code] = down;
 }
 void inout_keyboard_request_resync(void) {}
-static unsigned mouse_reports;
+static unsigned mouse_reports, mouse_polls;
+static int mouse_devices;
 void inout_note_usb_mouse_report(void) { mouse_reports++; }
+void inout_note_usb_mouse_poll(void) { mouse_polls++; }
+void inout_note_usb_mouse_device(int delta) { mouse_devices += delta; }
 void inout_add_event(inout_event_t ev) {
     assert(ev.type == INOUT_EVENT_MOUSE);
     if (ev.data.mouse.mouse_state == INOUT_MOUSE_MOVE) {
@@ -135,8 +138,11 @@ static void test_report_mouse(void) {
     memset(packet, 0, sizeof(packet));
     packet[1] = (uint8_t)-2; packet[2] = 5; packet[3] = 1;
     packet_ready = true; dev.poll(&dev);
-    assert(dx == -2 && dy == 5 && dz == 1 && mouse_reports > 0);
+    assert(dx == -2 && dy == 5 && dz == 1 && mouse_reports > 0 && mouse_polls > 0);
+    assert(mouse_devices == 1);
+    unsigned before_disconnect = mouse_reports;
     dev.destroy(&dev);
+    assert(mouse_devices == 0 && mouse_reports == before_disconnect);
     report_descriptor = NULL; report_length = 0;
 }
 static void test_disk(void) {

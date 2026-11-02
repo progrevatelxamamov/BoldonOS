@@ -7,6 +7,7 @@ void libpayload_usb_start(void);
 void libpayload_usb_ready(void);
 void libpayload_usb_set_leds(uint8_t leds);
 void *boldon_usb_input_create(int protocol, const uint8_t *descriptor, uint32_t length, int *report_mode);
+void boldon_usb_input_poll(void *context);
 void boldon_usb_input_report(void *context, const uint8_t *data, uint32_t length);
 void boldon_usb_input_protocol(void *context, int report_mode);
 void boldon_usb_input_destroy(void *context);
