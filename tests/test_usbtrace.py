@@ -5,7 +5,7 @@ import tempfile
 
 root = Path(__file__).resolve().parents[1]
 source = (root / 'kernel/src/inout/inout.c').read_text()
-trace = source[source.index('/* Enumeration transitions only'):source.index('typedef struct {\n    int8_t  dx;')]
+trace = source[source.index('/* Enumeration transitions only'):source.index('/* Raw samples and pre-clamp')]
 program = r'''
 #include <assert.h>
 #include <stdint.h>
