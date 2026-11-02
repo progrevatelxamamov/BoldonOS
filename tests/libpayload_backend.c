@@ -32,7 +32,8 @@ void inout_usb_trace(const char *stage, uint32_t a, uint32_t b, uint32_t c, uint
     if (!strcmp(stage, "lp.hid")) trace_hid++;
     if (!strcmp(stage, "lp.ready")) trace_ready++;
 }
-static uint8_t packet[8];
+static uint8_t packet[8], packet2[8];
+static bool packet2_ready;
 static bool packet_ready;
 static usbdev_t *disk_dev;
 static const uint8_t *report_descriptor;
@@ -93,18 +94,27 @@ static int control(usbdev_t *dev, direction_t dir, int sz, void *dr, int n, uint
 }
 static void *create_queue(endpoint_t *ep, int size, int count, int interval) {
     assert(ep->type == INTERRUPT && size == 8 && count == 4 && interval > 0);
+    if (ep->endpoint == 0x82) return packet2;
+    assert(ep->endpoint == 0x81);
     return packet;
 }
-static void destroy_queue(endpoint_t *ep, void *q) { (void)ep; assert(q == packet); queue_destroyed++; }
-static uint8_t *poll_queue(void *q) { assert(q == packet); if (!packet_ready) return NULL; packet_ready = false; return packet; }
+static void destroy_queue(endpoint_t *ep, void *q) {
+    assert(q == (ep->endpoint == 0x82 ? packet2 : packet)); queue_destroyed++;
+}
+static uint8_t *poll_queue(void *q) {
+    if (q == packet2) { if (!packet2_ready) return NULL; packet2_ready = false; return packet2; }
+    assert(q == packet);
+    if (!packet_ready) return NULL; packet_ready = false; return packet;
+}
 static void test_hid(int protocol) {
     hci_t hc = {.control = control, .create_intr_queue = create_queue,
         .destroy_intr_queue = destroy_queue, .poll_intr_queue = poll_queue};
-    uint8_t config[] = {9,2,18,0,1,1,0,0x80,50, 9,4,0,0,1,3,1,0,0};
+    uint8_t config[] = {9,2,25,0,1,1,0,0x80,50, 9,4,0,0,1,3,1,0,0,
+        7,5,0x81,3,8,0,10};
     config[16] = protocol;
     device_descriptor_t descriptor = {.idVendor = 1, .idProduct = 2};
     usbdev_t dev = {.controller = &hc, .configuration = (void *)config, .descriptor = &descriptor, .num_endp = 2};
-    dev.endpoints[1] = (endpoint_t){.dev = &dev, .type = INTERRUPT, .direction = IN, .maxpacketsize = 8};
+    dev.endpoints[1] = (endpoint_t){.dev = &dev, .type = INTERRUPT, .direction = IN, .endpoint = 0x81, .maxpacketsize = 8};
     usb_hid_init(&dev);
     assert(dev.data && dev.poll && dev.destroy);
     assert(protocol_value == 0 && idle_value == 0);
@@ -134,12 +144,12 @@ static void test_report_mouse(bool nonboot) {
     report_descriptor = descriptor; report_length = sizeof(descriptor);
     hci_t hc = {.control = control, .create_intr_queue = create_queue,
         .destroy_intr_queue = destroy_queue, .poll_intr_queue = poll_queue};
-    uint8_t config[] = {9,2,27,0,1,1,0,0x80,50, 9,4,0,0,1,3,1,2,0,
-        9,0x21,0x11,1,0,1,0x22,sizeof(descriptor),0};
+    uint8_t config[] = {9,2,34,0,1,1,0,0x80,50, 9,4,0,0,1,3,1,2,0,
+        9,0x21,0x11,1,0,1,0x22,sizeof(descriptor),0, 7,5,0x81,3,8,0,10};
     if (nonboot) { config[15] = 0; config[16] = 0; protocol_value = 123; }
     device_descriptor_t dd = {0};
     usbdev_t dev = {.controller = &hc, .configuration = (void *)config, .descriptor = &dd, .num_endp = 2};
-    dev.endpoints[1] = (endpoint_t){.dev = &dev, .type = INTERRUPT, .direction = IN, .maxpacketsize = 8};
+    dev.endpoints[1] = (endpoint_t){.dev = &dev, .type = INTERRUPT, .direction = IN, .endpoint = 0x81, .maxpacketsize = 8};
     usb_hid_init(&dev);
     assert(dev.data && protocol_value == (nonboot ? 123u : 1u));
     memset(packet, 0, sizeof(packet));
@@ -151,6 +161,38 @@ static void test_report_mouse(bool nonboot) {
     dev.destroy(&dev);
     assert(mouse_devices == 0 && mouse_reports == before_disconnect);
     report_descriptor = NULL; report_length = 0;
+}
+static void test_composite_hid(void) {
+    hci_t hc = {.control = control, .create_intr_queue = create_queue,
+        .destroy_intr_queue = destroy_queue, .poll_intr_queue = poll_queue};
+    /* HID keyboard (interface 0), HID mouse (interface 1), and an unrelated
+       vendor interface. Only the first two endpoint rings are configured. */
+    uint8_t config[] = {
+        9,2,57,0,3,1,0,0x80,50,
+        9,4,0,0,1,3,1,1,0, 7,5,0x81,3,8,0,10,
+        9,4,1,0,1,3,1,2,0, 7,5,0x82,3,8,0,10,
+        9,4,2,0,1,0xFF,0,0,0, 7,5,0x83,3,8,0,10
+    };
+    device_descriptor_t dd = {.idVendor = 0x062a, .idProduct = 0x4180};
+    usbdev_t dev = {.controller = &hc, .configuration = (void *)config,
+                    .descriptor = &dd, .num_endp = 3};
+    dev.endpoints[1] = (endpoint_t){.dev = &dev, .type = INTERRUPT,
+        .direction = IN, .endpoint = 0x81, .maxpacketsize = 8};
+    dev.endpoints[2] = (endpoint_t){.dev = &dev, .type = INTERRUPT,
+        .direction = IN, .endpoint = 0x82, .maxpacketsize = 8};
+    unsigned before_move = movements, before_destroy = queue_destroyed;
+    usb_hid_init(&dev);
+    assert(dev.data && mouse_devices == 1);
+    memset(packet, 0, sizeof(packet));
+    memset(packet2, 0, sizeof(packet2));
+    packet[2] = 4; // keyboard A
+    packet2[1] = 7; packet2[2] = (uint8_t)-3;
+    packet_ready = true; packet2_ready = true;
+    dev.poll(&dev);
+    assert(keys[KEY_A] && movements == before_move + 1 && dx == 7 && dy == -3);
+    dev.destroy(&dev);
+    assert(!dev.data && mouse_devices == 0 && !keys[KEY_A]);
+    assert(queue_destroyed == before_destroy + 2);
 }
 static void test_disk(void) {
     usbmsc_inst_t msc = {.numblocks = 0xF0000000, .blocksize = 4096};
@@ -178,6 +220,8 @@ int main(void) {
     test_report_mouse(false);
     test_report_mouse(true);
     assert(queue_destroyed == 4 && trace_hid == 4 && trace_ready == 4);
+    test_composite_hid();
+    assert(trace_hid == 6 && trace_ready == 6);
     test_disk();
     puts("libpayload HID, idle, LEDs, disconnect and block lifetime tests passed");
     return 0;
