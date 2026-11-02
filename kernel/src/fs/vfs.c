@@ -327,8 +327,6 @@ vfs_node_t *vfs_resolve_path_ext(const char *path, bool parent_only, char *last_
     if (!path) return NULL;
     char *norm = normalize_path(path);
     if (!norm) return NULL;
-    //console_print_string(norm);
-
     if (norm[0] < 'A' || norm[0] > 'Z' || norm[1] != ':') {
         malloc_free(norm);
         return NULL;
@@ -338,52 +336,97 @@ vfs_node_t *vfs_resolve_path_ext(const char *path, bool parent_only, char *last_
     if (!mnt || !mnt->root) { malloc_free(norm); return NULL; }
 
     vfs_node_t *current = mnt->root;
+    /* Track ancestors for relative symlinks containing '..'. A symlink is
+       expanded in-place instead of recursively calling vfs_resolve_path(),
+       so loops (including absolute loops) share one depth limit. */
+    vfs_node_t *parents[256];
+    uint32_t parent_count = 0;
+    uint32_t symlink_count = 0;
     char *p = norm + 2;
-    while (*p == '/') p++;
-
-    int symlink_depth = 0;
 
     while (*p && current) {
+        while (*p == '/') p++;
+        if (!*p) break;
         char token[256];
-        int t = 0;
-        while (*p && *p != '/' && t < 255) token[t++] = *p++;
+        size_t t = 0;
+        while (*p && *p != '/') {
+            if (t == sizeof(token) - 1) { current = NULL; break; }
+            token[t++] = *p++;
+        }
+        if (!current) break;
         token[t] = '\0';
         while (*p == '/') p++;
 
-        if (t == 0) break;
         if (t == 1 && token[0] == '.') continue;
-
-        if (parent_only && *p == '\0') {
-            if (last_component) {
-                int k = 0; while (token[k]) { last_component[k] = token[k]; k++; }
-                last_component[k] = 0;
-            }
+        if (t == 2 && token[0] == '.' && token[1] == '.') {
+            if (parent_count) current = parents[--parent_count];
+            continue;
+        }
+        if (parent_only && !*p) {
+            if (last_component) memcpy(last_component, token, t + 1);
             malloc_free(norm);
             return current;
         }
-
         if (current->type != VFS_TYPE_DIR || !current->ops || !current->ops->lookup) {
-            current = NULL; break;
+            current = NULL;
+            break;
         }
 
         vfs_node_t *next = current->ops->lookup(current, token);
-        
-        if (next && next->type == VFS_TYPE_SYMLINK) {
-            if (++symlink_depth > MAX_SYMLINK_DEPTH) { malloc_free(norm); return NULL; }
-            
-            char target[512] = {0};
-            int res = next->ops->readlink ? next->ops->readlink(next, target, 511) : -1;
-            
-            if (res >= 0) {
-                if (target[0] != '/') {
-                    next = current->ops->lookup(current, target);
-                } else {
-                    next = vfs_resolve_path(target);
-                }
-            } else {
-                next = NULL;
+        if (!next) { current = NULL; break; }
+        if (next->type == VFS_TYPE_SYMLINK) {
+            if (++symlink_count > MAX_SYMLINK_DEPTH || !next->ops || !next->ops->readlink) {
+                current = NULL;
+                break;
             }
+            char target[512] = {0};
+            int len = next->ops->readlink(next, target, sizeof(target) - 1);
+            if (len <= 0 || len >= (int)sizeof(target) || target[0] == '\0') {
+                current = NULL;
+                break;
+            }
+            target[len] = '\0';
+            char *absolute = NULL;
+            const char *replacement = target;
+            if (target[0] == '/' ||
+                (((target[0] >= 'A' && target[0] <= 'Z') ||
+                  (target[0] >= 'a' && target[0] <= 'z')) && target[1] == ':')) {
+                absolute = normalize_path(target);
+                if (!absolute || absolute[0] < 'A' || absolute[0] > 'Z' ||
+                    absolute[1] != ':' || !(mnt = drives[absolute[0] - 'A']) ||
+                    !mnt->root) {
+                    malloc_free(absolute);
+                    current = NULL;
+                    break;
+                }
+                current = mnt->root;
+                parent_count = 0;
+                replacement = absolute + 2;
+            }
+
+            /* p still points at the remaining components in norm. Never
+               format directly into norm: source and destination overlap. */
+            char expanded[512];
+            size_t prefix = strlen(replacement), tail = strlen(p);
+            size_t separator = prefix && replacement[prefix - 1] != '/' && tail ? 1 : 0;
+            if (prefix + separator + tail >= sizeof(expanded)) {
+                malloc_free(absolute);
+                current = NULL;
+                break;
+            }
+            memcpy(expanded, replacement, prefix);
+            if (separator) expanded[prefix++] = '/';
+            memcpy(expanded + prefix, p, tail + 1);
+            memcpy(norm + 2, expanded, prefix + tail + 1);
+            p = norm + 2;
+            malloc_free(absolute);
+            continue;
         }
+        if (parent_count == sizeof(parents) / sizeof(parents[0])) {
+            current = NULL;
+            break;
+        }
+        parents[parent_count++] = current;
         current = next;
     }
 
