@@ -8,6 +8,11 @@ extern void *malloc(size_t);
 extern void *calloc(size_t, size_t);
 extern void free(void *);
 extern int puts(const char *);
+static unsigned trace_ports;
+void inout_usb_trace(const char *stage, uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
+    (void)a; (void)b; (void)c; (void)d;
+    if (!strcmp(stage, "lp.port-on")) trace_ports++;
+}
 static u64 now_ms;
 static unsigned resets[3], attached[3], warnings;
 static int connected[3] = {0, 1, 1};
@@ -70,6 +75,7 @@ int main(void) {
     connected[1] = 1; enabled[1] = 1; changed_port[1] = 1;
     dev.poll(&dev);
     assert(attached[1] == 1 && !hub->retry[1].failures);
+    assert(trace_ports >= 2);
     generic_hub_destroy(&dev);
     puts("libpayload hub disabled-port backoff, log suppression, other ports and reconnect passed");
     return 0;

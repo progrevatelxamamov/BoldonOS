@@ -10,6 +10,7 @@
 #include <cpu/time.h>
 #include <scheduler/scheduler.h>
 #include <scheduler/spinlock.h>
+#include <inout/inout.h>
 
 #define LP_ALLOC_MAGIC 0x4C50444D41414C4CULL
 struct lp_allocation { uint64_t magic, phys, pages, size; };
@@ -218,6 +219,8 @@ void libpayload_pci_register(pci_device_t *dev) {
     controllers[controller_count++] = (struct lp_controller){
         0x80000000u | (dev->bus << 16) | (dev->slot << 11) | (dev->func << 8), dev->prog_if, bar
     };
+    inout_usb_trace("lp.pci", (dev->bus << 16) | (dev->slot << 8) | dev->func,
+                    dev->prog_if, (uint32_t)bar, (uint32_t)(bar >> 32));
 }
 
 int lp_platform_controller(unsigned index, uint32_t *pci, uint8_t *type, uintptr_t *bar) {

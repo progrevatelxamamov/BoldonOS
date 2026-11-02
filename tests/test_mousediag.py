@@ -10,7 +10,7 @@ destroy = xhci[xhci.index('void boldon_usb_input_destroy('):xhci.index('int bold
 assert 'handle_mouse_report(hid, released, sizeof(released));' in destroy
 assert 'inout_note_usb_mouse_report' not in destroy
 assert 'inout_note_usb_mouse_report();' in xhci[xhci.index('void boldon_usb_input_report('):xhci.index('void boldon_usb_input_destroy(')]
-note = source[source.index('void inout_note_usb_mouse_report('):source.index('typedef struct {\n    int8_t  dx;', source.index('void inout_note_usb_mouse_report('))]
+note = source[source.index('void inout_note_usb_mouse_report('):source.index('/* Enumeration transitions only')]
 read = source[source.index('static int mousediag_read('):source.index('static vfs_file_ops_t mousediag_ops', source.index('static int mousediag_read('))]
 code = r'''
 #include <stdint.h>

@@ -8,6 +8,7 @@
 #include "uhci.h"
 #include <disk/block.h>
 #include <disk/partitions.h>
+#include <inout/inout.h>
 #include <errno.h>
 
 struct lp_transport {
@@ -66,6 +67,8 @@ void lp_backend_initialize(void) {
             else if (type == 0x20) hc = ehci_init(bar);
             else if (type == 0x10) hc = ohci_init(bar);
             else hc = uhci_pci_init(pci);
+            inout_usb_trace("lp.hc", pci & 0x00FFFFFFu, type,
+                            hc ? 1 : 0, (uint32_t)bar);
             if (!hc) { printf("[LPUSB] controller initialization failed\n"); continue; }
             hc->pcidev = pci;
             if (hc->devices[0]) hc->devices[0]->quirks |= pci_quirk_check(pci);
@@ -88,6 +91,9 @@ struct lp_hid {
 static void lp_hid_destroy(usbdev_t *dev) {
     struct lp_hid *hid = dev->data;
     if (!hid) return;
+    inout_usb_trace("lp.detach", dev->descriptor ?
+                    ((uint32_t)dev->descriptor->idVendor << 16 | dev->descriptor->idProduct) : 0,
+                    hid->iface, 0, 0);
     dev->controller->destroy_intr_queue(hid->ep, hid->queue);
     boldon_usb_input_destroy(hid->input);
     free(hid);
@@ -132,7 +138,18 @@ void usb_hid_init(usbdev_t *dev) {
     endpoint_t *ep = NULL;
     for (int i = 1; i < dev->num_endp; i++)
         if (dev->endpoints[i].type == INTERRUPT && dev->endpoints[i].direction == IN) { ep = &dev->endpoints[i]; break; }
-    if (!iface || !ep || ep->maxpacketsize < 3 || ep->maxpacketsize > 64) return;
+    uint32_t id = dev->descriptor ? ((uint32_t)dev->descriptor->idVendor << 16 |
+                                     dev->descriptor->idProduct) : 0;
+    inout_usb_trace("lp.hid", id,
+                    iface ? ((uint32_t)iface->bInterfaceNumber << 16 |
+                             (uint32_t)iface->bInterfaceSubClass << 8 |
+                             iface->bInterfaceProtocol) : 0xFFFFFFFFu,
+                    ep ? ep->maxpacketsize : 0, report_length);
+    if (!iface || !ep || ep->maxpacketsize < 3 || ep->maxpacketsize > 64) {
+        inout_usb_trace("lp.noep", id, iface != NULL, ep != NULL,
+                        ep ? ep->maxpacketsize : 0);
+        return;
+    }
     struct lp_hid *hid = calloc(1, sizeof(*hid));
     if (!hid) return;
     hid->ep = ep;
@@ -152,6 +169,8 @@ void usb_hid_init(usbdev_t *dev) {
     int protocol = iface->bInterfaceSubClass == 1 ? iface->bInterfaceProtocol : 0;
     hid->input = boldon_usb_input_create(protocol, descriptor,
                         descriptor_length > 0 ? (uint32_t)descriptor_length : 0, &mode);
+    inout_usb_trace("lp.layout", id, (uint32_t)descriptor_length,
+                    (uint32_t)protocol, hid->input ? (uint32_t)(mode + 1) : 0);
     free(descriptor);
     if (!hid->input) { free(hid); printf("[LPUSB] unsupported HID report layout\n"); return; }
     if (iface->bInterfaceSubClass == 1) {
@@ -166,7 +185,11 @@ void usb_hid_init(usbdev_t *dev) {
     dev_req_t idle = {.bmRequestType = 0x21, .bRequest = 0x0A, .wIndex = iface->bInterfaceNumber};
     dev->controller->control(dev, OUT, sizeof(idle), &idle, 0, NULL);
     hid->queue = dev->controller->create_intr_queue(ep, ep->maxpacketsize, 4, 10);
-    if (!hid->queue) { boldon_usb_input_destroy(hid->input); free(hid); return; }
+    if (!hid->queue) {
+        inout_usb_trace("lp.queue-fail", id, ep->maxpacketsize, 0, 0);
+        boldon_usb_input_destroy(hid->input); free(hid); return;
+    }
+    inout_usb_trace("lp.ready", id, protocol, mode, ep->maxpacketsize);
     dev->data = hid;
     dev->destroy = lp_hid_destroy;
     dev->poll = lp_hid_poll;

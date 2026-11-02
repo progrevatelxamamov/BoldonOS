@@ -30,6 +30,8 @@
 
 #include <stdlib.h>
 #include <usb/usb.h>
+
+extern void inout_usb_trace(const char *, uint32_t, uint32_t, uint32_t, uint32_t);
 #include "generic_hub.h"
 
 void
@@ -215,6 +217,8 @@ generic_hub_scanport(usbdev_t *const dev, const int port)
 	}
 
 	if (hub->ports[port] >= 0) {
+		inout_usb_trace("lp.port-off", (uint32_t)dev->address,
+		                (uint32_t)port, (uint32_t)hub->ports[port], 0);
 		usb_debug("generic_hub: Detachment at port %d\n", port);
 
 		const int ret = generic_hub_detach_dev(dev, port);
@@ -224,9 +228,15 @@ generic_hub_scanport(usbdev_t *const dev, const int port)
 
 	if (connected) {
 		if (!retry->failures)
+			inout_usb_trace("lp.port-on", (uint32_t)dev->address,
+			                (uint32_t)port, (uint32_t)retry->failures, 0);
+		if (!retry->failures)
 			usb_debug("generic_hub: Attachment at port %d\n", port);
 		int result = generic_hub_attach_dev(dev, port);
 		if (result == -2) {
+			if (!retry->failures)
+				inout_usb_trace("lp.port-wait", (uint32_t)dev->address,
+				                (uint32_t)port, 0, 0);
 			if (retry->failures < 6) retry->failures++;
 			u64 delay = 1000ULL << (retry->failures - 1);
 			retry->deadline_ms = hub_time_ms() + MIN(delay, 30000);

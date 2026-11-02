@@ -26,6 +26,12 @@ static unsigned protocol_value = 255, queue_destroyed, unmounted, unregistered;
 static uint64_t last_lba;
 static uint32_t last_count;
 static bool remove_during_io;
+static unsigned trace_hid, trace_ready;
+void inout_usb_trace(const char *stage, uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
+    (void)a; (void)b; (void)c; (void)d;
+    if (!strcmp(stage, "lp.hid")) trace_hid++;
+    if (!strcmp(stage, "lp.ready")) trace_ready++;
+}
 static uint8_t packet[8];
 static bool packet_ready;
 static usbdev_t *disk_dev;
@@ -171,7 +177,7 @@ int main(void) {
     assert(queue_destroyed == 2);
     test_report_mouse(false);
     test_report_mouse(true);
-    assert(queue_destroyed == 4);
+    assert(queue_destroyed == 4 && trace_hid == 4 && trace_ready == 4);
     test_disk();
     puts("libpayload HID, idle, LEDs, disconnect and block lifetime tests passed");
     return 0;

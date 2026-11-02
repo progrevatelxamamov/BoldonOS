@@ -238,6 +238,10 @@ void inout_add_event(inout_event_t ev);
 void inout_note_usb_mouse_report(void);
 void inout_note_usb_mouse_device(int delta);
 void inout_note_usb_mouse_poll(void);
+/* Bounded event trace for USB enumeration. Use static stage strings only;
+   a/b/c/d are stage-specific hex values (documented in input-and-hotplug). */
+void inout_usb_trace(const char *stage, uint32_t a, uint32_t b,
+                     uint32_t c, uint32_t d);
 void inout_set_mouse_speed(int percent);
 int  inout_get_mouse_speed(void);
 void inout_call_scheduler(void);

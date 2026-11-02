@@ -32,6 +32,9 @@
 #include <libpayload-config.h>
 #include <usb/usb.h>
 
+/* BoldonOS's bounded diagnostic ring; no per-poll logging. */
+extern void inout_usb_trace(const char *, uint32_t, uint32_t, uint32_t, uint32_t);
+
 #define DR_DESC gen_bmRequestType(device_to_host, standard_type, dev_recp)
 
 hci_t *usb_hcs = 0;
@@ -400,6 +403,8 @@ set_address(hci_t *controller, usb_speed speed, int hubport, int hubaddr)
 	usbdev_t *dev = controller->set_address(controller, speed,
 						hubport, hubaddr);
 	if (!dev) {
+		inout_usb_trace("lp.address-fail", (uint32_t)hubaddr,
+		                (uint32_t)hubport, (uint32_t)speed, 0);
 		usb_debug("set_address failed\n");
 		return -1;
 	}
@@ -408,11 +413,17 @@ set_address(hci_t *controller, usb_speed speed, int hubport, int hubaddr)
 	if (!dev->descriptor || get_descriptor(dev, DR_DESC, DT_DEV, 0,
 			dev->descriptor, sizeof(*dev->descriptor))
 			!= sizeof(*dev->descriptor)) {
+		inout_usb_trace("lp.dev-fail", (uint32_t)hubaddr,
+		                (uint32_t)hubport, (uint32_t)dev->address, 0);
 		usb_debug("get_descriptor(DT_DEV) failed\n");
 		usb_detach_device(controller, dev->address);
 		return -1;
 	}
 
+	inout_usb_trace("lp.device", (uint32_t)dev->descriptor->idVendor << 16 |
+	                dev->descriptor->idProduct,
+	                (uint32_t)hubaddr << 16 | (uint32_t)hubport,
+	                (uint32_t)dev->address, (uint32_t)speed);
 	usb_debug("* found device (0x%04x:0x%04x, USB %x.%x, MPS0: %d)\n",
 		 dev->descriptor->idVendor, dev->descriptor->idProduct,
 		 dev->descriptor->bcdUSB >> 8, dev->descriptor->bcdUSB & 0xff,
@@ -464,6 +475,9 @@ set_address(hci_t *controller, usb_speed speed, int hubport, int hubaddr)
 	 * else for the time being. If you need it, see the SetInterface and
 	 * GetInterface functions in the USB specification and set it yourself.
 	 */
+	inout_usb_trace("lp.config", (uint32_t)dev->descriptor->idVendor << 16 |
+	                dev->descriptor->idProduct, cd->bNumInterfaces,
+	                cd->wTotalLength, 0);
 	usb_debug("device has %x interfaces\n", cd->bNumInterfaces);
 	int ifnum = usb_interface_check(dev->descriptor->idVendor,
 					dev->descriptor->idProduct);
@@ -496,6 +510,13 @@ set_address(hci_t *controller, usb_speed speed, int hubport, int hubaddr)
 		}
 		if (ifnum >= 0 && intf->bInterfaceNumber != ifnum)
 			continue;
+		inout_usb_trace("lp.interface", (uint32_t)dev->descriptor->idVendor << 16 |
+		                dev->descriptor->idProduct,
+		                (uint32_t)intf->bInterfaceNumber << 24 |
+		                (uint32_t)intf->bInterfaceClass << 16 |
+		                (uint32_t)intf->bInterfaceSubClass << 8 |
+		                intf->bInterfaceProtocol,
+		                cd->bNumInterfaces, (uint32_t)ifnum);
 		usb_debug("Interface %d: class 0x%x, sub 0x%x. proto 0x%x\n",
 			intf->bInterfaceNumber, intf->bInterfaceClass,
 			intf->bInterfaceSubClass, intf->bInterfaceProtocol);
