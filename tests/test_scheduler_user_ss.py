@@ -5,7 +5,7 @@ import tempfile
 
 source = (Path(__file__).resolve().parents[1] / 'kernel/src/scheduler/scheduler.c').read_text()
 start = source.index('static bool scheduler_repair_user_ss(')
-end = source.index('void schedule(', start)
+end = source.index('int scheduler_tty_sigint(', start)
 function = source[start:end]
 assert 'if (!proc->is_kernel_process && scheduler_repair_user_ss(frame))' in source
 assert 'restore->ss = frame->ss;' in source
