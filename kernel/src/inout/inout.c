@@ -17,6 +17,7 @@
 #include <mm/malloc.h>
 #include <fs/devfs.h>
 #include <fs/vfs.h>
+#include <cpu/time.h>
 
 void xhci_set_keyboard_leds(uint8_t leds);
 
@@ -51,6 +52,89 @@ void inout_note_usb_mouse_poll(void) {
 void inout_note_usb_mouse_device(int delta) {
     __atomic_fetch_add(&usb_mouse_devices, delta, __ATOMIC_RELAXED);
 }
+
+/* Enumeration transitions only, never per-poll/per-report: USB can otherwise
+   flood the framebuffer and overwrite the useful boot-time failure. */
+#define USB_TRACE_CAP 96
+#define USB_TRACE_TEXT 12288
+typedef struct {
+    uint64_t seq, ms;
+    const char *stage; /* all callers pass static string literals */
+    uint32_t a, b, c, d;
+} usb_trace_entry_t;
+static usb_trace_entry_t usb_trace_ring[USB_TRACE_CAP];
+static uint64_t usb_trace_next;
+static spinlock_t usb_trace_lock = SPINLOCK_INIT;
+
+typedef struct {
+    uint32_t len;
+    char text[USB_TRACE_TEXT];
+} usb_trace_snapshot_t;
+
+void inout_usb_trace(const char *stage, uint32_t a, uint32_t b,
+                     uint32_t c, uint32_t d) {
+    if (!stage) return;
+    uint64_t flags;
+    spin_lock_irqsave(&usb_trace_lock, &flags);
+    uint64_t seq = usb_trace_next++;
+    usb_trace_ring[seq % USB_TRACE_CAP] = (usb_trace_entry_t){
+        seq, get_monotonic_ms(), stage, a, b, c, d
+    };
+    spin_unlock_irqrestore(&usb_trace_lock, flags);
+}
+
+static int usbtrace_open(vfs_file_t *f) {
+    if (!f) return -EINVAL;
+    usb_trace_snapshot_t *snapshot = malloc_alloc(sizeof(*snapshot));
+    if (!snapshot) return -ENOMEM;
+    usb_trace_entry_t entries[USB_TRACE_CAP];
+    uint64_t flags;
+    spin_lock_irqsave(&usb_trace_lock, &flags);
+    uint64_t end = usb_trace_next;
+    uint64_t begin = end > USB_TRACE_CAP ? end - USB_TRACE_CAP : 0;
+    for (uint64_t seq = begin; seq < end; seq++)
+        entries[seq - begin] = usb_trace_ring[seq % USB_TRACE_CAP];
+    spin_unlock_irqrestore(&usb_trace_lock, flags);
+
+    int n = snprintf(snapshot->text, sizeof(snapshot->text),
+                     "usbtrace seq=%llu..%llu overwritten=%llu (values hex)\n",
+                     (unsigned long long)begin, (unsigned long long)end,
+                     (unsigned long long)begin);
+    if (n < 0 || n >= (int)sizeof(snapshot->text)) { malloc_free(snapshot); return -EOVERFLOW; }
+    uint32_t used = (uint32_t)n;
+    for (uint64_t i = 0; i < end - begin; i++) {
+        usb_trace_entry_t *e = &entries[i];
+        n = snprintf(snapshot->text + used, sizeof(snapshot->text) - used,
+                     "%llu %llu %s %08x %08x %08x %08x\n",
+                     (unsigned long long)e->seq, (unsigned long long)e->ms,
+                     e->stage, e->a, e->b, e->c, e->d);
+        if (n < 0 || n >= (int)(sizeof(snapshot->text) - used)) break;
+        used += (uint32_t)n;
+    }
+    snapshot->len = used;
+    f->private_data = snapshot;
+    return 0;
+}
+
+static int usbtrace_read(vfs_file_t *f, void *buf, uint64_t count) {
+    if (!f || !buf) return -EINVAL;
+    usb_trace_snapshot_t *snapshot = f->private_data;
+    if (!snapshot || !count || f->offset >= snapshot->len) return 0;
+    if (count > snapshot->len - f->offset) count = snapshot->len - f->offset;
+    memcpy(buf, snapshot->text + f->offset, (size_t)count);
+    f->offset += count;
+    return (int)count;
+}
+
+static int usbtrace_close(vfs_file_t *f) {
+    if (f && f->private_data) malloc_free(f->private_data);
+    if (f) f->private_data = NULL;
+    return 0;
+}
+
+static vfs_file_ops_t usbtrace_ops = {
+    .open = usbtrace_open, .read = usbtrace_read, .close = usbtrace_close
+};
 
 typedef struct {
     int8_t  dx;
@@ -869,6 +953,7 @@ void input_register_devfs(void) {
     devfs_register_device("kbd",               VFS_TYPE_CHAR_DEV, &kbd_ops, NULL);
     devfs_register_device("input/mousectl",    VFS_TYPE_CHAR_DEV, &mousectl_ops, NULL);
     devfs_register_device("input/mousediag",   VFS_TYPE_FILE, &mousediag_ops, NULL);
+    devfs_register_device("input/usbtrace",    VFS_TYPE_FILE, &usbtrace_ops, NULL);
 }
 
 void inout_keyboard_task(void) {

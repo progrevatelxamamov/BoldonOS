@@ -1859,6 +1859,8 @@ static void init_usb_hid(xhci_controller_t *hc, uint8_t slot_id, uint8_t speed,
                          uint8_t ep_in_addr, uint16_t mps, uint8_t interval,
                          uint16_t report_desc_len)
 {
+    inout_usb_trace("x.hid", slot_id, (uint32_t)iface_num << 8 | protocol,
+                    (uint32_t)ep_in_addr << 16 | mps, report_desc_len);
     struct usb_hid *hid = (struct usb_hid *)malloc_alloc(sizeof(struct usb_hid));
     if (!hid) return;
     memset(hid, 0, sizeof(struct usb_hid));
@@ -1915,6 +1917,7 @@ static void init_usb_hid(xhci_controller_t *hc, uint8_t slot_id, uint8_t speed,
     hid->led_probe_stage = 0;
 
     if (!xhci_configure_hid_endpoint(hc, hid)) {
+        inout_usb_trace("x.ep-fail", slot_id, iface_num, ep_in_addr, mps);
         pmm_free_pages((void*)hid->ring_phys, 1);
         pmm_free_pages((void*)hid->report_phys, 1);
         malloc_free(hid);
@@ -1944,6 +1947,9 @@ static void init_usb_hid(xhci_controller_t *hc, uint8_t slot_id, uint8_t speed,
                                              &get_desc, desc_phys, fetch_len);
             if (dres == 0)
                 hid_parse_report_descriptor(hid, desc_buf, fetch_len);
+            inout_usb_trace("x.layout", slot_id, (uint32_t)dres,
+                            (uint32_t)hid->mouse_layout_valid |
+                            ((uint32_t)hid->kbd_layout_valid << 1), fetch_len);
             pmm_free_pages((void *)desc_phys, desc_pages);
         }
     }
@@ -1954,6 +1960,7 @@ static void init_usb_hid(xhci_controller_t *hc, uint8_t slot_id, uint8_t speed,
         else {
             /* Protocol zero is not boot HID; packet size is not a safe
                fallback when the descriptor is missing or unsupported. */
+            inout_usb_trace("x.reject", slot_id, iface_num, report_desc_len, mps);
             pmm_free_pages((void *)hid->report_phys, 1);
             pmm_free_pages((void *)hid->ring_phys, 1);
             malloc_free(hid);
@@ -2020,6 +2027,8 @@ static void init_usb_hid(xhci_controller_t *hc, uint8_t slot_id, uint8_t speed,
     }
 
     hc->hid_table[slot_id][hid->dci] = hid;
+    inout_usb_trace("x.ready", slot_id, iface_num, hid->protocol,
+                    (uint32_t)hid->report_protocol_active);
     if (hid->protocol == 2) inout_note_usb_mouse_device(1);
 
     if (hid->protocol == 1) {
@@ -2133,6 +2142,7 @@ static void xhci_pool_task(void *arg) {
 }
 
 void parse_and_configure_device(xhci_controller_t *hc, uint8_t slot_id, uint8_t speed, uint16_t vid, uint16_t pid) {
+    inout_usb_trace("x.device", (uint32_t)vid << 16 | pid, slot_id, speed, 0);
     console_print_string("[USB] device VID=");
     console_print_hex(vid);
     console_print_string(" PID=");
@@ -2229,6 +2239,8 @@ void parse_and_configure_device(xhci_controller_t *hc, uint8_t slot_id, uint8_t 
                 init_usb_hid(hc, slot_id, speed, cur_iface_num, hid_proto, hid_ep_in, hid_mps, hid_interval, hid_report_desc_len);
                 is_hid = 0; hid_ep_in = 0; hid_report_desc_len = 0;
             } else {
+                if (is_hid) inout_usb_trace("x.noep", (uint32_t)vid << 16 | pid,
+                                            cur_iface_num, slot_id, hid_report_desc_len);
                 is_msd = 0; msd_ep_out = 0; msd_ep_in = 0;
                 is_hid = 0; hid_ep_in = 0; hid_report_desc_len = 0;
             }
@@ -2238,6 +2250,11 @@ void parse_and_configure_device(xhci_controller_t *hc, uint8_t slot_id, uint8_t 
             cur_iface_proto = id->bInterfaceProtocol;
             cur_iface_num   = id->bInterfaceNumber;
 
+            inout_usb_trace("x.interface", (uint32_t)vid << 16 | pid,
+                            (uint32_t)cur_iface_num << 24 |
+                            (uint32_t)cur_iface_class << 16 |
+                            (uint32_t)id->bInterfaceSubClass << 8 | cur_iface_proto,
+                            slot_id, 0);
             if (cur_iface_class == 0x08) is_msd = 1;
             if (cur_iface_class == 0x03) {
                 is_hid = 1;
@@ -2310,6 +2327,9 @@ void parse_and_configure_device(xhci_controller_t *hc, uint8_t slot_id, uint8_t 
         msd_done = true;
     } else if (is_hid && hid_ep_in) {
         init_usb_hid(hc, slot_id, speed, cur_iface_num, hid_proto, hid_ep_in, hid_mps, hid_interval, hid_report_desc_len);
+    } else if (is_hid) {
+        inout_usb_trace("x.noep", (uint32_t)vid << 16 | pid,
+                        cur_iface_num, slot_id, hid_report_desc_len);
     }
 
     if (is_hub) {
@@ -2577,6 +2597,8 @@ static void usb_enum_fail(xhci_controller_t *hc, uint8_t port, const char *stage
     uint32_t bit = 1u << (port - 1);
     if (hc->enum_fail_reported & bit) return;
     hc->enum_fail_reported |= bit;
+    inout_usb_trace(stage, (hc->bus << 16) | (hc->slot << 8) | hc->func,
+                    port, 0, 0);
     console_print_string("[USB] ");
     console_print_num(hc->bus);
     console_print_string(":");
@@ -2597,6 +2619,8 @@ void handle_port_connect(xhci_controller_t *hc, uint8_t port) {
 
     uint32_t portsc = xhci_read32(portsc_reg, 0x00);
     xhci_ack_port_changes(portsc_reg);
+    inout_usb_trace("x.port", (hc->bus << 16) | (hc->slot << 8) | hc->func,
+                    port, portsc, 0);
 
     if (!(portsc & XHCI_PORTSC_CCS)) {
         handle_port_disconnect(hc, port);
