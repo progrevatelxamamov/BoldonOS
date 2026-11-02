@@ -38,8 +38,12 @@ typedef struct unix_socket_internal {
 #define MAX_UNIX 128
 static unix_intern_t unix_pool[MAX_UNIX];
 
+static void trace_unix_bind(const char *stage, uint64_t detail);
+
 static bool unix_create_path_node(const char *path) {
+    trace_unix_bind("bind.unix.vfs.open", 0);
     vfs_file_t *file = vfs_open(path, VFS_O_RDWR | VFS_O_CREAT);
+    trace_unix_bind("bind.unix.vfs.open.done", file != NULL);
     if (!file) return false;
     vfs_close(file);
     return true;
