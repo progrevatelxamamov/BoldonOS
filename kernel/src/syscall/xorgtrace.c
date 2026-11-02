@@ -54,8 +54,8 @@ void xorgtrace_stage(const char *stage, uint64_t pid, uint64_t detail) {
     if (!stage) return;
     append(stage, pid, UINT32_MAX, detail, 0, 0, 0, 0);
     /* Stage markers also reach the screen if Xorg blocks the only shell.
-       No per-syscall console prints; limit restarts too. */
-    if (__atomic_fetch_add(&console_count, 1, __ATOMIC_RELAXED) < 12) {
+       Leave room for the bounded bind-path markers after exec stages. */
+    if (__atomic_fetch_add(&console_count, 1, __ATOMIC_RELAXED) < 24) {
         console_print_string("[XORGTRACE] ");
         console_print_string(stage);
         console_print_string(" pid=");
