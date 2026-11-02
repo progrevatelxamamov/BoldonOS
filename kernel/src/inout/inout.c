@@ -86,7 +86,10 @@ void inout_usb_trace(const char *stage, uint32_t a, uint32_t b,
 static int usbtrace_open(vfs_file_t *f) {
     if (!f) return -EINVAL;
     usb_trace_snapshot_t *snapshot = malloc_alloc(sizeof(*snapshot));
-    if (!snapshot) return -ENOMEM;
+    /* vfs_open() currently maps every device open failure to ENOENT. Keep
+       this diagnostic node openable under memory pressure and report the
+       real problem on read rather than pretending the path does not exist. */
+    if (!snapshot) { f->private_data = NULL; return 0; }
     usb_trace_entry_t entries[USB_TRACE_CAP];
     uint64_t flags;
     spin_lock_irqsave(&usb_trace_lock, &flags);
@@ -119,9 +122,11 @@ static int usbtrace_open(vfs_file_t *f) {
 static int usbtrace_read(vfs_file_t *f, void *buf, uint64_t count) {
     if (!f || !buf) return -EINVAL;
     usb_trace_snapshot_t *snapshot = f->private_data;
-    if (!snapshot || !count || f->offset >= snapshot->len) return 0;
-    if (count > snapshot->len - f->offset) count = snapshot->len - f->offset;
-    memcpy(buf, snapshot->text + f->offset, (size_t)count);
+    const char *text = snapshot ? snapshot->text : "usbtrace: snapshot allocation failed\n";
+    uint64_t len = snapshot ? snapshot->len : strlen(text);
+    if (!count || f->offset >= len) return 0;
+    if (count > len - f->offset) count = len - f->offset;
+    memcpy(buf, text + f->offset, (size_t)count);
     f->offset += count;
     return (int)count;
 }
@@ -953,7 +958,8 @@ void input_register_devfs(void) {
     devfs_register_device("kbd",               VFS_TYPE_CHAR_DEV, &kbd_ops, NULL);
     devfs_register_device("input/mousectl",    VFS_TYPE_CHAR_DEV, &mousectl_ops, NULL);
     devfs_register_device("input/mousediag",   VFS_TYPE_FILE, &mousediag_ops, NULL);
-    devfs_register_device("input/usbtrace",    VFS_TYPE_FILE, &usbtrace_ops, NULL);
+    if (devfs_register_device("input/usbtrace", VFS_TYPE_FILE, &usbtrace_ops, NULL) != 0)
+        console_print_string("[INPUT] cannot register /dev/input/usbtrace\n");
 }
 
 void inout_keyboard_task(void) {

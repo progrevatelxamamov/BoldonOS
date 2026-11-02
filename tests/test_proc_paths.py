@@ -62,6 +62,7 @@ int main(void) {
     check("/sys/dev/block/8:1", "D:/sys/dev/block/8:1");
     check("/dev", "D:/");
     check("/dev/null", "D:/null");
+    check("/dev/input/usbtrace", "D:/input/usbtrace");
     check("proc", "D:/proc");
     check("proc/partitions", "D:/proc/partitions");
     check("dev/null", "D:/null");
@@ -89,6 +90,12 @@ int main(void) {
     dev_nodes[4].used = true;
     strcpy(dev_nodes[4].name, "sys/dev/block/8:1");
     dev_nodes[4].node.type = VFS_TYPE_SYMLINK;
+    dev_nodes[5].used = true;
+    strcpy(dev_nodes[5].name, "input/mousediag");
+    dev_nodes[5].node.type = VFS_TYPE_FILE;
+    dev_nodes[6].used = true;
+    strcpy(dev_nodes[6].name, "input/usbtrace");
+    dev_nodes[6].node.type = VFS_TYPE_FILE;
     vfs_node_t *dir = devfs_vfs_lookup(&root, "proc");
     assert(dir && dir->type == VFS_TYPE_DIR);
     assert(devfs_vfs_lookup(dir, "partitions") == &dev_nodes[0].node);
@@ -121,6 +128,10 @@ int main(void) {
     vfs_node_t *devblock = devfs_vfs_lookup(dev, "block");
     assert(dev && devblock);
     assert(devfs_vfs_lookup(devblock, "8:1") == &dev_nodes[4].node);
+    vfs_node_t *input = devfs_vfs_lookup(&root, "input");
+    assert(input && input->type == VFS_TYPE_DIR);
+    assert(devfs_vfs_lookup(input, "mousediag") == &dev_nodes[5].node);
+    assert(devfs_vfs_lookup(input, "usbtrace") == &dev_nodes[6].node);
     return 0;
 }
 '''
