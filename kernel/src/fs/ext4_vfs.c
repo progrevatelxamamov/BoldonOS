@@ -404,9 +404,13 @@ static int ext4_vfs_op_stat(vfs_node_t *node, vfs_stat_t *st) {
     return 0;
 }
 
-static void trace_xorg_ext4_create(const char *stage, uint64_t detail) {
+static void trace_xorg_ext4_create(const char *stage, uint64_t detail,
+                                   const char *path) {
     process_t *p = get_current_process();
-    if (p && p->name && strcmp(p->name, "Xorg") == 0)
+    /* Ordinary Xorg open(O_CREAT) calls happen before the socket bind and
+       used up the console budget. Only trace creation of the X11 socket path. */
+    if (p && p->name && strcmp(p->name, "Xorg") == 0 &&
+        path && strstr(path, "/.X11-unix/"))
         xorgtrace_stage(stage, p->pid, detail);
 }
 
@@ -423,21 +427,21 @@ static int ext4_vfs_op_create(vfs_node_t *dir, const char *name, uint16_t mode, 
         snprintf(target_path, sizeof(target_path), "%s/%s", parent_path, name);
 
     ext4_file f;
-    trace_xorg_ext4_create("bind.ext4.fopen", 0);
+    trace_xorg_ext4_create("bind.ext4.fopen", 0, target_path);
     int r = ext4_fopen(&f, target_path, "w+");
-    trace_xorg_ext4_create("bind.ext4.fopen.done", (uint64_t)(uint32_t)r);
+    trace_xorg_ext4_create("bind.ext4.fopen.done", (uint64_t)(uint32_t)r, target_path);
     if (r != EOK) return -1;
     ext4_fclose(&f);
 
-    trace_xorg_ext4_create("bind.ext4.mode", 0);
+    trace_xorg_ext4_create("bind.ext4.mode", 0, target_path);
     r = ext4_mode_set(target_path, mode);
-    trace_xorg_ext4_create("bind.ext4.mode.done", (uint64_t)(uint32_t)r);
+    trace_xorg_ext4_create("bind.ext4.mode.done", (uint64_t)(uint32_t)r, target_path);
 
     struct ext4_inode stat_buf;
     uint32_t ino = 0;
-    trace_xorg_ext4_create("bind.ext4.inode", 0);
+    trace_xorg_ext4_create("bind.ext4.inode", 0, target_path);
     r = ext4_raw_inode_fill(target_path, &ino, &stat_buf);
-    trace_xorg_ext4_create("bind.ext4.inode.done", (uint64_t)(uint32_t)r);
+    trace_xorg_ext4_create("bind.ext4.inode.done", (uint64_t)(uint32_t)r, target_path);
     if (r != EOK) return -1;
 
     vfs_node_t *node = malloc_alloc(sizeof(vfs_node_t));
