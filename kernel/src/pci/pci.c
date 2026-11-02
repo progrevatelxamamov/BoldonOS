@@ -123,6 +123,24 @@ void pci_init(void) {
     }
 }
 
+uint32_t pci_display_devices(pci_display_id_t *out, uint32_t capacity) {
+    if (!out || !capacity) return 0;
+    uint32_t count = 0;
+    for (uint64_t i = 0; i < pci_count && i < 1024 && count < capacity; i++) {
+        pci_device_t *dev = devices[i];
+        if (!dev || dev->base_class != 0x03) continue;
+        uint32_t id = pci_read_config(dev->bus, dev->slot, dev->func, 0);
+        if ((id & 0xffffu) == 0xffffu) continue;
+        out[count++] = (pci_display_id_t){
+            .bus = dev->bus, .slot = dev->slot, .func = dev->func,
+            .subclass = dev->subclass,
+            .revision = pci_get_revision(dev->bus, dev->slot, dev->func),
+            .vendor = id & 0xffffu, .device = id >> 16
+        };
+    }
+    return count;
+}
+
 uint8_t pci_find_capability(uint8_t bus, uint8_t slot, uint8_t func, uint8_t cap_id) {
     uint32_t status = pci_read_config(bus, slot, func, 0x04);
     if (!(status & (1u << 4))) return 0;
