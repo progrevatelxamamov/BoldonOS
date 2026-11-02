@@ -18,7 +18,8 @@ typedef int spinlock_t;
 static void spin_lock_irqsave(spinlock_t *p, uint64_t *f) { (void)p; *f = 0; }
 static void spin_unlock_irqrestore(spinlock_t *p, uint64_t f) { (void)p; (void)f; }
 static uint64_t get_monotonic_ms(void) { return 42; }
-static void *malloc_alloc(size_t n) { return calloc(1, n); }
+static int fail_alloc;
+static void *malloc_alloc(size_t n) { return fail_alloc ? NULL : calloc(1, n); }
 static void malloc_free(void *p) { free(p); }
 typedef struct { uint64_t offset; void *private_data; } vfs_file_t;
 typedef struct {
@@ -48,6 +49,14 @@ int main(void) {
     assert(strstr(second_data, "120 42 lp.port-on 00000077"));
     assert(usbtrace_ops.close(&first) == 0);
     assert(usbtrace_ops.close(&second) == 0);
+    // An allocation failure must be visible, not disguised as ENOENT.
+    fail_alloc = 1;
+    vfs_file_t fallback = {0};
+    assert(usbtrace_ops.open(&fallback) == 0);
+    char msg[80] = {0};
+    assert(usbtrace_ops.read(&fallback, msg, sizeof(msg)) > 0);
+    assert(strcmp(msg, "usbtrace: snapshot allocation failed\n") == 0);
+    assert(usbtrace_ops.close(&fallback) == 0);
     return 0;
 }
 '''
