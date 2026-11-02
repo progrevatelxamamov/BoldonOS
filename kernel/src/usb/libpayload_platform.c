@@ -315,7 +315,7 @@ static void libpayload_task(void) {
         lp_usb_lock();
         if (!lp_usb_failed()) lp_backend_poll();
         lp_usb_unlock();
-        task_sleep_ms(2);
+        schedule_yield();
     }
 }
 void libpayload_usb_start(void) { create_task_kernel((void *)libpayload_task, "libpayload-usb"); }

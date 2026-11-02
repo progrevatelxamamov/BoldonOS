@@ -107,7 +107,7 @@ static void pty_input_task(void) {
                 }
             }
         }
-        task_sleep_ms(2);
+        schedule_yield();
     }
 }
 
@@ -152,7 +152,7 @@ void launch_init_process(void) {
 
     if (!vfs_get_mount('C')) {
         init_no_root_hint();
-        while (!vfs_get_mount('C')) task_sleep_ms(20);
+        while (!vfs_get_mount('C')) schedule_yield();
     }
 
     /* Keep the real root layout usable for programs that inspect /proc,
@@ -180,8 +180,7 @@ void launch_init_process(void) {
 
     console_print_string("[INIT] Failed to start shell; C: may be the wrong partition,\n");
     console_print_string("[INIT] /bin/sh or its ELF interpreter may be missing or invalid.\n");
-    for (;;) {
-        task_sleep(get_current_process());
+    while (1) {
         schedule_yield();
     }
 }

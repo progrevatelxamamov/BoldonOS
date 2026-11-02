@@ -2105,7 +2105,7 @@ static void xhci_hotplug_task(void *arg) {
 
     for (;;) {
         if (hc->command_failed) {
-            task_sleep_ms(50);
+            schedule_yield_safe();
             continue;
         }
         if (hc->port_change_head != hc->port_change_tail) {
@@ -2120,7 +2120,7 @@ static void xhci_hotplug_task(void *arg) {
             last_rescan = now;
             xhci_rescan_ports(hc);
         }
-        task_sleep_ms(5);
+        schedule_yield_safe();
     }
 }
 
@@ -2128,7 +2128,7 @@ static void xhci_pool_task(void *arg) {
     xhci_controller_t *hc = (xhci_controller_t *)arg;
     for (;;) {
         xhci_poll(hc);
-        task_sleep_ms(2);
+        schedule_yield_safe();
     }
 }
 

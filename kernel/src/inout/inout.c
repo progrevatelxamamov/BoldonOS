@@ -877,17 +877,12 @@ void inout_keyboard_task(void) {
             kbd_leds_dirty = false;
             update_keyboard_leds();
         }
-        task_sleep_ms(10);
+        schedule_yield();
     }
 }
 
 void inout_mouse_task(void) {
-    /* Mouse input is driven by USB/PS2 callbacks; this legacy task has no
-       polling work and must not spin just to keep the scheduler busy. */
-    for (;;) {
-        task_sleep(get_current_process());
-        schedule_yield();
-    }
+    for (;;) schedule_yield();
 }
 
 void inout_call_scheduler(void) {
