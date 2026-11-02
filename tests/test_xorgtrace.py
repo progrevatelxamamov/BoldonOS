@@ -92,6 +92,9 @@ int main(void) {
     assert(trace_ops.read(&recent,text,sizeof(text)) > 0);
     assert(strstr(text,"overwritten=20")); // 4 earlier entries + 80 - 64
     trace_ops.close(&recent);
+    for (int i=80; i<9000; i++) xorgtrace_syscall_enter(77, i, 0, 0);
+    assert(enter_lines == 34); // first 12 + 7 early samples + 15 late samples
+    assert(exit_lines == 3); // no extra exits for pending calls
     return 0;
 }
 '''

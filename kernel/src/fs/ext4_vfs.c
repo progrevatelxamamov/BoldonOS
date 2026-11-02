@@ -1,6 +1,7 @@
 #include "disk/partitions.h"
 #include "fs/vfs.h"
 #include "gconsole.h"
+#include "cpu/time.h"
 #include "kernel.h"
 #include "mm/pmm.h"
 #include "scheduler/scheduler.h"
@@ -43,6 +44,10 @@ static spinlock_t ext4_lock_guard = SPINLOCK_INIT;
 static spinlock_t ext4_lock_fallback = SPINLOCK_INIT;
 static thread_t *ext4_lock_owner;
 static uint32_t ext4_lock_depth;
+/* Diagnostic only: who owns the lwext4 lock, not proof of why they are stuck. */
+static uint64_t ext4_owner_pid;
+static uint64_t ext4_owner_tid;
+static unsigned ext4_wait_prints;
 
 static void ext4_os_lock(void) {
     thread_t *self = get_current_thread();
@@ -51,6 +56,8 @@ static void ext4_os_lock(void) {
         return;
     }
 
+    uint64_t wait_start = 0;
+    bool reported = false;
     for (;;) {
         uint64_t flags;
         spin_lock_irqsave(&ext4_lock_guard, &flags);
@@ -60,12 +67,39 @@ static void ext4_os_lock(void) {
             return;
         }
         if (!ext4_lock_owner) {
+            process_t *p = get_current_process();
             ext4_lock_owner = self;
             ext4_lock_depth = 1;
+            ext4_owner_pid = p ? p->pid : 0;
+            ext4_owner_tid = self->tid;
             spin_unlock_irqrestore(&ext4_lock_guard, flags);
             return;
         }
+        /* Snapshot under the guard; never print or yield while holding it. */
+        uint64_t owner_pid = ext4_owner_pid;
+        uint64_t owner_tid = ext4_owner_tid;
+        uint32_t depth = ext4_lock_depth;
         spin_unlock_irqrestore(&ext4_lock_guard, flags);
+
+        uint64_t now = get_monotonic_ms();
+        if (!wait_start) wait_start = now ? now : 1;
+        if (!reported && now >= wait_start && now - wait_start >= 2000) {
+            reported = true;
+            if (__atomic_fetch_add(&ext4_wait_prints, 1, __ATOMIC_RELAXED) < 12) {
+                process_t *p = get_current_process();
+                console_print_string("[EXT4WAIT] pid=");
+                console_print_num(p ? p->pid : 0);
+                console_print_string(" tid=");
+                console_print_num(self->tid);
+                console_print_string(" owner_pid=");
+                console_print_num(owner_pid);
+                console_print_string(" owner_tid=");
+                console_print_num(owner_tid);
+                console_print_string(" depth=");
+                console_print_num(depth);
+                console_print_string("\n");
+            }
+        }
         schedule_yield();
     }
 }
