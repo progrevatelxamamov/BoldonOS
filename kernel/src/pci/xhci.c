@@ -1489,7 +1489,6 @@ static void handle_keyboard_report(struct usb_hid *hid, const uint8_t *r, uint32
 
 static void handle_mouse_report(struct usb_hid *hid, const uint8_t *r, uint32_t report_len) {
     if (!r || report_len == 0 || report_len > 64) return;
-    inout_note_usb_mouse_report();
     if (report_len > hid->report_size) report_len = hid->report_size;
 
     int dx = 0;
@@ -1689,6 +1688,7 @@ static void usb_hid_task(void *arg) {
     uint8_t snap[64];
 
     for (;;) {
+        if (hid->protocol == 2) inout_note_usb_mouse_poll();
         if (hid->disconnected) {
             hid->stopped = 1;
             for (;;) {
@@ -1761,7 +1761,10 @@ static void usb_hid_task(void *arg) {
         if (snap_len) {
             transfer_queued = false;
             if (hid->protocol == 1) handle_keyboard_report(hid, snap, snap_len);
-            else if (hid->protocol == 2) handle_mouse_report(hid, snap, snap_len);
+            else if (hid->protocol == 2) {
+                inout_note_usb_mouse_report();
+                handle_mouse_report(hid, snap, snap_len);
+            }
         }
 
         if (!transfer_queued &&
@@ -1998,6 +2001,7 @@ static void init_usb_hid(xhci_controller_t *hc, uint8_t slot_id, uint8_t speed,
     }
 
     hc->hid_table[slot_id][hid->dci] = hid;
+    if (hid->protocol == 2) inout_note_usb_mouse_device(1);
 
     if (hid->protocol == 1) {
         update_keyboard_leds();
@@ -2441,6 +2445,7 @@ static void xhci_disconnect_hid_devices(xhci_controller_t *hc, uint8_t slot_id) 
         }
 
         hid->disconnected = 1;
+        if (hid->protocol == 2) inout_note_usb_mouse_device(-1);
         hc->hid_table[slot_id][dci] = NULL;
         hids[n++] = hid;
     }
@@ -2980,7 +2985,13 @@ void *boldon_usb_input_create(int protocol, const uint8_t *descriptor,
     hid->report_protocol_active = mode;
     hid->boot_protocol_active = !mode;
     *report_mode = mode;
+    if (hid->protocol == 2) inout_note_usb_mouse_device(1);
     return hid;
+}
+
+void boldon_usb_input_poll(void *context) {
+    struct usb_hid *hid = context;
+    if (hid && hid->protocol == 2) inout_note_usb_mouse_poll();
 }
 
 void boldon_usb_input_protocol(void *context, int report_mode) {
@@ -2998,7 +3009,10 @@ void boldon_usb_input_report(void *context, const uint8_t *data, uint32_t length
     struct usb_hid *hid = context;
     if (!hid) return;
     if (hid->protocol == 1) handle_keyboard_report(hid, data, length);
-    else if (hid->protocol == 2) handle_mouse_report(hid, data, length);
+    else if (hid->protocol == 2) {
+        if (data && length && length <= 64) inout_note_usb_mouse_report();
+        handle_mouse_report(hid, data, length);
+    }
 }
 
 void boldon_usb_input_destroy(void *context) {
@@ -3014,6 +3028,7 @@ void boldon_usb_input_destroy(void *context) {
         for (uint8_t i = 0; i < hid->active_keycode_count; i++)
             inout_set_key_state(hid->active_keycodes[i], false);
     } else if (hid->protocol == 2) {
+        inout_note_usb_mouse_device(-1);
         uint8_t released[3] = {0};
         hid->mouse_layout_valid = false;
         hid->report_protocol_active = false;

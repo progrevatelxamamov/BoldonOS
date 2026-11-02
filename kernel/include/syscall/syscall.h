@@ -136,6 +136,7 @@
 #define SYS_EPOLL_CREATE1 291
 #define SYS_DUP3        292
 #define SYS_PIPE2       293
+#define SYS_SPLICE      275
 #define SYS_EVENTFD2    290
 #define SYS_PRLIMIT64   302
 #define SYS_MEMFD_CREATE 319

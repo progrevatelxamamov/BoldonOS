@@ -10,6 +10,7 @@ void lp_platform_prepare(uint32_t pci, uint8_t type, uintptr_t bar);
 void lp_backend_initialize(void);
 void lp_backend_poll(void);
 void *boldon_usb_input_create(int protocol, const uint8_t *descriptor, uint32_t length, int *mode);
+void boldon_usb_input_poll(void *context);
 void boldon_usb_input_protocol(void *context, int mode);
 void boldon_usb_input_report(void *context, const uint8_t *data, uint32_t length);
 uint8_t lp_platform_leds(void);

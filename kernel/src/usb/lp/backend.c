@@ -96,6 +96,7 @@ static void lp_hid_destroy(usbdev_t *dev) {
 static void lp_hid_poll(usbdev_t *dev) {
     struct lp_hid *hid = dev->data;
     if (!hid) return;
+    boldon_usb_input_poll(hid->input);
     uint8_t desired = lp_platform_leds();
     if (desired != hid->leds) {
         uint8_t data[64], id = 0;

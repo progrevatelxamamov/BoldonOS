@@ -38,10 +38,18 @@ volatile bool new_kbd_event   = false;
 volatile bool new_mouse_event = false;
 
 static uint64_t usb_mouse_reports;
+static uint64_t usb_mouse_polls;
+static int usb_mouse_devices;
 static uint64_t decoded_mouse_events;
 
 void inout_note_usb_mouse_report(void) {
     __atomic_fetch_add(&usb_mouse_reports, 1, __ATOMIC_RELAXED);
+}
+void inout_note_usb_mouse_poll(void) {
+    __atomic_fetch_add(&usb_mouse_polls, 1, __ATOMIC_RELAXED);
+}
+void inout_note_usb_mouse_device(int delta) {
+    __atomic_fetch_add(&usb_mouse_devices, delta, __ATOMIC_RELAXED);
 }
 
 typedef struct {
@@ -445,7 +453,10 @@ static int mousectl_read(vfs_file_t *f, void *buf, uint64_t count) {
 static int mousediag_read(vfs_file_t *f, void *buf, uint64_t count) {
     if (!f || !buf || count == 0) return 0;
     char text[128];
-    int len = snprintf(text, sizeof(text), "usb_reports=%llu mouse_events=%llu\n",
+    int len = snprintf(text, sizeof(text),
+                       "usb_devices=%d usb_polls=%llu usb_reports=%llu mouse_events=%llu\n",
+                       __atomic_load_n(&usb_mouse_devices, __ATOMIC_RELAXED),
+                       (unsigned long long)__atomic_load_n(&usb_mouse_polls, __ATOMIC_RELAXED),
                        (unsigned long long)__atomic_load_n(&usb_mouse_reports, __ATOMIC_RELAXED),
                        (unsigned long long)__atomic_load_n(&decoded_mouse_events, __ATOMIC_RELAXED));
     if (len < 0 || len >= (int)sizeof(text)) return -EOVERFLOW;

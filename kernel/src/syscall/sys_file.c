@@ -901,6 +901,81 @@ uint64_t sys_pipe2_impl(uint64_t pipefd_ptr, uint64_t flags) {
     return 0;
 }
 
+/* Linux splice(2): exactly one endpoint must be a pipe. Copy through a
+   bounded kernel buffer for now; never report success without moving bytes. */
+uint64_t sys_splice_impl(uint64_t fd_in, uint64_t off_in, uint64_t fd_out,
+                         uint64_t off_out, uint64_t len, uint64_t flags) {
+    process_t *proc = get_current_process();
+    if (!proc || !proc->fd_table || fd_in >= VFS_MAX_FD || fd_out >= VFS_MAX_FD ||
+        !proc->fd_table->fds[fd_in] || !proc->fd_table->fds[fd_out])
+        return (uint64_t)-EBADF;
+    vfs_file_t *src = proc->fd_table->fds[fd_in];
+    vfs_file_t *dst = proc->fd_table->fds[fd_out];
+    bool src_pipe = src->node && src->node->file_ops == &pipe_file_ops;
+    bool dst_pipe = dst->node && dst->node->file_ops == &pipe_file_ops;
+    if (!src_pipe && !dst_pipe) return (uint64_t)-EINVAL;
+    if (src->node == dst->node) return (uint64_t)-EINVAL;
+    if ((off_in && src_pipe) || (off_out && dst_pipe)) return (uint64_t)-ESPIPE;
+    if (flags & ~0xFu) return (uint64_t)-EINVAL;
+    if ((off_in && !user_range_ok(off_in, sizeof(uint64_t))) ||
+        (off_out && !user_range_ok(off_out, sizeof(uint64_t))))
+        return (uint64_t)-EFAULT;
+    if ((off_in && (int64_t)*(uint64_t *)off_in < 0) ||
+        (off_out && (int64_t)*(uint64_t *)off_out < 0))
+        return (uint64_t)-EINVAL;
+    if (!(src->flags & VFS_O_READ) || !(dst->flags & VFS_O_WRITE))
+        return (uint64_t)-EBADF;
+    if (len == 0) return 0;
+    if (len > 0x7FFFFFFFFFFFFFFFULL) len = 0x7FFFFFFFFFFFFFFFULL;
+
+    uint8_t *buf = malloc_alloc(4096);
+    if (!buf) return (uint64_t)-ENOMEM;
+    uint64_t done = 0;
+    int error = 0;
+    while (done < len) {
+        uint64_t want = len - done;
+        if (want > 4096) want = 4096;
+        if (dst_pipe) {
+            pipe_ring_t *ring = dst->node->fs_data;
+            if (!ring) { error = -EBADF; break; }
+            uint32_t used = (ring->head + 4096 - ring->tail) % 4096;
+            uint32_t room = 4095 - used;
+            if (!room) {
+                if ((flags & 2) || (dst->flags & VFS_O_NONBLOCK)) {
+                    error = -EAGAIN; break;
+                }
+                schedule_yield();
+                continue;
+            }
+            if (want > room) want = room;
+        }
+        if (src_pipe && ((flags & 2) || (src->flags & VFS_O_NONBLOCK))) {
+            pipe_ring_t *ring = src->node->fs_data;
+            if (!ring) { error = -EBADF; break; }
+            uint32_t available = (ring->head + 4096 - ring->tail) % 4096;
+            if (!available) { error = -EAGAIN; break; }
+            if (want > available) want = available;
+        }
+        uint64_t old_in = src->offset, old_out = dst->offset;
+        if (off_in) src->offset = *(uint64_t *)off_in;
+        if (off_out) dst->offset = *(uint64_t *)off_out;
+        int nr = vfs_read(src, buf, want);
+        if (nr > 0) {
+            int nw = vfs_write(dst, buf, (uint64_t)nr);
+            if (nw > 0) done += (uint64_t)nw;
+            if (nw < nr) {
+                /* A short write must not be mistaken for a complete splice. */
+                error = nw < 0 ? nw : -EAGAIN;
+            }
+        } else if (nr < 0) error = nr;
+        if (off_in) { *(uint64_t *)off_in = src->offset; src->offset = old_in; }
+        if (off_out) { *(uint64_t *)off_out = dst->offset; dst->offset = old_out; }
+        if (nr <= 0 || error) break;
+    }
+    malloc_free(buf);
+    return done ? done : (uint64_t)error;
+}
+
 uint64_t sys_mkdirat_impl(uint64_t dirfd, uint64_t path_ptr, uint64_t mode) {
     (void)dirfd;
 
