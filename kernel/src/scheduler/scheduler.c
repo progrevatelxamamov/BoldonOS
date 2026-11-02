@@ -383,6 +383,56 @@ static bool scheduler_repair_user_ss(struct interrupt_frame *frame) {
     return true;
 }
 
+/* A character-device read can loop in kernel space indefinitely. Queueing a
+   signal and consuming it during scheduling interrupts that loop as well as
+   user-space CPU loops, without freeing a still-running kernel stack. */
+int scheduler_tty_sigint(void *tty, uint64_t foreground_pgid) {
+    if (!tty) return 0;
+    int queued = 0;
+    uint64_t flags;
+    spin_lock_irqsave(&sched_lock, &flags);
+    for (int i = 1; i < MAX_TASKS; i++) {
+        process_t *p = tasks[i];
+        if (!p || p->is_kernel_process || p->state == TASK_DEAD ||
+            p->state == TASK_ZOMBIE || !p->fd_table) continue;
+        /* The init shell is the sole console owner; preserve it even if a
+           basic shell leaves itself in the foreground group of its child. */
+        if (p->pid == 1 && !p->parent) continue;
+        if (foreground_pgid) {
+            if (p->pgid != foreground_pgid) continue;
+        } else if (!p->parent) {
+            /* Without job control, never terminate the interactive shell. */
+            continue;
+        }
+        bool attached = false;
+        for (int fd = 0; fd < 3; fd++) {
+            vfs_file_t *f = p->fd_table->fds[fd];
+            if (f && f->node && f->node->fs_data == tty) attached = true;
+        }
+        if (!attached) continue;
+        __atomic_fetch_or(&p->sigpending, 1ULL << (2 - 1), __ATOMIC_RELAXED);
+        queued++;
+    }
+    spin_unlock_irqrestore(&sched_lock, flags);
+    return queued;
+}
+
+static void scheduler_deliver_sigint(process_t *p) {
+    const uint64_t bit = 1ULL << (2 - 1);
+    if (!p || p->is_kernel_process || !(p->sigpending & bit) ||
+        (p->sigmask & bit) || p->state == TASK_ZOMBIE) return;
+    __atomic_fetch_and(&p->sigpending, ~bit, __ATOMIC_RELAXED);
+    /* SIG_IGN or a registered user handler must not be treated as SIG_DFL.
+       User handler trampolines are not implemented yet; never kill the shell
+       for installing its own SIGINT handler. */
+    if (p->sigactions[2] && *(uint64_t *)p->sigactions[2] != 0) return;
+    p->term_signal = 2;
+    p->exit_code = 130;
+    p->state = TASK_ZOMBIE;
+    for (int i = 0; i < MAX_THREADS; i++)
+        if (p->threads[i]) p->threads[i]->state = TASK_DEAD;
+}
+
 void schedule(struct interrupt_frame *frame) {
     if (!frame || !scheduler_ready) return;
 
@@ -427,6 +477,21 @@ void schedule(struct interrupt_frame *frame) {
         }
     }
 
+    /* Signals are consumed at the scheduler boundary, including when a
+       process is blocked in a driver read that calls schedule_yield(). */
+    for (uint64_t i = 1; i < MAX_TASKS; i++) {
+        process_t *target = tasks[i];
+        if (!target) continue;
+        bool on_cpu = false;
+        for (int t = 0; t < MAX_THREADS; t++)
+            if (target->threads[t] && (target->threads[t]->state == TASK_RUNNING ||
+                                       target->threads[t]->switch_held)) {
+                on_cpu = true;
+                break;
+            }
+        if (!on_cpu || target == curr_proc) scheduler_deliver_sigint(target);
+    }
+
     // 2. Очистка мертвых задач (только если их никто не исполняет)
     for (uint64_t i = 1; i < MAX_TASKS; i++) {
         process_t *p = tasks[i];
@@ -454,7 +519,7 @@ void schedule(struct interrupt_frame *frame) {
         uint64_t idx = (start_task + dt) % MAX_TASKS;
         if (idx == 0) continue;
         process_t *p = tasks[idx];
-        if (!p || p->state == TASK_DEAD) continue;
+        if (!p || p->state == TASK_DEAD || p->state == TASK_ZOMBIE) continue;
 
         uint64_t first = (idx == start_task) ? (start_thr + 1) : 0;
         for (uint64_t t = first; t < MAX_THREADS; t++) {

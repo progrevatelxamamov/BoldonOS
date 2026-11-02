@@ -111,6 +111,7 @@ typedef struct pty {
     uint16_t winsize_row;
     uint16_t winsize_col;
     int kbd_mode;
+    uint64_t foreground_pgid; /* Set by TIOCSPGRP; 0 means no job control. */
     struct termios termios;
 } pty_t;
 

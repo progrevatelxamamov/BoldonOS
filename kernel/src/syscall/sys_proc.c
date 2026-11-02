@@ -100,13 +100,17 @@ uint64_t sys_getrandom_impl(uint64_t buf, uint64_t count, uint64_t flags) {
 
 uint64_t sys_rt_sigaction_impl(uint64_t sig, uint64_t act,
                                uint64_t oldact, uint64_t sigsetsize) {
-    (void)sigsetsize;
-    if (sig >= 64) return (uint64_t)-EINVAL;
+    if (sig == 0 || sig >= 64 || sigsetsize != sizeof(uint64_t))
+        return (uint64_t)-EINVAL;
     process_t *p = get_current_process();
     if (!p) return (uint64_t)-ESRCH;
 
-    if (oldact && p->sigactions[sig])
-        memcpy((void *)oldact, p->sigactions[sig], sizeof(struct k_sigaction));
+    if (oldact) {
+        if (p->sigactions[sig])
+            memcpy((void *)oldact, p->sigactions[sig], sizeof(struct k_sigaction));
+        else
+            memset((void *)oldact, 0, sizeof(struct k_sigaction)); /* SIG_DFL */
+    }
 
     if (act) {
         if (!p->sigactions[sig])
@@ -133,9 +137,27 @@ uint64_t sys_rt_sigprocmask_impl(uint64_t how, uint64_t set,
     return 0;
 }
 
+extern process_t *tasks[];
+
 uint64_t sys_kill_impl(uint64_t pid, uint64_t sig) {
     process_t *p = get_current_process();
     if (!p) return (uint64_t)-ESRCH;
+    if (sig == 2) {
+        int sent = 0;
+        int64_t target = (int64_t)pid;
+        if (target == -1) return (uint64_t)-ENOSYS; /* broadcast is not implemented */
+        for (int i = 1; i < 512; i++) {
+            process_t *q = tasks[i];
+            if (!q || q->is_kernel_process || q->state == TASK_ZOMBIE ||
+                q->state == TASK_DEAD) continue;
+            if ((target > 0 && q->pid != pid) ||
+                (target == 0 && q->pgid != p->pgid) ||
+                (target < -1 && q->pgid != (uint64_t)-target)) continue;
+            __atomic_fetch_or(&q->sigpending, 1ULL << (2 - 1), __ATOMIC_RELAXED);
+            sent++;
+        }
+        return sent ? 0 : (uint64_t)-ESRCH;
+    }
     if (sig == 0) return 0;
 
     if (pid == p->pid || pid == 0) {
@@ -154,12 +176,33 @@ uint64_t sys_kill_impl(uint64_t pid, uint64_t sig) {
 
 uint64_t sys_getpid_impl(void)   { process_t *p = get_current_process(); return p ? p->pid : 1; }
 uint64_t sys_getppid_impl(void)  { process_t *p = get_current_process(); return (p && p->parent) ? p->parent->pid : 1; }
-uint64_t sys_getpgid_impl(uint64_t pid) { (void)pid; process_t *p = get_current_process(); return p ? p->pgid : 0; }
+static process_t *process_by_pid(uint64_t pid) {
+    for (int i = 1; i < 512; i++)
+        if (tasks[i] && tasks[i]->pid == pid && !tasks[i]->is_kernel_process &&
+            tasks[i]->state != TASK_ZOMBIE && tasks[i]->state != TASK_DEAD)
+            return tasks[i];
+    return NULL;
+}
+
+uint64_t sys_getpgid_impl(uint64_t pid) {
+    process_t *self = get_current_process();
+    process_t *p = pid ? process_by_pid(pid) : self;
+    return p ? p->pgid : (uint64_t)-ESRCH;
+}
 uint64_t sys_setpgid_impl(uint64_t pid, uint64_t pgid) {
-    (void)pid;
-    process_t *p = get_current_process();
+    process_t *self = get_current_process();
+    if (!self) return (uint64_t)-ESRCH;
+    process_t *p = pid ? process_by_pid(pid) : self;
     if (!p) return (uint64_t)-ESRCH;
-    p->pgid = (pgid == 0) ? p->pid : pgid;
+    if (p != self && p->parent != self) return (uint64_t)-ESRCH;
+    if (p->sid != self->sid) return (uint64_t)-EPERM;
+    uint64_t group = pgid ? pgid : p->pid;
+    if (!group) return (uint64_t)-EINVAL;
+    if (group != p->pid) {
+        process_t *leader = process_by_pid(group);
+        if (!leader || leader->sid != self->sid) return (uint64_t)-EPERM;
+    }
+    p->pgid = group;
     return 0;
 }
 uint64_t sys_getsid_impl(uint64_t pid) { (void)pid; process_t *p = get_current_process(); return p ? p->sid : 1; }
@@ -311,6 +354,7 @@ uint64_t sys_exit_impl(uint64_t status) {
 
     if (p) {
         p->exit_code = (int)status;
+        p->term_signal = 0;
         p->state = TASK_ZOMBIE;
 
         for (int i = 1; i < 512; i++) {
@@ -613,9 +657,18 @@ uint64_t sys_wait4_impl(uint64_t pid, uint64_t wstatus, uint64_t options, uint64
             has_children = true;
 
             if (p->state == TASK_ZOMBIE) {
-                zombie_child = p;
-                zombie_slot = i;
-                break;
+                /* Do not free a stack while another CPU or the previous
+                   scheduler frame still references it. */
+                bool held = false;
+                for (int t = 0; t < 256; t++)
+                    if (p->threads[t] && (p->threads[t]->switch_held ||
+                                          p->threads[t]->state == TASK_RUNNING))
+                        held = true;
+                if (!held) {
+                    zombie_child = p;
+                    zombie_slot = i;
+                    break;
+                }
             }
         }
 
@@ -623,7 +676,9 @@ uint64_t sys_wait4_impl(uint64_t pid, uint64_t wstatus, uint64_t options, uint64
             uint64_t child_pid = zombie_child->pid;
             
             if (wstatus && user_range_ok(wstatus, 4)) {
-                *(uint32_t *)wstatus = (uint32_t)((zombie_child->exit_code & 0xFF) << 8);
+                *(uint32_t *)wstatus = zombie_child->term_signal
+                    ? (uint32_t)(zombie_child->term_signal & 0x7F)
+                    : (uint32_t)((zombie_child->exit_code & 0xFF) << 8);
             }
 
             if (zombie_slot >= 0) {

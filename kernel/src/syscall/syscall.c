@@ -226,6 +226,7 @@ uint64_t osdev_syscall_handler(uint64_t num,
     case SYS_MPROTECT:    return sys_mprotect_impl(a1, a2, a3);
     case SYS_IOCTL:       return sys_ioctl_impl(a1, a2, a3);
     case SYS_MOUNT:       return sys_mount_impl(a1, a2, a3, a4, a5);
+    case SYS_FSOPEN:      return (uint64_t)-ENOSYS; /* Let mount(8) try legacy mount(2); do not return a fake fd. */
     case SYS_UMOUNT2:     return sys_umount2_impl(a1, a2);
     case SYS_FSYNC:       return sys_fsync_impl(a1);
     case SYS_FDATASYNC:   return sys_fsync_impl(a1);

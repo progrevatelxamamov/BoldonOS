@@ -7,6 +7,7 @@
 #include <stddef.h>
 #include <errno.h>
 #include <string.h>
+#include <stdio.h>
 
 #include <inout/inout.h>
 #include <inout/ps2kbd.h>
@@ -35,6 +36,13 @@ volatile mouse_state_t    g_mouse = { .x = 0, .y = 0, .z = 0 };
 
 volatile bool new_kbd_event   = false;
 volatile bool new_mouse_event = false;
+
+static uint64_t usb_mouse_reports;
+static uint64_t decoded_mouse_events;
+
+void inout_note_usb_mouse_report(void) {
+    __atomic_fetch_add(&usb_mouse_reports, 1, __ATOMIC_RELAXED);
+}
 
 typedef struct {
     int8_t  dx;
@@ -432,6 +440,23 @@ static int mousectl_read(vfs_file_t *f, void *buf, uint64_t count) {
     f->offset += count;
     return (int)count;
 }
+
+/* Read-only, on-demand diagnostics instead of noisy per-report USB logs. */
+static int mousediag_read(vfs_file_t *f, void *buf, uint64_t count) {
+    if (!f || !buf || count == 0) return 0;
+    char text[128];
+    int len = snprintf(text, sizeof(text), "usb_reports=%llu mouse_events=%llu\n",
+                       (unsigned long long)__atomic_load_n(&usb_mouse_reports, __ATOMIC_RELAXED),
+                       (unsigned long long)__atomic_load_n(&decoded_mouse_events, __ATOMIC_RELAXED));
+    if (len < 0 || len >= (int)sizeof(text)) return -EOVERFLOW;
+    if (f->offset >= (uint64_t)len) return 0;
+    if (count > (uint64_t)len - f->offset) count = (uint64_t)len - f->offset;
+    memcpy(buf, text + f->offset, count);
+    f->offset += count;
+    return (int)count;
+}
+
+static vfs_file_ops_t mousediag_ops = { .read = mousediag_read };
 
 static int mousectl_write(vfs_file_t *f, const void *buf, uint64_t count) {
     (void)f;
@@ -832,6 +857,7 @@ void input_register_devfs(void) {
     devfs_register_device("input/mouse0",      VFS_TYPE_CHAR_DEV, &mouse_ops, NULL);
     devfs_register_device("kbd",               VFS_TYPE_CHAR_DEV, &kbd_ops, NULL);
     devfs_register_device("input/mousectl",    VFS_TYPE_CHAR_DEV, &mousectl_ops, NULL);
+    devfs_register_device("input/mousediag",   VFS_TYPE_FILE, &mousediag_ops, NULL);
 }
 
 void inout_keyboard_task(void) {
@@ -917,6 +943,7 @@ void inout_add_event(inout_event_t ev) {
         evdev_report_mouse(dx, dy, dz, btn, 0);
     }
 
+    __atomic_fetch_add(&decoded_mouse_events, 1, __ATOMIC_RELAXED);
     new_mouse_event = true;
     irq_restore(flags);
 }

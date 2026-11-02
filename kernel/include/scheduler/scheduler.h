@@ -62,6 +62,7 @@ typedef struct process {
     char cwd[256];
     void *sigactions[64];
     int exit_code;
+    int term_signal; /* Nonzero when wait4 must report signal termination. */
 
     uint32_t uid;
     uint32_t euid;
@@ -140,5 +141,8 @@ void task_wake_thread(thread_t *t);
 process_t *get_current_process(void);
 thread_t  *get_current_thread(void);
 bool tasks_insert(process_t *proc);
+/* Queue SIGINT for the controlling PTY's foreground processes. If job
+   control did not set a foreground pgid, restrict delivery to shell children. */
+int scheduler_tty_sigint(void *tty, uint64_t foreground_pgid);
 
 #endif

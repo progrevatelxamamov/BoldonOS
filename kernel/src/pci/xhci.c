@@ -1489,6 +1489,7 @@ static void handle_keyboard_report(struct usb_hid *hid, const uint8_t *r, uint32
 
 static void handle_mouse_report(struct usb_hid *hid, const uint8_t *r, uint32_t report_len) {
     if (!r || report_len == 0 || report_len > 64) return;
+    inout_note_usb_mouse_report();
     if (report_len > hid->report_size) report_len = hid->report_size;
 
     int dx = 0;

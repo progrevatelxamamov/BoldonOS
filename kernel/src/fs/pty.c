@@ -144,11 +144,26 @@ static int pty_master_read(vfs_file_t *file, void *buf, uint64_t count) {
     }
 }
 
+static bool pty_handle_intr(pty_t *p, uint8_t byte) {
+    if (!p || !(p->termios.c_lflag & ISIG) ||
+        !p->termios.c_cc[VINTR] || byte != p->termios.c_cc[VINTR])
+        return false;
+    scheduler_tty_sigint(p, p->foreground_pgid);
+    if (!(p->termios.c_lflag & NOFLSH)) p->in.tail = p->in.head;
+    return true; /* VINTR is a signal, not input for the foreground program. */
+}
+
 static int pty_master_write(vfs_file_t *file, const void *buf, uint64_t count) {
     if (!file || !file->node || !buf) return -EFAULT;
     pty_t *p = (pty_t *)file->node->fs_data;
     if (!p) return -EINVAL;
-    return ring_write(&p->in, (const uint8_t *)buf, count);
+    const uint8_t *bytes = (const uint8_t *)buf;
+    uint64_t done = 0;
+    for (; done < count; done++) {
+        if (pty_handle_intr(p, bytes[done])) continue;
+        if (!ring_write(&p->in, &bytes[done], 1)) break;
+    }
+    return (int)done;
 }
 
 static int pty_slave_read(vfs_file_t *file, void *buf, uint64_t count) {
@@ -206,6 +221,7 @@ static int pty_slave_write(vfs_file_t *file, const void *buf, uint64_t count) {
 }
 
 static void pty_reset_pair(pty_t *p) {
+    p->foreground_pgid = 0;
     memset(&p->in, 0, sizeof(pty_ring_t));
     memset(&p->out, 0, sizeof(pty_ring_t));
     pty_get_screen_dimensions(&p->winsize_row, &p->winsize_col);
@@ -443,13 +459,19 @@ static int pty_ioctl(vfs_file_t *file, uint64_t request, void *arg) {
     if (request == TIOCGPGRP) {
         if (!arg) return -EFAULT;
         process_t *proc = get_current_process();
-        *(int *)arg = proc ? proc->pgid : 1;
+        *(int *)arg = (int)(p->foreground_pgid ? p->foreground_pgid :
+                             (proc ? proc->pgid : 1));
         return 0;
     }
 
-    if (request == TIOCSPGRP || request == TIOCSCTTY) {
+    if (request == TIOCSPGRP) {
+        if (!arg) return -EFAULT;
+        int pgid = *(int *)arg;
+        if (pgid <= 0) return -EINVAL;
+        p->foreground_pgid = (uint64_t)pgid;
         return 0;
     }
+    if (request == TIOCSCTTY) return 0;
 
     return -25; // -ENOTTY
 }
@@ -631,7 +653,8 @@ static void pty_input_mode_sync(void) {
 static void pty_feed_byte(uint8_t val) {
     for (int i = 0; i < MAX_PTYS; i++) {
         if (ptys[i].used) {
-            ring_write(&ptys[i].in, &val, 1);
+            if (!pty_handle_intr(&ptys[i], val))
+                ring_write(&ptys[i].in, &val, 1);
             return;
         }
     }

@@ -142,6 +142,8 @@
 #define SYS_STATX       332
 #define SYS_MOUNT       165
 #define SYS_UMOUNT2     166
+/* Linux's new mount API; legacy mount(2) remains the supported path. */
+#define SYS_FSOPEN      430
 
 void syscall_init(void);
 uint64_t syscall_handler(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6);

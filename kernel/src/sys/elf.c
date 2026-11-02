@@ -490,6 +490,10 @@ int sys_execve(const char *pathname, char *const argv[], char *const envp[])
     uint64_t target_entry = has_interp ? interp_entry : entry_point;
 
     if (p->pid == 0) p->pid = 1;
+    /* The init kernel task becomes the interactive shell here; its original
+       kernel-task pgid/sid are zero and cannot be a tty foreground group. */
+    if (p->pgid == 0) p->pgid = p->pid;
+    if (p->sid == 0) p->sid = p->pid;
     if (thr->tid == 0) thr->tid = 1;
 
     void *fpu_ptr = thread_get_fpu_state(thr);

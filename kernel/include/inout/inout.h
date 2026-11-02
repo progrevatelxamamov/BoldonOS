@@ -234,6 +234,8 @@ static const char keymap_caps[KEY_MAX] = {
 
 void inout_init(void);
 void inout_add_event(inout_event_t ev);
+/* Diagnostic counters for received mouse HID reports and decoded events. */
+void inout_note_usb_mouse_report(void);
 void inout_set_mouse_speed(int percent);
 int  inout_get_mouse_speed(void);
 void inout_call_scheduler(void);
