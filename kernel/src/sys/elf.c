@@ -9,6 +9,7 @@
 #include <scheduler/scheduler.h>
 #include <memory.h>
 #include <errno.h>
+#include <syscall/xorgtrace.h>
 #include <io.h>
 
 #define STACK_SIZE (2 * 1024 * 1024)
@@ -170,6 +171,11 @@ static int sys_execve_depth(const char *pathname, char *const argv[],
 
     vfs_file_t *f = vfs_open(pathname, VFS_O_READ);
     if (!f) { errno = ENOENT; return -1; }
+    if (xorgtrace_exec_target(pathname)) {
+        process_t *current = get_current_process();
+        xorgtrace_stage("exec.open", current ? current->pid : 0,
+                        (uint64_t)xorgtrace_exec_target(pathname));
+    }
 
     char header[256];
     int header_len = vfs_read(f, header, sizeof(header));
@@ -312,6 +318,11 @@ static int sys_execve_depth(const char *pathname, char *const argv[],
     uint64_t interp_base  = 0x40000000ULL;
     uint64_t interp_entry = 0;
     if (has_interp) {
+        if (xorgtrace_exec_target(pathname)) {
+            process_t *current = get_current_process();
+            xorgtrace_stage("exec.interp", current ? current->pid : 0,
+                            (uint64_t)xorgtrace_exec_target(pathname));
+        }
         int rc = load_interp(new_pml4, interp_path, interp_base, &interp_entry);
         if (rc != 0) {
             malloc_free(phdrs); vfs_close(f);
@@ -468,6 +479,8 @@ static int sys_execve_depth(const char *pathname, char *const argv[],
         malloc_free(phdrs); vfs_close(f); errno = ESRCH; return -1;
     }
 
+    if (xorgtrace_exec_target(pathname))
+        xorgtrace_stage("exec.entry", p->pid, (uint64_t)xorgtrace_exec_target(pathname));
     __asm__ volatile("cli");
     thr->regs->rip    = has_interp ? interp_entry : entry_point;
     thr->regs->rsp    = final_rsp;
@@ -596,5 +609,11 @@ static int sys_execve_depth(const char *pathname, char *const argv[],
     __builtin_unreachable();
 }
 int sys_execve(const char *pathname, char *const argv[], char *const envp[]) {
-    return sys_execve_depth(pathname, argv, envp, 0);
+    int target = xorgtrace_exec_target(pathname);
+    process_t *p = target ? get_current_process() : NULL;
+    uint64_t pid = p ? p->pid : 0;
+    if (target) xorgtrace_stage("exec.begin", pid, (uint64_t)target);
+    int result = sys_execve_depth(pathname, argv, envp, 0);
+    if (target && result < 0) xorgtrace_stage("exec.fail", pid, (uint64_t)errno);
+    return result;
 }

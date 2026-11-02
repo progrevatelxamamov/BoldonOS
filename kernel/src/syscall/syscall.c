@@ -1,11 +1,14 @@
 #include "gconsole.h"
 #include <syscall/syscall.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include <io.h>
 #include <desc/gdt.h>
 #include <fs/vfs.h>
 #include <scheduler/scheduler.h>
 #include <errno.h>
+#include <string.h>
+#include <syscall/xorgtrace.h>
 
 #define IA32_STAR_MSR        0xC0000081
 #define IA32_LSTAR_MSR       0xC0000082
@@ -185,6 +188,7 @@ void syscall_save_frame(struct interrupt_frame *frame) {
 }
 
 void syscall_init(void) {
+    xorgtrace_register(); /* devfs has already been mounted by kstart */
     uint64_t cr4;
     __asm__ volatile("mov %%cr4, %0" : "=r"(cr4));
     cr4 &= ~(1ULL << 21); // Сбрасываем 21-й бит
@@ -380,7 +384,16 @@ uint64_t syscall_handler(uint64_t num,
                          uint64_t a1, uint64_t a2, uint64_t a3,
                          uint64_t a4, uint64_t a5, uint64_t a6)
 {
+    process_t *p = get_current_process();
+    const char *name = p ? p->name : NULL;
+    bool xorg = name && (!strcmp(name, "Xorg") || !strcmp(name, "Xorg.wrap") ||
+                         !strcmp(name, "X"));
+    bool xinit_spawn = name && !strcmp(name, "xinit") &&
+                       (num == SYS_CLONE || num == SYS_FORK || num == SYS_EXECVE);
+    uint64_t ticket = (xorg || xinit_spawn) ?
+        xorgtrace_syscall_enter(p->pid, num, a1, a2) : 0;
     uint64_t ret = osdev_syscall_handler(num, a1, a2, a3, a4, a5, a6);
+    xorgtrace_syscall_exit(ticket, (int64_t)ret);
     // if (dbg_cnt < 100) {
     //     console_print_string("[S] ");
     //     console_print_num(num);
