@@ -344,6 +344,63 @@ usb_decode_interval(usb_speed speed, const endpoint_type type, const unsigned ch
 #undef LOG2
 }
 
+/* Endpoint numbers are device-wide. Include all active HID interfaces in a
+ * composite HID before finish_device_config; leave other classes unchanged. */
+static void
+usb_gather_config_endpoints(usbdev_t *dev, u8 *ptr, u8 *end, int composite_hid)
+{
+	int accept = 1;
+	int extra_iface = 0;
+	dev->num_endp = 1;
+	for (; ptr + 2 <= end && ptr[0] && ptr + ptr[0] <= end; ptr += ptr[0]) {
+		if (ptr[1] == DT_CFG) break;
+		if (ptr[1] == DT_INTF) {
+			if (!composite_hid) break;
+			if (ptr[0] < sizeof(interface_descriptor_t)) { accept = 0; continue; }
+			interface_descriptor_t *iface = (void *)ptr;
+			accept = iface->bInterfaceClass == 3 && iface->bAlternateSetting == 0;
+			extra_iface = 1;
+			inout_usb_trace("lp.iface-extra",
+				(uint32_t)dev->descriptor->idVendor << 16 |
+				dev->descriptor->idProduct,
+				(uint32_t)iface->bInterfaceNumber << 24 |
+				(uint32_t)iface->bInterfaceClass << 16 |
+				(uint32_t)iface->bInterfaceSubClass << 8 |
+				iface->bInterfaceProtocol,
+				iface->bAlternateSetting, (uint32_t)accept);
+			continue;
+		}
+		if (!accept || ptr[1] != DT_ENDP ||
+		    ptr[0] < sizeof(endpoint_descriptor_t)) continue;
+		if (dev->num_endp >= (int)ARRAY_SIZE(dev->endpoints)) break;
+		endpoint_descriptor_t *desc = (void *)ptr;
+		/* The adapter can use only interrupt-IN packets up to 64 bytes on
+		 * additional HID interfaces. Don't risk failing the existing
+		 * keyboard's Configure Endpoint command for unsupported extras. */
+		if (extra_iface && ((desc->bmAttributes & 3) != INTERRUPT ||
+		    !(desc->bEndpointAddress & 0x80) ||
+		    desc->wMaxPacketSize < 3 || desc->wMaxPacketSize > 64))
+			continue;
+		int duplicate = 0;
+		for (int i = 1; i < dev->num_endp; ++i)
+			if (dev->endpoints[i].endpoint == desc->bEndpointAddress)
+				duplicate = 1;
+		if (duplicate) continue;
+		endpoint_t *ep = &dev->endpoints[dev->num_endp++];
+		ep->dev = dev;
+		ep->endpoint = desc->bEndpointAddress;
+		ep->toggle = 0;
+		ep->maxpacketsize = desc->wMaxPacketSize;
+		ep->direction = (desc->bEndpointAddress & 0x80) ? IN : OUT;
+		ep->type = desc->bmAttributes & 0x3;
+		ep->interval = usb_decode_interval(dev->speed, ep->type, desc->bInterval);
+		inout_usb_trace("lp.endpoint",
+			(uint32_t)dev->descriptor->idVendor << 16 | dev->descriptor->idProduct,
+			(uint32_t)ep->endpoint, (uint32_t)ep->type,
+			(uint32_t)ep->maxpacketsize);
+	}
+}
+
 usbdev_t *
 generic_set_address(hci_t *controller, usb_speed speed,
 		     int hubport, int hubaddr)
@@ -524,35 +581,11 @@ set_address(hci_t *controller, usb_speed speed, int hubport, int hubaddr)
 		break;
 	}
 
-	/* Gather up all endpoints belonging to this interface */
-	dev->num_endp = 1;
-	for (; ptr + 2 <= end && ptr[0] && ptr + ptr[0] <= end; ptr += ptr[0]) {
-		if (ptr[1] == DT_INTF || ptr[1] == DT_CFG ||
-				dev->num_endp >= ARRAY_SIZE(dev->endpoints))
-			break;
-		if (ptr[1] != DT_ENDP)
-			continue;
-
-		endpoint_descriptor_t *desc = (void *)ptr;
-		static const char *transfertypes[4] = {
-			"control", "isochronous", "bulk", "interrupt"
-		};
-		usb_debug(" #Endpoint %d (%s), max packet size %x, type %s\n",
-			desc->bEndpointAddress & 0x7f,
-			(desc->bEndpointAddress & 0x80) ? "in" : "out",
-			desc->wMaxPacketSize,
-			transfertypes[desc->bmAttributes & 0x3]);
-
-		endpoint_t *ep = &dev->endpoints[dev->num_endp++];
-		ep->dev = dev;
-		ep->endpoint = desc->bEndpointAddress;
-		ep->toggle = 0;
-		ep->maxpacketsize = desc->wMaxPacketSize;
-		ep->direction = (desc->bEndpointAddress & 0x80) ? IN : OUT;
-		ep->type = desc->bmAttributes & 0x3;
-		ep->interval = usb_decode_interval(dev->speed, ep->type,
-						    desc->bInterval);
-	}
+	/* xHCI configures every endpoint in dev->endpoints at once. For a
+	 * composite HID include alternate-setting-zero HID interfaces beyond
+	 * the first; do not add unrelated video/storage/vendor endpoints. */
+	usb_gather_config_endpoints(dev, ptr, end,
+		dev->descriptor->bDeviceClass == 0 && intf->bInterfaceClass == 3);
 
 	if ((controller->finish_device_config &&
 			controller->finish_device_config(dev)) ||

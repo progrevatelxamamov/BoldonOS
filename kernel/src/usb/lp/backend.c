@@ -83,6 +83,7 @@ void lp_backend_initialize(void) {
 void lp_backend_poll(void) { usb_poll(); }
 
 struct lp_hid {
+    struct lp_hid *next;
     endpoint_t *ep;
     void *queue;
     void *input;
@@ -90,63 +91,59 @@ struct lp_hid {
 };
 static void lp_hid_destroy(usbdev_t *dev) {
     struct lp_hid *hid = dev->data;
-    if (!hid) return;
-    inout_usb_trace("lp.detach", dev->descriptor ?
-                    ((uint32_t)dev->descriptor->idVendor << 16 | dev->descriptor->idProduct) : 0,
-                    hid->iface, 0, 0);
-    dev->controller->destroy_intr_queue(hid->ep, hid->queue);
-    boldon_usb_input_destroy(hid->input);
-    free(hid);
     dev->data = NULL;
+    while (hid) {
+        struct lp_hid *next = hid->next;
+        inout_usb_trace("lp.detach", dev->descriptor ?
+                        ((uint32_t)dev->descriptor->idVendor << 16 | dev->descriptor->idProduct) : 0,
+                        hid->iface, 0, 0);
+        dev->controller->destroy_intr_queue(hid->ep, hid->queue);
+        boldon_usb_input_destroy(hid->input);
+        free(hid);
+        hid = next;
+    }
 }
 static void lp_hid_poll(usbdev_t *dev) {
-    struct lp_hid *hid = dev->data;
-    if (!hid) return;
-    boldon_usb_input_poll(hid->input);
-    uint8_t desired = lp_platform_leds();
-    if (desired != hid->leds) {
-        uint8_t data[64], id = 0;
-        int n = boldon_usb_input_led_report(hid->input, desired, data, &id);
-        hid->leds = desired;
-        if (n > 0) {
-            dev_req_t request = {.bmRequestType = 0x21, .bRequest = 9,
-                .wValue = 0x0200 | id, .wIndex = hid->iface, .wLength = n};
-            dev->controller->control(dev, OUT, sizeof(request), &request, n, data);
+    for (struct lp_hid *hid = dev->data; hid; hid = hid->next) {
+        boldon_usb_input_poll(hid->input);
+        uint8_t desired = lp_platform_leds();
+        if (desired != hid->leds) {
+            uint8_t data[64], id = 0;
+            int n = boldon_usb_input_led_report(hid->input, desired, data, &id);
+            hid->leds = desired;
+            if (n > 0) {
+                dev_req_t request = {.bmRequestType = 0x21, .bRequest = 9,
+                    .wValue = 0x0200 | id, .wIndex = hid->iface, .wLength = n};
+                dev->controller->control(dev, OUT, sizeof(request), &request, n, data);
+            }
         }
+        u8 *report;
+        unsigned budget = 32;
+        while (budget-- && (report = dev->controller->poll_intr_queue(hid->queue)))
+            boldon_usb_input_report(hid->input, report, MIN(hid->ep->maxpacketsize, 64));
     }
-    u8 *report;
-    unsigned budget = 32;
-    while (budget-- && (report = dev->controller->poll_intr_queue(hid->queue)))
-        boldon_usb_input_report(hid->input, report, MIN(hid->ep->maxpacketsize, 64));
 }
 
-void usb_hid_init(usbdev_t *dev) {
-    u8 *ptr = (u8 *)dev->configuration;
-    u8 *end = ptr + dev->configuration->wTotalLength;
-    interface_descriptor_t *iface = NULL;
-    uint16_t report_length = 0;
-    while (ptr + 2 <= end && ptr[0] >= 2 && ptr + ptr[0] <= end) {
-        if (ptr[1] == DT_INTF && ptr[0] >= sizeof(*iface)) {
-            if (iface) break;
-            interface_descriptor_t *candidate = (void *)ptr;
-            if (candidate->bInterfaceClass == 3) iface = candidate;
-        } else if (iface && ptr[1] == 0x21 && ptr[0] >= 9) {
-            report_length = ptr[7] | ((uint16_t)ptr[8] << 8);
-        }
-        ptr += ptr[0];
-    }
-    endpoint_t *ep = NULL;
-    for (int i = 1; i < dev->num_endp; i++)
-        if (dev->endpoints[i].type == INTERRUPT && dev->endpoints[i].direction == IN) { ep = &dev->endpoints[i]; break; }
+/* The USB address is shared by every interface. Each HID interface owns its
+ * own report descriptor, protocol state, interrupt endpoint and queue. */
+static void lp_hid_attach_interface(usbdev_t *dev, interface_descriptor_t *iface,
+                                    uint16_t report_length, uint8_t ep_addr) {
     uint32_t id = dev->descriptor ? ((uint32_t)dev->descriptor->idVendor << 16 |
                                      dev->descriptor->idProduct) : 0;
+    endpoint_t *ep = NULL;
+    for (int i = 1; i < dev->num_endp; i++)
+        if (dev->endpoints[i].type == INTERRUPT &&
+            dev->endpoints[i].direction == IN &&
+            dev->endpoints[i].endpoint == ep_addr) {
+            ep = &dev->endpoints[i]; break;
+        }
     inout_usb_trace("lp.hid", id,
-                    iface ? ((uint32_t)iface->bInterfaceNumber << 16 |
-                             (uint32_t)iface->bInterfaceSubClass << 8 |
-                             iface->bInterfaceProtocol) : 0xFFFFFFFFu,
+                    ((uint32_t)iface->bInterfaceNumber << 16 |
+                     (uint32_t)iface->bInterfaceSubClass << 8 |
+                     iface->bInterfaceProtocol),
                     ep ? ep->maxpacketsize : 0, report_length);
-    if (!iface || !ep || ep->maxpacketsize < 3 || ep->maxpacketsize > 64) {
-        inout_usb_trace("lp.noep", id, iface != NULL, ep != NULL,
+    if (!ep || ep->maxpacketsize < 3 || ep->maxpacketsize > 64) {
+        inout_usb_trace("lp.noep", id, iface->bInterfaceNumber, ep_addr,
                         ep ? ep->maxpacketsize : 0);
         return;
     }
@@ -186,13 +183,45 @@ void usb_hid_init(usbdev_t *dev) {
     dev->controller->control(dev, OUT, sizeof(idle), &idle, 0, NULL);
     hid->queue = dev->controller->create_intr_queue(ep, ep->maxpacketsize, 4, 10);
     if (!hid->queue) {
-        inout_usb_trace("lp.queue-fail", id, ep->maxpacketsize, 0, 0);
+        inout_usb_trace("lp.queue-fail", id, ep->maxpacketsize, iface->bInterfaceNumber, 0);
         boldon_usb_input_destroy(hid->input); free(hid); return;
     }
     inout_usb_trace("lp.ready", id, protocol, mode, ep->maxpacketsize);
+    hid->next = dev->data;
     dev->data = hid;
     dev->destroy = lp_hid_destroy;
     dev->poll = lp_hid_poll;
+}
+
+void usb_hid_init(usbdev_t *dev) {
+    if (!dev || !dev->configuration) return;
+    u8 *ptr = (u8 *)dev->configuration;
+    u8 *end = ptr + dev->configuration->wTotalLength;
+    interface_descriptor_t *iface = NULL;
+    uint16_t report_length = 0;
+    uint8_t ep_addr = 0;
+    while (ptr + 2 <= end && ptr[0] >= 2 && ptr + ptr[0] <= end) {
+        if (ptr[1] == DT_INTF) {
+            if (iface) lp_hid_attach_interface(dev, iface, report_length, ep_addr);
+            iface = NULL;
+            report_length = 0;
+            ep_addr = 0;
+            if (ptr[0] >= sizeof(interface_descriptor_t)) {
+                interface_descriptor_t *candidate = (void *)ptr;
+                if (candidate->bInterfaceClass == 3 && candidate->bAlternateSetting == 0)
+                    iface = candidate;
+            }
+        } else if (iface && ptr[1] == 0x21 && ptr[0] >= 9) {
+            report_length = ptr[7] | ((uint16_t)ptr[8] << 8);
+        } else if (iface && ptr[1] == DT_ENDP && ptr[0] >= sizeof(endpoint_descriptor_t)) {
+            endpoint_descriptor_t *desc = (void *)ptr;
+            if ((desc->bmAttributes & 3) == INTERRUPT &&
+                (desc->bEndpointAddress & 0x80) && !ep_addr)
+                ep_addr = desc->bEndpointAddress;
+        }
+        ptr += ptr[0];
+    }
+    if (iface) lp_hid_attach_interface(dev, iface, report_length, ep_addr);
 }
 
 struct lp_disk { usbdev_t *dev; char name[32]; bool removing; };

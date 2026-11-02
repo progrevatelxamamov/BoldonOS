@@ -85,10 +85,12 @@ dereferencing its potentially freed usbdev.
   controller stack does not prove that its Address Device timeout is fixed.
 - USB is polled by one worker, not interrupt-driven. A long control/MSC timeout
   serializes other USB activity, although the scheduler and non-USB tasks run.
-- The upstream core selects one interface per device. Simple keyboard, mouse,
-  hubs and bulk-only storage are supported paths; arbitrary composite devices,
-  multiple HID interfaces, UAS, isochronous audio/video and USB Wi-Fi are not
-  promised. Multi-LUN MSC remains the upstream single-LUN model.
+- For composite HID with a HID first interface, the adapter now configures all
+  alternate-setting-zero HID interrupt endpoints and binds keyboard/mouse
+  interfaces independently. It does not bind mixed HID+MSC/video/vendor
+  classes on a single device, arbitrary non-HID composite devices, UAS,
+  isochronous audio/video or USB Wi-Fi. Multi-LUN MSC remains the upstream
+  single-LUN model.
 - Capacity is the upstream READ CAPACITY(10) 32-bit block count, conservatively
   saturated below 2^32 blocks. READ CAPACITY(16)/READ(16) are not implemented.
 - Existing `usb_net.c` and RTL8192EU drivers directly use old xHCI rings and
