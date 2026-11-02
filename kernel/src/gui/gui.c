@@ -24,7 +24,7 @@ void gui_server(void) {
 
     while (1) {
         if (gconsole_framebuffer_acquired()) {
-            task_sleep_ms(16);
+            schedule_yield();
             continue;
         }
 
@@ -56,7 +56,7 @@ void gui_server(void) {
             old_pressed = pressed;
         }
 
-        task_sleep_ms(8);
+        schedule_yield();
     }
 }
 
