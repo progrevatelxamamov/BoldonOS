@@ -190,9 +190,21 @@ uint64_t sys_chdir_impl(uint64_t path) {
     process_t *p = get_current_process();
     if (p) {
         const char *s = (const char *)path;
+        char cwd[sizeof(p->cwd)];
         size_t len = 0;
-        while (s[len] && len < 255) { p->cwd[len] = s[len]; len++; }
-        p->cwd[len] = 0;
+        if (s[0] != '/' && !(((s[0] >= 'A' && s[0] <= 'Z') ||
+                              (s[0] >= 'a' && s[0] <= 'z')) && s[1] == ':')) {
+            const char *base = p->cwd[0] ? p->cwd : "/";
+            while (base[len] && len < sizeof(cwd) - 1) { cwd[len] = base[len]; len++; }
+            if (base[len]) return (uint64_t)-ENAMETOOLONG;
+            if (len == 0 || cwd[len - 1] != '/') cwd[len++] = '/';
+        }
+        for (size_t i = 0; s[i]; i++) {
+            if (len >= sizeof(cwd) - 1) return (uint64_t)-ENAMETOOLONG;
+            cwd[len++] = s[i];
+        }
+        cwd[len] = 0;
+        memcpy(p->cwd, cwd, len + 1);
     }
     return 0;
 }

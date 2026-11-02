@@ -510,8 +510,6 @@ int sys_execve(const char *pathname, char *const argv[], char *const envp[])
     wrmsr(IA32_GS_BASE, 0);
     wrmsr(IA32_KERNEL_GS_BASE, (uint64_t)get_current_local_data());
 
-    /* Distinguish this image from older boots which pushed SS=0x18. */
-    console_print_string("[EXEC] IRET target SS=0x1B\n");
     __asm__ volatile (
         "cli\n\t"
         "mov %0, %%ds\n\t"

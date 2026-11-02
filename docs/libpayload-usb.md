@@ -115,8 +115,11 @@ Full kernel/image build and VM boot still need NASM (and image/QEMU tools), whic
 were unavailable in the integration environment; a successful host harness is
 not a hardware boot test.
 
-On hardware, collect logs starting with `[BOOT] PCI scan`, `[LPUSB] initializing
-PCI`, `controller ready`, HID/disk registration and the first upstream failure.
+Routine libpayload USB enumeration messages are now disabled by default
+(`USB_DEBUG` is no longer defined in `usb-compat/libpayload.h`, and the adapter
+omits controller/HID/disk success messages). Fatal errors and adapter failures
+remain visible. For a hardware investigation, temporarily enable `USB_DEBUG`
+in the compatibility header and inspect the controller and HID/disk logs.
 Test both controllers, hubs, long keyboard/mouse idle, unplug/replug, Nano-X,
 and a disposable storage device including reads/writes/flush/eject. Do not use
 important data for first write testing.

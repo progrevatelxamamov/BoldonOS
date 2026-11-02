@@ -153,18 +153,6 @@ void launch_init_process(void) {
     if (!vfs_get_mount('C')) {
         init_no_root_hint();
         while (!vfs_get_mount('C')) schedule_yield();
-        console_print_string("[INIT] root appeared, continuing boot\n");
-    }
-
-    vfs_mount_t *root = vfs_get_mount('C');
-    if (root) {
-        console_print_string("[INIT] C: device=");
-        console_print_string(root->device);
-        console_print_string(" fs=");
-        console_print_string(root->fs_name);
-        console_print_string(" start_lba=");
-        console_print_num(root->start_lba);
-        console_print_string("\n");
     }
 
     /* Keep the real root layout usable for programs that inspect /proc,
@@ -178,14 +166,9 @@ void launch_init_process(void) {
             console_print_string("\n");
         }
     }
-    console_print_string("[INIT] /proc/partitions: ");
-    console_print_string(vfs_stat("/proc/partitions", &st) == 0 ? "ready\n" : "missing\n");
-    console_print_string("[INIT] C:/bin/sh: ");
-    console_print_string(vfs_stat("C:/bin/sh", &st) == 0 ? "present\n" : "not found\n");
-    console_print_string("[INIT] C:/etc/init.sh: ");
-    console_print_string(vfs_stat("C:/etc/init.sh", &st) == 0 ? "present\n" : "not found\n");
+    if (vfs_stat("/proc/partitions", &st) != 0)
+        console_print_string("[INIT] /proc/partitions missing\n");
 
-    console_print_string("[INIT] Starting /etc/init.sh...\n");
     sys_execve("/bin/sh", argv, envp);
     int script_error = errno;
     init_exec_failure("/etc/init.sh", script_error);
