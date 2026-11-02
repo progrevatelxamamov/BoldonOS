@@ -71,7 +71,11 @@ uint64_t xorgtrace_syscall_enter(uint64_t pid, uint64_t num,
     /* Diagnostic fallback when /dev/xorgtrace cannot be read because the
        shell stalls. Never print every syscall: Xorg can issue thousands. */
     unsigned sample = __atomic_fetch_add(&syscall_console_count, 1, __ATOMIC_RELAXED);
-    uint8_t printed = sample < 12 || (sample < 512 && (sample % 64) == 0);
+    /* Keep a sparse progress signal after the first 512 calls too: the
+       guest shell may be unavailable long before Xorg stops making calls. */
+    uint8_t printed = sample < 12 ||
+                      (sample < 512 && (sample % 64) == 0) ||
+                      (sample < 8192 && sample >= 512 && (sample % 512) == 0);
     uint64_t ticket = append("syscall", pid, (uint32_t)num, a1, a2, 0, 1, printed);
     if (printed) {
         console_print_string("[XORGTRACE] enter pid=");
