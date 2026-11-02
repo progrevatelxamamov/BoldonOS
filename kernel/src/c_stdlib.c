@@ -3,6 +3,9 @@
 #include <stdlib.h>
 #include <gconsole.h>
 #include <stdarg.h>
+#include <limits.h>
+#include <stdint.h>
+#include <stdbool.h>
 
 size_t strlen(const char *s) {
     size_t len = 0;
@@ -99,64 +102,148 @@ int printf(const char *format, ...) {
     return 0;
 }
 
-static void itoa(int n, char *s, int base) {
-    static char digits[] = "0123456789abcdef";
-    char buf[32];
-    int i = 0;
-    unsigned int num = (unsigned int)n;
-    if (n < 0 && base == 10) {
-        *s++ = '-';
-        num = -n;
+/* Freestanding formatter used by procfs, mountinfo and disk diagnostics.
+   Keep va_arg consumption aligned with the complete conversion specification:
+   skipping %4u/%10llu made a later %s treat the integer 8 as a pointer. */
+typedef struct {
+    char *data;
+    size_t capacity;
+    size_t length; /* full length, including bytes truncated from output */
+} format_output_t;
+
+static void format_char(format_output_t *out, char c) {
+    if (out->capacity && out->length < out->capacity - 1)
+        out->data[out->length] = c;
+    if (out->length < (size_t)INT_MAX) out->length++;
+}
+
+static void format_padding(format_output_t *out, char c, int count) {
+    while (count-- > 0) format_char(out, c);
+}
+
+static int format_vprintf(char *dest, size_t cap, const char *fmt, va_list ap) {
+    if (!fmt || (cap && !dest)) return -1;
+    format_output_t out = {dest, cap, 0};
+    while (*fmt) {
+        if (*fmt != '%') { format_char(&out, *fmt++); continue; }
+        fmt++;
+        if (*fmt == '%') { format_char(&out, *fmt++); continue; }
+        if (!*fmt) { format_char(&out, '%'); break; }
+
+        bool left = false, zero = false, alt = false, plus = false, space = false;
+        for (;;) {
+            if (*fmt == '-') left = true;
+            else if (*fmt == '0') zero = true;
+            else if (*fmt == '#') alt = true;
+            else if (*fmt == '+') plus = true;
+            else if (*fmt == ' ') space = true;
+            else break;
+            fmt++;
+        }
+        int width = 0;
+        if (*fmt == '*') {
+            width = va_arg(ap, int);
+            if (width < 0) { left = true; width = width == INT_MIN ? INT_MAX : -width; }
+            fmt++;
+        } else {
+            while (*fmt >= '0' && *fmt <= '9') {
+                if (width < 65536) width = width * 10 + (*fmt - '0');
+                fmt++;
+            }
+        }
+        if (width > 65536) width = 65536;
+        int precision = -1;
+        if (*fmt == '.') {
+            precision = 0;
+            fmt++;
+            if (*fmt == '*') { precision = va_arg(ap, int); fmt++; }
+            else while (*fmt >= '0' && *fmt <= '9') {
+                if (precision < 65536) precision = precision * 10 + (*fmt - '0');
+                fmt++;
+            }
+            if (precision > 65536) precision = 65536;
+        }
+        int length = 0; /* 0=int, 1=long, 2=long long, 3=size_t */
+        if (*fmt == 'h') { fmt++; if (*fmt == 'h') fmt++; }
+        else if (*fmt == 'l') { length = 1; fmt++; if (*fmt == 'l') { length = 2; fmt++; } }
+        else if (*fmt == 'z' || *fmt == 't') { length = 3; fmt++; }
+        char spec = *fmt;
+        if (!spec) break;
+        fmt++;
+        if (spec == 's') {
+            const char *text = va_arg(ap, const char *);
+            if (!text) text = "(null)";
+            size_t n = 0;
+            while (text[n] && (precision < 0 || n < (size_t)precision)) n++;
+            if (!left && width > (int)n) format_padding(&out, ' ', width - (int)n);
+            for (size_t i = 0; i < n; i++) format_char(&out, text[i]);
+            if (left && width > (int)n) format_padding(&out, ' ', width - (int)n);
+            continue;
+        }
+        if (spec == 'c') {
+            int c = va_arg(ap, int);
+            if (!left) format_padding(&out, ' ', width - 1);
+            format_char(&out, (char)c);
+            if (left) format_padding(&out, ' ', width - 1);
+            continue;
+        }
+        if (spec != 'd' && spec != 'i' && spec != 'u' && spec != 'x' &&
+            spec != 'X' && spec != 'o' && spec != 'p') {
+            format_char(&out, '%'); format_char(&out, spec);
+            continue;
+        }
+        bool signed_num = spec == 'd' || spec == 'i';
+        uint64_t value;
+        char sign = 0;
+        if (signed_num) {
+            int64_t signed_value = length == 2 ? va_arg(ap, long long) :
+                                   length == 1 ? va_arg(ap, long) :
+                                   length == 3 ? va_arg(ap, ptrdiff_t) : va_arg(ap, int);
+            if (signed_value < 0) { sign = '-'; value = 0ULL - (uint64_t)signed_value; }
+            else { sign = plus ? '+' : space ? ' ' : 0; value = (uint64_t)signed_value; }
+        } else if (spec == 'p') {
+            value = (uintptr_t)va_arg(ap, void *);
+            alt = true;
+        } else {
+            value = length == 2 ? va_arg(ap, unsigned long long) :
+                    length == 1 ? va_arg(ap, unsigned long) :
+                    length == 3 ? va_arg(ap, size_t) : va_arg(ap, unsigned int);
+        }
+        unsigned base = spec == 'o' ? 8 : spec == 'x' || spec == 'X' || spec == 'p' ? 16 : 10;
+        const char *digits = spec == 'X' ? "0123456789ABCDEF" : "0123456789abcdef";
+        char reverse[32];
+        int n = 0;
+        uint64_t original = value;
+        do { reverse[n++] = digits[value % base]; value /= base; } while (value);
+        if (precision == 0 && original == 0) n = 0;
+        char prefix = (alt && base == 16 && (original || spec == 'p')) ? (spec == 'X' ? 'X' : 'x') : 0;
+        int leading = precision > n ? precision - n : 0;
+        int occupied = n + leading + (sign != 0) + (prefix ? 2 : 0);
+        int pad = width > occupied ? width - occupied : 0;
+        if (!left && (!zero || precision >= 0)) format_padding(&out, ' ', pad);
+        if (sign) format_char(&out, sign);
+        if (prefix) { format_char(&out, '0'); format_char(&out, prefix); }
+        if (!left && zero && precision < 0) format_padding(&out, '0', pad);
+        format_padding(&out, '0', leading);
+        while (n) format_char(&out, reverse[--n]);
+        if (left) format_padding(&out, ' ', pad);
     }
-    do {
-        buf[i++] = digits[num % base];
-        num /= base;
-    } while (num > 0);
-    while (i > 0) *s++ = buf[--i];
-    *s = '\0';
+    if (cap) dest[out.length < cap ? out.length : cap - 1] = 0;
+    return (int)out.length;
 }
 
 int snprintf(char *str, size_t size, const char *format, ...) {
-    if (!str || !format || size == 0) return 0;
     va_list args;
     va_start(args, format);
-    size_t out_idx = 0;
-    size_t max_write = size - 1;
-
-    for (size_t i = 0; format[i] && out_idx < max_write; i++) {
-        if (format[i] == '%') {
-            i++;
-            if (format[i] == 's') {
-                const char *s = va_arg(args, const char *);
-                while (s && *s && out_idx < max_write) str[out_idx++] = *s++;
-            } else if (format[i] == 'd') {
-                char buf[32];
-                itoa(va_arg(args, int), buf, 10);
-                for (int j = 0; buf[j] && out_idx < max_write; j++) str[out_idx++] = buf[j];
-            } else if (format[i] == 'x' || format[i] == 'X') {
-                char buf[32];
-                itoa(va_arg(args, int), buf, 16);
-                for (int j = 0; buf[j] && out_idx < max_write; j++) str[out_idx++] = buf[j];
-            } else {
-                str[out_idx++] = format[i];
-            }
-        } else {
-            str[out_idx++] = format[i];
-        }
-    }
-    str[out_idx] = '\0';
+    int ret = format_vprintf(str, size, format, args);
     va_end(args);
-    return (int)out_idx;
+    return ret;
 }
 
 int sprintf(char *str, const char *format, ...) {
-    if (!str || !format) return 0;
-    
     va_list args;
     va_start(args, format);
-    
-    int ret = snprintf(str, 65536, format, va_arg(args, void*)); 
-    
+    int ret = format_vprintf(str, (size_t)-1, format, args);
     va_end(args);
     return ret;
 }
