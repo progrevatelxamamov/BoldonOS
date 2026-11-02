@@ -5,6 +5,7 @@
 #include "kernel.h"
 #include "mm/pmm.h"
 #include "scheduler/scheduler.h"
+#include "syscall/xorgtrace.h"
 #include "sys/mman.h"
 #include <scheduler/spinlock.h>
 #include <fs/ext4_vfs.h>
@@ -48,6 +49,10 @@ static uint32_t ext4_lock_depth;
 static uint64_t ext4_owner_pid;
 static uint64_t ext4_owner_tid;
 static unsigned ext4_wait_prints;
+/* The active block operation is a diagnostic snapshot, never a lock state. */
+static uint32_t ext4_io_kind; /* 0=none, 1=read, 2=write */
+static uint64_t ext4_io_lba;
+static uint32_t ext4_io_sectors;
 
 static void ext4_os_lock(void) {
     thread_t *self = get_current_thread();
@@ -97,6 +102,15 @@ static void ext4_os_lock(void) {
                 console_print_num(owner_tid);
                 console_print_string(" depth=");
                 console_print_num(depth);
+                uint32_t io = __atomic_load_n(&ext4_io_kind, __ATOMIC_ACQUIRE);
+                console_print_string(" io=");
+                console_print_num(io);
+                if (io) {
+                    console_print_string(" lba=");
+                    console_print_num(__atomic_load_n(&ext4_io_lba, __ATOMIC_RELAXED));
+                    console_print_string(" sectors=");
+                    console_print_num(__atomic_load_n(&ext4_io_sectors, __ATOMIC_RELAXED));
+                }
                 console_print_string("\n");
             }
         }
@@ -143,10 +157,12 @@ static int boldon_ext4_bread(struct ext4_blockdev *bdev, void *buf, uint64_t blk
     uint64_t lba = dev->start_lba + (blk_id * sectors_per_block);
     uint32_t sectors = blk_cnt * sectors_per_block;
 
-    if (block_read(dev->dev_name, lba, sectors, buf) != 0) {
-        return EIO;
-    }
-    return EOK;
+    __atomic_store_n(&ext4_io_lba, lba, __ATOMIC_RELAXED);
+    __atomic_store_n(&ext4_io_sectors, sectors, __ATOMIC_RELAXED);
+    __atomic_store_n(&ext4_io_kind, 1, __ATOMIC_RELEASE);
+    int rc = block_read(dev->dev_name, lba, sectors, buf);
+    __atomic_store_n(&ext4_io_kind, 0, __ATOMIC_RELEASE);
+    return rc == 0 ? EOK : EIO;
 }
 
 static int boldon_ext4_bwrite(struct ext4_blockdev *bdev, const void *buf, uint64_t blk_id, uint32_t blk_cnt) {
@@ -158,10 +174,12 @@ static int boldon_ext4_bwrite(struct ext4_blockdev *bdev, const void *buf, uint6
     uint64_t lba = dev->start_lba + (blk_id * sectors_per_block);
     uint32_t sectors = blk_cnt * sectors_per_block;
 
-    if (block_write(dev->dev_name, lba, sectors, (void *)buf) != 0) {
-        return EIO;
-    }
-    return EOK;
+    __atomic_store_n(&ext4_io_lba, lba, __ATOMIC_RELAXED);
+    __atomic_store_n(&ext4_io_sectors, sectors, __ATOMIC_RELAXED);
+    __atomic_store_n(&ext4_io_kind, 2, __ATOMIC_RELEASE);
+    int rc = block_write(dev->dev_name, lba, sectors, (void *)buf);
+    __atomic_store_n(&ext4_io_kind, 0, __ATOMIC_RELEASE);
+    return rc == 0 ? EOK : EIO;
 }
 
 static int boldon_ext4_close(struct ext4_blockdev *bdev) {
@@ -386,6 +404,12 @@ static int ext4_vfs_op_stat(vfs_node_t *node, vfs_stat_t *st) {
     return 0;
 }
 
+static void trace_xorg_ext4_create(const char *stage, uint64_t detail) {
+    process_t *p = get_current_process();
+    if (p && p->name && strcmp(p->name, "Xorg") == 0)
+        xorgtrace_stage(stage, p->pid, detail);
+}
+
 static int ext4_vfs_op_create(vfs_node_t *dir, const char *name, uint16_t mode, vfs_node_t **out_node) {
     if (!dir || !name || !out_node) return -1;
 
@@ -399,15 +423,21 @@ static int ext4_vfs_op_create(vfs_node_t *dir, const char *name, uint16_t mode, 
         snprintf(target_path, sizeof(target_path), "%s/%s", parent_path, name);
 
     ext4_file f;
+    trace_xorg_ext4_create("bind.ext4.fopen", 0);
     int r = ext4_fopen(&f, target_path, "w+");
+    trace_xorg_ext4_create("bind.ext4.fopen.done", (uint64_t)(uint32_t)r);
     if (r != EOK) return -1;
     ext4_fclose(&f);
 
-    ext4_mode_set(target_path, mode);
+    trace_xorg_ext4_create("bind.ext4.mode", 0);
+    r = ext4_mode_set(target_path, mode);
+    trace_xorg_ext4_create("bind.ext4.mode.done", (uint64_t)(uint32_t)r);
 
     struct ext4_inode stat_buf;
     uint32_t ino = 0;
+    trace_xorg_ext4_create("bind.ext4.inode", 0);
     r = ext4_raw_inode_fill(target_path, &ino, &stat_buf);
+    trace_xorg_ext4_create("bind.ext4.inode.done", (uint64_t)(uint32_t)r);
     if (r != EOK) return -1;
 
     vfs_node_t *node = malloc_alloc(sizeof(vfs_node_t));
