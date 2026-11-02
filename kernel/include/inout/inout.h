@@ -238,6 +238,12 @@ void inout_add_event(inout_event_t ev);
 void inout_note_usb_mouse_report(void);
 void inout_note_usb_mouse_device(int delta);
 void inout_note_usb_mouse_poll(void);
+/* Bounded raw HID mouse samples, captured before report-ID/length checks;
+   decoded values are attached by the matching sequence number. */
+uint64_t inout_hid_mouse_raw(const uint8_t *data, uint32_t len, bool layout,
+                            uint8_t report_id, uint16_t x_offset, uint16_t x_bits,
+                            uint16_t y_offset, uint16_t y_bits);
+void inout_hid_mouse_decoded(uint64_t seq, int dx, int dy, int dz);
 /* Bounded event trace for USB enumeration. Use static stage strings only;
    a/b/c/d are stage-specific hex values (documented in input-and-hotplug). */
 void inout_usb_trace(const char *stage, uint32_t a, uint32_t b,

@@ -141,6 +141,125 @@ static vfs_file_ops_t usbtrace_ops = {
     .open = usbtrace_open, .read = usbtrace_read, .close = usbtrace_close
 };
 
+/* Raw samples and pre-clamp deltas help distinguish descriptor offsets,
+   signedness, protocol fallback and GUI scaling. No console spam per packet. */
+#define HID_TRACE_CAP 16
+#define HID_TRACE_TEXT 4096
+typedef struct {
+    uint64_t seq;
+    uint8_t raw[16], len, layout, report_id, decoded;
+    uint16_t x_offset, x_bits, y_offset, y_bits;
+    int dx, dy, dz;
+} hid_trace_entry_t;
+static hid_trace_entry_t hid_trace_ring[HID_TRACE_CAP];
+static uint64_t hid_trace_next;
+static spinlock_t hid_trace_lock = SPINLOCK_INIT;
+
+typedef struct { uint32_t len; char text[HID_TRACE_TEXT]; } hid_trace_snapshot_t;
+
+uint64_t inout_hid_mouse_raw(const uint8_t *data, uint32_t len, bool layout,
+                            uint8_t report_id, uint16_t x_offset, uint16_t x_bits,
+                            uint16_t y_offset, uint16_t y_bits) {
+    if (!data || !len) return 0;
+    uint64_t flags;
+    spin_lock_irqsave(&hid_trace_lock, &flags);
+    /* Most HID mice repeat an identical idle report. Do not let those
+       copies evict the useful movement packets while the user types cat. */
+    if (hid_trace_next) {
+        hid_trace_entry_t *prev = &hid_trace_ring[(hid_trace_next - 1) % HID_TRACE_CAP];
+        uint32_t raw_len = len > sizeof(prev->raw) ? sizeof(prev->raw) : len;
+        if (len <= sizeof(prev->raw) && prev->len == len &&
+            prev->layout == (uint8_t)layout &&
+            prev->report_id == report_id && prev->x_offset == x_offset &&
+            prev->x_bits == x_bits && prev->y_offset == y_offset &&
+            prev->y_bits == y_bits &&
+            memcmp(prev->raw, data, raw_len) == 0) {
+            spin_unlock_irqrestore(&hid_trace_lock, flags);
+            return 0;
+        }
+    }
+    uint64_t seq = ++hid_trace_next;
+    hid_trace_entry_t *e = &hid_trace_ring[(seq - 1) % HID_TRACE_CAP];
+    memset(e, 0, sizeof(*e));
+    e->seq = seq;
+    e->len = (uint8_t)(len > 64 ? 64 : len);
+    e->layout = layout;
+    e->report_id = report_id;
+    e->x_offset = x_offset; e->x_bits = x_bits;
+    e->y_offset = y_offset; e->y_bits = y_bits;
+    for (uint32_t i = 0; i < len && i < sizeof(e->raw); i++) e->raw[i] = data[i];
+    spin_unlock_irqrestore(&hid_trace_lock, flags);
+    return seq;
+}
+
+void inout_hid_mouse_decoded(uint64_t seq, int dx, int dy, int dz) {
+    if (!seq) return;
+    uint64_t flags;
+    spin_lock_irqsave(&hid_trace_lock, &flags);
+    hid_trace_entry_t *e = &hid_trace_ring[(seq - 1) % HID_TRACE_CAP];
+    if (e->seq == seq) {
+        e->dx = dx; e->dy = dy; e->dz = dz;
+        e->decoded = 1;
+    }
+    spin_unlock_irqrestore(&hid_trace_lock, flags);
+}
+
+static int hidtrace_open(vfs_file_t *f) {
+    if (!f) return -EINVAL;
+    hid_trace_snapshot_t *snapshot = malloc_alloc(sizeof(*snapshot));
+    if (!snapshot) { f->private_data = NULL; return 0; }
+    hid_trace_entry_t entries[HID_TRACE_CAP];
+    uint64_t flags;
+    spin_lock_irqsave(&hid_trace_lock, &flags);
+    uint64_t end = hid_trace_next;
+    uint64_t begin = end > HID_TRACE_CAP ? end - HID_TRACE_CAP : 0;
+    for (uint64_t i = begin; i < end; i++)
+        entries[i - begin] = hid_trace_ring[i % HID_TRACE_CAP];
+    spin_unlock_irqrestore(&hid_trace_lock, flags);
+    int n = snprintf(snapshot->text, sizeof(snapshot->text),
+                     "hidtrace samples=%llu overwritten=%llu (first 16 bytes; pre-clamp dx/dy)\n",
+                     (unsigned long long)end, (unsigned long long)begin);
+    if (n < 0 || n >= (int)sizeof(snapshot->text)) { malloc_free(snapshot); return -EOVERFLOW; }
+    uint32_t used = (uint32_t)n;
+    for (uint64_t i = 0; i < end - begin; i++) {
+        hid_trace_entry_t *e = &entries[i];
+        n = snprintf(snapshot->text + used, sizeof(snapshot->text) - used,
+            "%llu len=%u id=%02x layout=%u x=%u/%u y=%u/%u raw=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x decoded=%u dx=%d dy=%d dz=%d\n",
+            (unsigned long long)e->seq, e->len, e->report_id, e->layout,
+            e->x_offset, e->x_bits, e->y_offset, e->y_bits,
+            e->raw[0], e->raw[1], e->raw[2], e->raw[3],
+            e->raw[4], e->raw[5], e->raw[6], e->raw[7],
+            e->raw[8], e->raw[9], e->raw[10], e->raw[11],
+            e->raw[12], e->raw[13], e->raw[14], e->raw[15],
+            e->decoded, e->dx, e->dy, e->dz);
+        if (n < 0 || n >= (int)(sizeof(snapshot->text) - used)) break;
+        used += (uint32_t)n;
+    }
+    snapshot->len = used;
+    f->private_data = snapshot;
+    return 0;
+}
+
+static int hidtrace_read(vfs_file_t *f, void *buf, uint64_t count) {
+    if (!f || !buf) return -EINVAL;
+    hid_trace_snapshot_t *snapshot = f->private_data;
+    const char *text = snapshot ? snapshot->text : "hidtrace: snapshot allocation failed\n";
+    uint64_t len = snapshot ? snapshot->len : strlen(text);
+    if (!count || f->offset >= len) return 0;
+    if (count > len - f->offset) count = len - f->offset;
+    memcpy(buf, text + f->offset, (size_t)count);
+    f->offset += count;
+    return (int)count;
+}
+static int hidtrace_close(vfs_file_t *f) {
+    if (f && f->private_data) malloc_free(f->private_data);
+    if (f) f->private_data = NULL;
+    return 0;
+}
+static vfs_file_ops_t hidtrace_ops = {
+    .open = hidtrace_open, .read = hidtrace_read, .close = hidtrace_close
+};
+
 typedef struct {
     int8_t  dx;
     int8_t  dy;
@@ -960,6 +1079,8 @@ void input_register_devfs(void) {
     devfs_register_device("input/mousediag",   VFS_TYPE_FILE, &mousediag_ops, NULL);
     if (devfs_register_device("input/usbtrace", VFS_TYPE_FILE, &usbtrace_ops, NULL) != 0)
         console_print_string("[INPUT] cannot register /dev/input/usbtrace\n");
+    if (devfs_register_device("input/hidtrace", VFS_TYPE_FILE, &hidtrace_ops, NULL) != 0)
+        console_print_string("[INPUT] cannot register /dev/input/hidtrace\n");
 }
 
 void inout_keyboard_task(void) {

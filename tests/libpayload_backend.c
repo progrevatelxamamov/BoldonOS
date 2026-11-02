@@ -57,6 +57,17 @@ static int mouse_devices;
 void inout_note_usb_mouse_report(void) { mouse_reports++; }
 void inout_note_usb_mouse_poll(void) { mouse_polls++; }
 void inout_note_usb_mouse_device(int delta) { mouse_devices += delta; }
+static unsigned raw_samples, decoded_samples;
+uint64_t inout_hid_mouse_raw(const uint8_t *data, uint32_t len, bool layout,
+                            uint8_t id, uint16_t xo, uint16_t xb,
+                            uint16_t yo, uint16_t yb) {
+    (void)layout; (void)id; (void)xo; (void)xb; (void)yo; (void)yb;
+    assert(data && len); return ++raw_samples;
+}
+void inout_hid_mouse_decoded(uint64_t seq, int x, int y, int z) {
+    (void)x; (void)y; (void)z;
+    if (seq) decoded_samples++;
+}
 void inout_add_event(inout_event_t ev) {
     assert(ev.type == INOUT_EVENT_MOUSE);
     if (ev.data.mouse.mouse_state == INOUT_MOUSE_MOVE) {
@@ -157,9 +168,10 @@ static void test_report_mouse(bool nonboot) {
     packet_ready = true; dev.poll(&dev);
     assert(dx == -2 && dy == 5 && dz == 1 && mouse_reports > 0 && mouse_polls > 0);
     assert(mouse_devices == 1);
-    unsigned before_disconnect = mouse_reports;
+    unsigned before_disconnect = mouse_reports, before_raw = raw_samples;
     dev.destroy(&dev);
     assert(mouse_devices == 0 && mouse_reports == before_disconnect);
+    assert(raw_samples == before_raw && decoded_samples >= before_raw);
     report_descriptor = NULL; report_length = 0;
 }
 static void test_composite_hid(void) {

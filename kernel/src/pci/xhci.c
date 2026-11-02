@@ -1499,6 +1499,10 @@ static void handle_mouse_report(struct usb_hid *hid, const uint8_t *r, uint32_t 
 
     bool use_layout = hid->mouse_layout_valid &&
         (hid->report_protocol_active || hid->mouse_report_id == 0);
+    uint64_t sample = hid->disconnected ? 0 : inout_hid_mouse_raw(
+        r, report_len, use_layout, hid->mouse_report_id,
+        hid->mouse_x.bit_offset, hid->mouse_x.bit_size,
+        hid->mouse_y.bit_offset, hid->mouse_y.bit_size);
 
     if (use_layout) {
         uint32_t expected = (uint32_t)((hid->mouse_report_bits + 7) / 8) +
@@ -1539,6 +1543,7 @@ static void handle_mouse_report(struct usb_hid *hid, const uint8_t *r, uint32_t 
         dz = report_len > offset + 3 ? (int8_t)r[offset + 3] : 0;
     }
 
+    inout_hid_mouse_decoded(sample, dx, dy, dz);
     if (dx > 2048 || dx < -2048 || dy > 2048 || dy < -2048) return;
     if (dx > 127) dx = 127; else if (dx < -127) dx = -127;
     if (dy > 127) dy = 127; else if (dy < -127) dy = -127;
@@ -3072,6 +3077,7 @@ void boldon_usb_input_destroy(void *context) {
     } else if (hid->protocol == 2) {
         inout_note_usb_mouse_device(-1);
         uint8_t released[3] = {0};
+        hid->disconnected = 1; /* synthetic button release is not a USB sample */
         hid->mouse_layout_valid = false;
         hid->report_protocol_active = false;
         hid->boot_protocol_active = true;
