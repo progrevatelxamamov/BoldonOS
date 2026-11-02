@@ -717,9 +717,10 @@ static void hotplug_task(void) {
 }
 
 void partitions_hotplug_start(void) {
-    devfs_register_device("proc/partitions", VFS_TYPE_CHAR_DEV, &proc_ops, (void *)(uintptr_t)1);
-    devfs_register_device("proc/mounts",     VFS_TYPE_CHAR_DEV, &proc_ops, (void *)(uintptr_t)2);
-    devfs_register_device("proc/mountinfo",  VFS_TYPE_CHAR_DEV, &proc_ops, (void *)(uintptr_t)3);
+    /* proc entries behave as readable files, not character devices. */
+    devfs_register_device("proc/partitions", VFS_TYPE_FILE, &proc_ops, (void *)(uintptr_t)1);
+    devfs_register_device("proc/mounts",     VFS_TYPE_FILE, &proc_ops, (void *)(uintptr_t)2);
+    devfs_register_device("proc/mountinfo",  VFS_TYPE_FILE, &proc_ops, (void *)(uintptr_t)3);
     devfs_register_device("diskctl",         VFS_TYPE_CHAR_DEV, &ctl_ops,  (void *)(uintptr_t)4);
 
     for (int i = 0; i < MAX_BLOCK_DEVICES; i++) {

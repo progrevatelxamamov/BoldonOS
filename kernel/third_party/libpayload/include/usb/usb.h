@@ -351,6 +351,8 @@ static inline void __printf(1, 2) usb_debug(const char *fmt, ...)
 	va_start(ap, fmt);
 	vprintf(fmt, ap);
 	va_end(ap);
+#else
+	(void)fmt;
 #endif
 }
 

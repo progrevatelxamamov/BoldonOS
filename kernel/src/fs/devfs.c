@@ -201,7 +201,7 @@ int devfs_register_device(const char *name, vfs_node_type_t type, vfs_file_ops_t
             dev_nodes[i].node.type = type;
             dev_nodes[i].node.file_ops = ops;
             dev_nodes[i].node.fs_data = private_data;
-            dev_nodes[i].node.mode = 0666;
+            dev_nodes[i].node.mode = type == VFS_TYPE_FILE ? 0444 : 0666;
             dev_nodes[i].node.inode_num = (type == VFS_TYPE_BLOCK_DEV ? 0x0800u : 0x0100u) + (uint32_t)i;
             dev_nodes[i].used = true;
             return 0;

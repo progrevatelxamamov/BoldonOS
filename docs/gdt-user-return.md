@@ -11,12 +11,10 @@ prove which full selector the CPU attempted to load.
 
 The current source had already specified `USER_DATA | 3` for `sys_execve` and
 the compiled object pushed 0x1B. We now encode the initial SS push explicitly
-as `pushq $0x1B` and verify that immediate in the built object. A boot marker
-`[EXEC] IRET target SS=0x1B` helps distinguish a newly built image from an old
-kernel/ISO. If the marker appears but the rejected frame still has SS=0x18,
-the cause is elsewhere (a different IRET path or frame corruption); record the
-full new photo before changing the GDT. The follow-up photo has that boot
-marker, but the rejected frame's SS still appears to be 0x18 (the blurred
+as `pushq $0x1B` and verify that immediate in the built object. An earlier
+image printed `[EXEC] IRET target SS=0x1B` to distinguish a newly built kernel;
+that one-time debug marker is now disabled. In the follow-up photo the
+rejected frame's SS still appears to be 0x18 (the blurred
 photo does not resolve the last digit conclusively), with #GP(0x18) on CPU 2.
 The marker only proves that the new code reached the logging call, **not** the
 value present in the stack frame at IRETQ. The next hardware photo confirmed

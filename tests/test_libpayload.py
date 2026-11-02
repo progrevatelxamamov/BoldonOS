@@ -19,7 +19,9 @@ with tempfile.TemporaryDirectory() as directory:
                     *(str(KERNEL / p) for p in objects[:2]), '-o', str(binary)], check=True)
     subprocess.run([str(binary)], check=True)
     hub = pathlib.Path(directory) / 'libpayload-hub-test'
-    subprocess.run(['cc', '-std=gnu11', '-no-pie', '-ffunction-sections',
+    # Production USB traces are off; enable them only in this harness to
+    # verify that disabled-port warnings remain rate-limited.
+    subprocess.run(['cc', '-std=gnu11', '-DUSB_DEBUG', '-no-pie', '-ffunction-sections',
                     '-fdata-sections', '-Wl,--gc-sections', *INCLUDES,
                     str(ROOT / 'tests/libpayload_hub.c'), '-o', str(hub)], check=True)
     subprocess.run([str(hub)], check=True)

@@ -60,7 +60,6 @@ void lp_backend_initialize(void) {
         uint32_t pci; uint8_t type; uintptr_t bar;
         for (unsigned i = 0; lp_platform_controller(i, &pci, &type, &bar); i++) {
             if (type != order[pass] || transport_count >= ARRAY_SIZE(transports)) continue;
-            printf("[LPUSB] initializing PCI %02x:%02x.%x type=%02x BAR=%lx\n", PCI_BUS(pci), PCI_SLOT(pci), PCI_FUNC(pci), type, (unsigned long)bar);
             lp_platform_prepare(pci, type, bar);
             hci_t *hc = NULL;
             if (type == 0x30) hc = xhci_init(bar);
@@ -75,10 +74,8 @@ void lp_backend_initialize(void) {
             hc->control = safe_control;
             hc->bulk = safe_bulk;
             hc->bulk_timeout = safe_bulk_timeout;
-            printf("[LPUSB] controller ready\n");
         }
     }
-    printf("[LPUSB] %u controllers ready, polling devices\n", transport_count);
 }
 void lp_backend_poll(void) { usb_poll(); }
 
@@ -172,7 +169,6 @@ void usb_hid_init(usbdev_t *dev) {
     dev->data = hid;
     dev->destroy = lp_hid_destroy;
     dev->poll = lp_hid_poll;
-    printf("[LPUSB] HID ready %04x:%04x protocol=%d\n", dev->descriptor->idVendor, dev->descriptor->idProduct, protocol);
 }
 
 struct lp_disk { usbdev_t *dev; char name[32]; bool removing; };
@@ -213,7 +209,6 @@ void usbdisk_create(usbdev_t *dev) {
     if (!block.name[0]) { free(disk); return; }
     memcpy(disk->name, block.name, sizeof(disk->name));
     msc->data = disk;
-    printf("[LPUSB] disk %s sectors=%u bytes/sector=%u\n", disk->name, msc->numblocks, msc->blocksize);
 }
 void usbdisk_remove(usbdev_t *dev) {
     struct lp_disk *disk = MSC_INST(dev)->data;
@@ -223,10 +218,6 @@ void usbdisk_remove(usbdev_t *dev) {
     unregister_device(disk->name);
     disk->dev = NULL;
     MSC_INST(dev)->data = NULL;
-    printf("[LPUSB] removed disk %s\n", disk->name);
 }
-void usb_generic_create(usbdev_t *dev) {
-    printf("[LPUSB] unclaimed device %04x:%04x; legacy TP-Link/USB-net driver is not attached\n",
-        dev->descriptor->idVendor, dev->descriptor->idProduct);
-}
+void usb_generic_create(usbdev_t *dev) { (void)dev; }
 void usb_generic_remove(usbdev_t *dev) { (void)dev; }

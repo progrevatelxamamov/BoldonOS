@@ -19,7 +19,7 @@ typedef int8_t s8;
 typedef int16_t s16;
 typedef int32_t s32;
 typedef int64_t s64;
-#define USB_DEBUG 1
+/* USB enumeration trace disabled by default; fatal errors still use lp_fatal. */
 #define __packed __attribute__((packed))
 #define __aligned(n) __attribute__((aligned(n)))
 #define __printf(a,b) __attribute__((format(__printf__,a,b)))

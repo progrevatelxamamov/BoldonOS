@@ -198,13 +198,19 @@ static void normalize_path_raw(const char *path, char *norm, size_t cap) {
 
     if (path[0] == '/' && path[1] == 'p' && path[2] == 'r' && path[3] == 'o' &&
         path[4] == 'c' && (path[5] == '/' || path[5] == '\0')) {
+        /* devfs registers proc/partitions, proc/mounts, ... under its
+           synthetic proc directory. Keep /proc in the devfs-relative path:
+           mapping it to D:/ made /proc an alias for /dev and hid the files. */
         norm[0] = 'D'; norm[1] = ':';
-        if (strncmp(path, "/proc/self/mountinfo", 20) == 0) {
-            memcpy(norm + 2, "/proc/mountinfo", 16);
+        if (strcmp(path, "/proc/self/mountinfo") == 0) {
+            const char *alias = "/proc/mountinfo";
+            size_t j = 2;
+            for (size_t i = 0; alias[i] && j < cap - 1; i++) norm[j++] = alias[i];
+            norm[j] = 0;
             return;
         }
         size_t j = 2;
-        for (size_t i = 5; path[i] && j < cap - 1; i++) norm[j++] = path[i];
+        for (size_t i = 0; path[i] && j < cap - 1; i++) norm[j++] = path[i];
         norm[j] = 0;
         return;
     }
@@ -244,27 +250,34 @@ static void normalize_path_raw(const char *path, char *norm, size_t cap) {
     process_t *p = get_current_process();
     const char *cwd = (p && p->cwd[0]) ? p->cwd : "/";
 
+    if (cwd[0] == '/') {
+        /* Resolve relative names against the logical POSIX cwd first. This
+           makes `proc` from / and `partitions` from /proc use the same
+           special mapping as their absolute counterparts. */
+        char absolute[512];
+        size_t j = 0;
+        for (size_t i = 0; cwd[i] && j < sizeof(absolute) - 1; i++) absolute[j++] = cwd[i];
+        if (j == 0 || absolute[j - 1] != '/') absolute[j++] = '/';
+        for (size_t i = 0; path[i] && j < sizeof(absolute) - 1; i++) absolute[j++] = path[i];
+        absolute[j] = '\0';
+        normalize_path_raw(absolute, norm, cap);
+        return;
+    }
+
     char target_drive = boot_drive_letter;
 
-    if ((cwd[0] == '/' && cwd[1] == 'd' && cwd[2] == 'e' && cwd[3] == 'v' && (cwd[4] == '/' || cwd[4] == '\0')) ||
-        ((cwd[0] == 'D' || cwd[0] == 'd') && cwd[1] == ':')) {
+    if ((cwd[0] == 'D' || cwd[0] == 'd') && cwd[1] == ':')
         target_drive = 'D';
-    }
 
     norm[0] = target_drive;
     norm[1] = ':';
     size_t j = 2;
-    size_t i = 0;
-    if (cwd[0] == '/') {
-        if (target_drive == 'D') i = 4;
-        while (cwd[i] && j < cap - 2) norm[j++] = cwd[i++];
-    } else if (((cwd[0] >= 'A' && cwd[0] <= 'Z') || (cwd[0] >= 'a' && cwd[0] <= 'z')) && cwd[1] == ':') {
-        i = 2;
-        while (cwd[i] && j < cap - 2) norm[j++] = cwd[i++];
+    if (((cwd[0] >= 'A' && cwd[0] <= 'Z') || (cwd[0] >= 'a' && cwd[0] <= 'z')) && cwd[1] == ':') {
+        for (size_t i = 2; cwd[i] && j < cap - 2; i++) norm[j++] = cwd[i];
     }
 
     if (j == 2 || norm[j - 1] != '/') norm[j++] = '/';
-    i = 0;
+    size_t i = 0;
     while (path[i] && j < cap - 1) norm[j++] = path[i++];
     norm[j] = '\0';
 }
