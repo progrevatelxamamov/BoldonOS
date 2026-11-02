@@ -6,5 +6,7 @@
 void devfs_vfs_init(void);
 int devfs_register_device(const char *name, vfs_node_type_t type, vfs_file_ops_t *ops, void *private_data);
 int devfs_unregister_device(const char *name);
+/* Read-only synthetic link; target storage must outlive the registration. */
+int devfs_register_symlink(const char *name, const char *target);
 
 #endif

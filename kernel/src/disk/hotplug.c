@@ -52,6 +52,7 @@ typedef struct {
     uint64_t start_lba;
     uint64_t sector_count;
     char fstype[16];
+    char sys_target[64];
     bool used;
 } block_node_t;
 
@@ -66,6 +67,7 @@ static bool hotplug_ready = false;
 
 static void append(const char *text, uint32_t cap);
 static void hotplug_scan(void);
+static const char *alias_for(const char *dev);
 
 static bool str_eq(const char *a, const char *b) {
     if (!a || !b) return false;
@@ -363,6 +365,23 @@ static vfs_file_ops_t ctl_ops = {
     .write = ctl_write
 };
 
+/* The subset of sysfs used by util-linux fdisk's disk enumeration. */
+static int sysdev_read(vfs_file_t *file, void *buf, uint64_t count) {
+    if (!file || !file->node || !buf) return -EINVAL;
+    block_node_t *n = (block_node_t *)file->node->fs_data;
+    if (!n || n < nodes || n >= nodes + MAX_BLOCK_NODES || !n->used) return -ENODEV;
+    char value[32];
+    int len = snprintf(value, sizeof(value), "8:%u\n", (unsigned)(n - nodes));
+    if (file->offset >= (uint64_t)len) return 0;
+    uint64_t available = (uint64_t)len - file->offset;
+    if (count > available) count = available;
+    memcpy(buf, value + file->offset, count);
+    file->offset += count;
+    return (int)count;
+}
+
+static vfs_file_ops_t sysdev_ops = { .read = sysdev_read };
+
 static int node_add(const char *name, const char *dev, uint32_t index,
                     uint64_t lba, uint64_t sectors, const char *fstype) {
     int slot = find_node(name);
@@ -388,6 +407,18 @@ static int node_add(const char *name, const char *dev, uint32_t index,
         struct block_device *bd = find_device(dev);
         uint32_t ss = bd && bd->sector_size ? bd->sector_size : 512;
         vn->size = sectors * (uint64_t)ss;
+        /* /proc/partitions minor numbers and stat(/dev/...) must agree. */
+        vn->inode_num = 0x0800u + (uint32_t)slot;
+    }
+    if (index == 0 && str_eq(name, alias_for(dev))) {
+        /* Advertise only the stable sd* alias, not a second copy of the
+           same physical disk under its controller-specific name. */
+        char sys_path[64];
+        snprintf(sys_path, sizeof(sys_path), "sys/block/%s/dev", name);
+        devfs_register_device(sys_path, VFS_TYPE_FILE, &sysdev_ops, n);
+        snprintf(sys_path, sizeof(sys_path), "sys/dev/block/8:%u", (unsigned)slot);
+        snprintf(n->sys_target, sizeof(n->sys_target), "/sys/block/%s", name);
+        devfs_register_symlink(sys_path, n->sys_target);
     }
     return 0;
 }
@@ -396,6 +427,13 @@ static void node_remove_device(const char *dev) {
     for (int i = 0; i < MAX_BLOCK_NODES; i++) {
         if (!nodes[i].used || !str_eq(nodes[i].dev_name, dev)) continue;
         devfs_unregister_device(nodes[i].node);
+        if (nodes[i].part_index == 0 && str_eq(nodes[i].node, alias_for(dev))) {
+            char path[64];
+            snprintf(path, sizeof(path), "sys/block/%s/dev", nodes[i].node);
+            devfs_unregister_device(path);
+            snprintf(path, sizeof(path), "sys/dev/block/8:%u", (unsigned)i);
+            devfs_unregister_device(path);
+        }
         memset(&nodes[i], 0, sizeof(block_node_t));
     }
 }

@@ -712,7 +712,12 @@ uint64_t sys_readlink_impl(uint64_t path, uint64_t buf, uint64_t bufsiz) {
     if (!path || !buf || bufsiz == 0) return (uint64_t)-EFAULT;
     if (!user_range_ok(path, 1) || !user_range_ok(buf, bufsiz)) return (uint64_t)-EFAULT;
 
-    vfs_node_t *node = vfs_resolve_path((const char *)path);
+    /* Resolve the parent, not the final component: ordinary VFS resolution
+       follows symlinks, which made readlink() unable to see the link itself. */
+    char name[256];
+    vfs_node_t *parent = vfs_resolve_path_ext((const char *)path, true, name);
+    if (!parent || !parent->ops || !parent->ops->lookup) return (uint64_t)-ENOENT;
+    vfs_node_t *node = parent->ops->lookup(parent, name);
     if (!node) return (uint64_t)-ENOENT;
     if (node->type != VFS_TYPE_SYMLINK) return (uint64_t)-EINVAL;
 
