@@ -22,19 +22,26 @@ Linux для `pacman`: одной установкой `pacman` через apt �
 
 ```sh
 mkdir -p osdata
-sudo docker run --rm -v "$PWD/osdata:/rootfs" archlinux:latest sh -ec '
-  pacman --root /rootfs --config /etc/pacman.conf \
+sudo docker run --rm -it -v "$PWD/osdata:/rootfs" archlinux:latest sh -ec '
+  pacman --root /rootfs --dbpath /rootfs/var/lib/pacman \
+    --logfile /rootfs/var/log/pacman.log --config /etc/pacman.conf \
     --gpgdir /etc/pacman.d/gnupg --cachedir /var/cache/pacman/pkg \
     -Syu --needed xorg-server xorg-xinit xf86-video-fbdev xf86-input-evdev xterm
 '
 ```
 
-`--root` направляет файлы и базу пакетов в смонтированный `osdata/`;
-`--cachedir` хранит архивы только внутри временного контейнера. Не
-применяйте `--overwrite '*'` для разрешения конфликтов с существующими
-файлами. Сборка `main.img` копирует `osdata/` в ext4 при **новой сборке**
-образа (не изменяет готовый образ). Это способ подготовки бинарников, а не
-готовый установщик или гарантия работоспособности Xorg в BoldonOS.
+`-it` сохраняет терминал и ввод для подтверждения `[Y/n]`: без `-i`
+`pacman` получит EOF и выйдет, не установив пакеты. `--root` направляет
+файлы в `osdata/`; явные `--dbpath` и `--logfile` гарантируют, что база и
+журнал также останутся в нём, а не в контейнере. `--cachedir` хранит архивы
+только внутри временного контейнера. Перед подтверждением списка обновлений
+проверьте `osdata/var/lib/pacman/local`: если каталог пустой, но pacman
+показывает *старые версии* системных пакетов, не подтверждайте установку —
+проверьте путь базы пакетов. Не применяйте `--overwrite '*'` для разрешения
+конфликтов с существующими файлами. Сборка `main.img` копирует `osdata/` в
+ext4 при **новой сборке** образа (не изменяет готовый образ); проверьте,
+что в разделе хватает места для пакетов. Это способ подготовки бинарников,
+а не готовый установщик или гарантия работоспособности Xorg в BoldonOS.
 
 **Установка не означает, что Xorg уже запустится.** Это бинарники Arch Linux,
 а не портированный X-сервер: они зависят от ABI Linux, динамического
