@@ -15,13 +15,14 @@ typedef struct {
     uint64_t seq, pid, a1, a2;
     int64_t result;
     uint32_t num;
-    uint8_t pending;
+    uint8_t pending, printed;
     const char *stage; /* only static literals from the kernel */
 } xorgtrace_entry_t;
 static xorgtrace_entry_t entries[XORGTRACE_CAP];
 static uint64_t next_seq;
 static spinlock_t trace_lock = SPINLOCK_INIT;
 static unsigned console_count;
+static unsigned syscall_console_count;
 
 typedef struct { uint32_t len; char text[XORGTRACE_TEXT]; } xorgtrace_snapshot_t;
 
@@ -35,13 +36,15 @@ int xorgtrace_exec_target(const char *path) {
 }
 
 static uint64_t append(const char *stage, uint64_t pid, uint32_t num,
-                       uint64_t a1, uint64_t a2, int64_t result, uint8_t pending) {
+                       uint64_t a1, uint64_t a2, int64_t result,
+                       uint8_t pending, uint8_t printed) {
     uint64_t flags;
     spin_lock_irqsave(&trace_lock, &flags);
     uint64_t seq = ++next_seq;
     entries[(seq - 1) % XORGTRACE_CAP] = (xorgtrace_entry_t){
         .seq = seq, .pid = pid, .num = num, .stage = stage,
-        .a1 = a1, .a2 = a2, .result = result, .pending = pending
+        .a1 = a1, .a2 = a2, .result = result, .pending = pending,
+        .printed = printed
     };
     spin_unlock_irqrestore(&trace_lock, flags);
     return seq;
@@ -49,7 +52,7 @@ static uint64_t append(const char *stage, uint64_t pid, uint32_t num,
 
 void xorgtrace_stage(const char *stage, uint64_t pid, uint64_t detail) {
     if (!stage) return;
-    append(stage, pid, UINT32_MAX, detail, 0, 0, 0);
+    append(stage, pid, UINT32_MAX, detail, 0, 0, 0, 0);
     /* Stage markers also reach the screen if Xorg blocks the only shell.
        No per-syscall console prints; limit restarts too. */
     if (__atomic_fetch_add(&console_count, 1, __ATOMIC_RELAXED) < 12) {
@@ -65,16 +68,41 @@ void xorgtrace_stage(const char *stage, uint64_t pid, uint64_t detail) {
 
 uint64_t xorgtrace_syscall_enter(uint64_t pid, uint64_t num,
                                 uint64_t a1, uint64_t a2) {
-    return append("syscall", pid, (uint32_t)num, a1, a2, 0, 1);
+    /* Diagnostic fallback when /dev/xorgtrace cannot be read because the
+       shell stalls. Never print every syscall: Xorg can issue thousands. */
+    unsigned sample = __atomic_fetch_add(&syscall_console_count, 1, __ATOMIC_RELAXED);
+    uint8_t printed = sample < 12 || (sample < 512 && (sample % 64) == 0);
+    uint64_t ticket = append("syscall", pid, (uint32_t)num, a1, a2, 0, 1, printed);
+    if (printed) {
+        console_print_string("[XORGTRACE] enter pid=");
+        console_print_num(pid);
+        console_print_string(" seq=");
+        console_print_num(ticket);
+        console_print_string(" num=");
+        console_print_num(num);
+        console_print_string("\n");
+    }
+    return ticket;
 }
 
 void xorgtrace_syscall_exit(uint64_t ticket, int64_t result) {
     if (!ticket) return;
     uint64_t flags;
+    uint8_t printed = 0;
     spin_lock_irqsave(&trace_lock, &flags);
     xorgtrace_entry_t *e = &entries[(ticket - 1) % XORGTRACE_CAP];
-    if (e->seq == ticket) { e->result = result; e->pending = 0; }
+    if (e->seq == ticket) {
+        e->result = result; e->pending = 0;
+        printed = e->printed;
+    }
     spin_unlock_irqrestore(&trace_lock, flags);
+    if (printed) {
+        console_print_string("[XORGTRACE] exit seq=");
+        console_print_num(ticket);
+        console_print_string(" ret=");
+        console_print_hex((uint64_t)result);
+        console_print_string("\n");
+    }
 }
 
 static int trace_open(vfs_file_t *f) {
