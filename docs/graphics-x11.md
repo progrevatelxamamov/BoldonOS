@@ -21,7 +21,7 @@ Linux для `pacman`: одной установкой `pacman` через apt �
 конфликтовать с уже положенными туда файлами:
 
 ```sh
-mkdir -p osdata
+mkdir -p osdata/var/lib/pacman osdata/var/log
 sudo docker run --rm -it -v "$PWD/osdata:/rootfs" archlinux:latest sh -ec '
   pacman --root /rootfs --dbpath /rootfs/var/lib/pacman \
     --logfile /rootfs/var/log/pacman.log --config /etc/pacman.conf \
