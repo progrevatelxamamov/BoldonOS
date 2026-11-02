@@ -139,13 +139,60 @@ static int load_interp(page_table_t *pml4, const char *interp_path,
     return 0;
 }
 
-int sys_execve(const char *pathname, char *const argv[], char *const envp[])
+/* Linux execve recognizes #! scripts before trying to parse an ELF header.
+   Keep parsing bounded; the optional argument is passed as one argv element. */
+static int parse_shebang(const char *line, size_t size, char *interpreter,
+                         char *argument, size_t cap) {
+    if (size < 3 || line[0] != '#' || line[1] != '!' || cap < 2) return -ENOEXEC;
+    size_t end = 2;
+    while (end < size && line[end] != '\n' && line[end] != '\r') end++;
+    size_t pos = 2;
+    while (pos < end && (line[pos] == ' ' || line[pos] == '\t')) pos++;
+    size_t start = pos;
+    while (pos < end && line[pos] != ' ' && line[pos] != '\t') pos++;
+    if (pos == start || pos - start >= cap || (end == size && size >= 256))
+        return -ENOEXEC;
+    memcpy(interpreter, line + start, pos - start);
+    interpreter[pos - start] = '\0';
+    while (pos < end && (line[pos] == ' ' || line[pos] == '\t')) pos++;
+    size_t arg_end = end;
+    while (arg_end > pos && (line[arg_end - 1] == ' ' || line[arg_end - 1] == '\t')) arg_end--;
+    if (arg_end - pos >= cap) return -ENOEXEC;
+    memcpy(argument, line + pos, arg_end - pos);
+    argument[arg_end - pos] = '\0';
+    return 0;
+}
+
+static int sys_execve_depth(const char *pathname, char *const argv[],
+                            char *const envp[], unsigned depth)
 {
     if (!pathname) { errno = EFAULT; return -1; }
 
     vfs_file_t *f = vfs_open(pathname, VFS_O_READ);
     if (!f) { errno = ENOENT; return -1; }
 
+    char header[256];
+    int header_len = vfs_read(f, header, sizeof(header));
+    if (header_len >= 2 && header[0] == '#' && header[1] == '!') {
+        char interpreter[256], argument[256];
+        int parsed = parse_shebang(header, (size_t)header_len,
+                                   interpreter, argument, sizeof(interpreter));
+        vfs_close(f);
+        if (parsed != 0 || depth >= 4) {
+            errno = depth >= 4 ? ELOOP : ENOEXEC;
+            return -1;
+        }
+        char *script_argv[256];
+        unsigned count = 0;
+        script_argv[count++] = interpreter;
+        if (argument[0]) script_argv[count++] = argument;
+        script_argv[count++] = (char *)pathname;
+        for (unsigned i = 1; argv && argv[i] && count < 255; i++)
+            script_argv[count++] = argv[i];
+        script_argv[count] = NULL;
+        return sys_execve_depth(interpreter, script_argv, envp, depth + 1);
+    }
+    vfs_lseek(f, 0, VFS_SEEK_SET);
     Elf64_Ehdr ehdr;
     if (vfs_read(f, &ehdr, sizeof(ehdr)) != sizeof(ehdr)) {
         vfs_close(f); errno = ENOEXEC; return -1;
@@ -547,4 +594,7 @@ int sys_execve(const char *pathname, char *const argv[], char *const envp[])
     );
 
     __builtin_unreachable();
+}
+int sys_execve(const char *pathname, char *const argv[], char *const envp[]) {
+    return sys_execve_depth(pathname, argv, envp, 0);
 }

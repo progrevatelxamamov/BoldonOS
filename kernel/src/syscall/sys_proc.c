@@ -254,9 +254,12 @@ uint64_t sys_chdir_impl(uint64_t path) {
 
 uint64_t sys_execve_impl(uint64_t a1, uint64_t a2, uint64_t a3) {
     if (!a1) return (uint64_t)-EFAULT;
-    return (uint64_t)(int64_t)sys_execve((const char *)a1,
-                                         (char *const *)a2,
-                                         (char *const *)a3);
+    int result = sys_execve((const char *)a1, (char *const *)a2,
+                            (char *const *)a3);
+    /* sys_execve uses the kernel-internal -1 + errno convention. The Linux
+       syscall ABI needs -errno; returning -1 makes every error look EPERM. */
+    if (result < 0) return (uint64_t)(int64_t)-errno;
+    return (uint64_t)result;
 }
 
 uint64_t sys_brk_impl(uint64_t brk) {
