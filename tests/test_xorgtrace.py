@@ -22,7 +22,11 @@ static void spin_lock_irqsave(spinlock_t *l, uint64_t *flags) { (void)l; *flags=
 static void spin_unlock_irqrestore(spinlock_t *l, uint64_t flags) { (void)l; (void)flags; }
 static void *malloc_alloc(size_t n) { return calloc(1, n); }
 static void malloc_free(void *p) { free(p); }
-static void console_print_string(const char *s) { (void)s; }
+static unsigned enter_lines, exit_lines;
+static void console_print_string(const char *s) {
+    if (!strcmp(s, "[XORGTRACE] enter pid=")) enter_lines++;
+    if (!strcmp(s, "[XORGTRACE] exit seq=")) exit_lines++;
+}
 static void console_print_num(uint64_t x) { (void)x; }
 static void console_print_hex(uint64_t x) { (void)x; }
 typedef struct { uint64_t offset; void *private_data; } vfs_file_t;
@@ -80,6 +84,8 @@ int main(void) {
     assert(strstr(text,"num=3 a1=abc a2=0 ret=fffffffffffffffe pending=0"));
     trace_ops.close(&old); trace_ops.close(&newer);
     for (int i=0; i<80; i++) xorgtrace_syscall_enter(77, i, 0, 0);
+    assert(enter_lines == 13); // first 12 plus one at count 64
+    assert(exit_lines == 3); // explicit sample plus Xorg and xinit handlers
     vfs_file_t recent = {0};
     assert(trace_ops.open(&recent) == 0);
     memset(text,0,sizeof(text));
