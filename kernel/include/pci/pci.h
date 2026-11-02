@@ -32,6 +32,13 @@ uint32_t pci_read_config(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset
 void pci_write_config(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset, uint32_t data);
 void pci_init(void);
 
+/* Read-only display inventory; no MMIO or GPU generation assumptions. */
+typedef struct {
+    uint8_t bus, slot, func, subclass, revision;
+    uint16_t vendor, device;
+} pci_display_id_t;
+uint32_t pci_display_devices(pci_display_id_t *out, uint32_t capacity);
+
 uint8_t pci_find_capability(uint8_t bus, uint8_t slot, uint8_t func, uint8_t cap_id);
 
 #endif

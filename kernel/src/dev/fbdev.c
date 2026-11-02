@@ -8,6 +8,7 @@
 #include <errno.h>
 #include <memory.h>
 #include <stdint.h>
+#include <pci/pci.h>
 
 #define FBIOGET_VSCREENINFO 0x4600
 #define FBIOPUT_VSCREENINFO 0x4601
@@ -300,7 +301,47 @@ static vfs_file_ops_t fb_file_ops = {
     .mmap = fb_dev_mmap
 };
 
+/* Hardware-independent first step: identify the active firmware framebuffer
+   and all PCI display controllers without touching a GPU register. In
+   particular /dev/dri/card0 is currently only a legacy fbdev alias. */
+static int gpuinfo_read(vfs_file_t *file, void *buf, uint64_t count) {
+    if (!file || !buf) return -EFAULT;
+    char text[1024];
+    pci_display_id_t cards[8];
+    uint32_t cards_len = pci_display_devices(cards, 8);
+    struct limine_framebuffer *fb = fb_current();
+    int n = snprintf(text, sizeof(text), "backend=limine-fb drm=none vblank=none\n");
+    if (n < 0 || n >= (int)sizeof(text)) return -EOVERFLOW;
+    uint32_t used = (uint32_t)n;
+    if (fb) {
+        n = snprintf(text + used, sizeof(text) - used,
+                     "bootfb=%llux%llu bpp=%llu pitch=%llu\n",
+                     (unsigned long long)fb->width,
+                     (unsigned long long)fb->height,
+                     (unsigned long long)fb->bpp,
+                     (unsigned long long)fb->pitch);
+        if (n < 0 || n >= (int)(sizeof(text) - used)) return -EOVERFLOW;
+        used += n;
+    }
+    for (uint32_t i = 0; i < cards_len; i++) {
+        pci_display_id_t *card = &cards[i];
+        n = snprintf(text + used, sizeof(text) - used,
+                     "pci=%02x:%02x.%x vendor=%04x device=%04x subclass=%02x rev=%02x\n",
+                     card->bus, card->slot, card->func, card->vendor,
+                     card->device, card->subclass, card->revision);
+        if (n < 0 || n >= (int)(sizeof(text) - used)) return -EOVERFLOW;
+        used += n;
+    }
+    if (file->offset >= used) return 0;
+    if (count > used - file->offset) count = used - file->offset;
+    memcpy(buf, text + file->offset, (size_t)count);
+    file->offset += count;
+    return (int)count;
+}
+static vfs_file_ops_t gpuinfo_ops = { .read = gpuinfo_read };
+
 void fbdev_init(void) {
+    devfs_register_device("gpuinfo", VFS_TYPE_FILE, &gpuinfo_ops, NULL);
     devfs_register_device("fb0", VFS_TYPE_CHAR_DEV, &fb_file_ops, NULL);
     devfs_register_device("fb/0", VFS_TYPE_CHAR_DEV, &fb_file_ops, NULL);
     devfs_register_device("dri/card0", VFS_TYPE_CHAR_DEV, &fb_file_ops, NULL);
