@@ -6,6 +6,7 @@
 #include <memory.h>
 #include <scheduler/scheduler.h>
 #include <string.h>
+#include <syscall/xorgtrace.h>
 
 #define SOL_SOCKET 1
 #define SO_DEBUG   1
@@ -44,7 +45,14 @@ static bool unix_create_path_node(const char *path) {
     return true;
 }
 
+static void trace_unix_bind(const char *stage, uint64_t detail) {
+    process_t *p = get_current_process();
+    if (p && p->name && !strcmp(p->name, "Xorg"))
+        xorgtrace_stage(stage, p->pid, detail);
+}
+
 static int un_bind(socket_t *sock, const struct sockaddr *addr, socklen_t addrlen) {
+    trace_unix_bind("bind.unix.enter", addrlen);
     unix_intern_t *u = (unix_intern_t *)sock->private_data;
     if (!u) return -EINVAL;
     if (u->bound) return -EINVAL;
@@ -62,12 +70,17 @@ static int un_bind(socket_t *sock, const struct sockaddr *addr, socklen_t addrle
             }
         }
 
-        if (vfs_resolve_path(u->addr.sun_path)) {
+        trace_unix_bind("bind.unix.lookup", 0);
+        vfs_node_t *existing = vfs_resolve_path(u->addr.sun_path);
+        trace_unix_bind("bind.unix.lookup.done", existing != NULL);
+        if (existing) {
             memset(&u->addr, 0, sizeof(u->addr));
             return -EADDRINUSE;
         }
 
+        trace_unix_bind("bind.unix.create", 0);
         u->path_node_created = unix_create_path_node(u->addr.sun_path);
+        trace_unix_bind("bind.unix.create.done", u->path_node_created);
     }
 
     u->bound = true;

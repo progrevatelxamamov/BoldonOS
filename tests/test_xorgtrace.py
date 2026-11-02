@@ -22,8 +22,9 @@ static void spin_lock_irqsave(spinlock_t *l, uint64_t *flags) { (void)l; *flags=
 static void spin_unlock_irqrestore(spinlock_t *l, uint64_t flags) { (void)l; (void)flags; }
 static void *malloc_alloc(size_t n) { return calloc(1, n); }
 static void malloc_free(void *p) { free(p); }
-static unsigned enter_lines, exit_lines;
+static unsigned enter_lines, exit_lines, stage_lines;
 static void console_print_string(const char *s) {
+    if (!strcmp(s, "[XORGTRACE] ")) stage_lines++;
     if (!strcmp(s, "[XORGTRACE] enter pid=")) enter_lines++;
     if (!strcmp(s, "[XORGTRACE] exit seq=")) exit_lines++;
 }
@@ -95,6 +96,8 @@ int main(void) {
     for (int i=80; i<9000; i++) xorgtrace_syscall_enter(77, i, 0, 0);
     assert(enter_lines == 34); // first 12 + 7 early samples + 15 late samples
     assert(exit_lines == 3); // no extra exits for pending calls
+    for (int i=0; i<30; i++) xorgtrace_stage("bind.unix.lookup", 77, i);
+    assert(stage_lines == 24); // initial exec marker + bounded bind stages
     return 0;
 }
 '''

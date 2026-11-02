@@ -2,6 +2,8 @@
 #include <errno.h>
 #include <scheduler/scheduler.h>
 #include <memory.h>
+#include <string.h>
+#include <syscall/xorgtrace.h>
 
 
 extern int sys_getsockname(int sockfd, struct sockaddr *addr, socklen_t *addrlen);
@@ -35,7 +37,18 @@ uint64_t sys_bind_impl(uint64_t sockfd, uint64_t addr_ptr, uint64_t addrlen) {
     if (!addr_ptr || !user_range_ok(addr_ptr, addrlen))
         return (uint64_t)-EFAULT;
 
+    /* Xorg can stall before opening its logfile while binding an X11 socket.
+       Record the socket family without dereferencing the user sockaddr. */
+    process_t *p = get_current_process();
+    bool trace = p && p->name && !strcmp(p->name, "Xorg");
+    if (trace) {
+        socket_t *sock = get_socket_from_fd((int)sockfd);
+        xorgtrace_stage("bind.dispatch", p->pid,
+                        ((uint64_t)(uint32_t)sockfd << 32) |
+                        (sock ? (uint32_t)sock->domain : 0));
+    }
     int res = sys_bind((int)sockfd, (struct sockaddr*)addr_ptr, (socklen_t)addrlen);
+    if (trace) xorgtrace_stage("bind.done", p->pid, (uint64_t)(int64_t)res);
     if (res < 0) return (uint64_t)(int64_t)res;
     return (uint64_t)res;
 }

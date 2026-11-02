@@ -45,6 +45,7 @@ typedef struct socket {
 } socket_t;
 
 extern vfs_file_ops_t generic_socket_vfs_ops;
+socket_t *get_socket_from_fd(int sockfd);
 
 socket_t* unix_socket_create(int type, int protocol);
 socket_t* inet_socket_create(int type, int protocol);
