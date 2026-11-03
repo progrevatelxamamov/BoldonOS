@@ -67,8 +67,12 @@ void inotify_vfs_event(vfs_node_t *node, uint32_t mask, const char *name) {
     for (in_instance_t *in = instances; in; in = in->next) {
         for (int i = 0; i < IN_WATCH_LIMIT; i++) {
             in_watch_t *w = &in->watch[i];
-            if (w->active && same_node(w, node) && (w->mask & mask))
-                enqueue(in, w->wd, mask, name);
+            if (!w->active || !same_node(w, node)) continue;
+            if (w->mask & mask) enqueue(in, w->wd, mask, name);
+            if (mask & IN_DELETE_SELF) {
+                enqueue(in, w->wd, IN_IGNORED, NULL);
+                w->active = false;
+            }
         }
     }
     spin_unlock_irqrestore(&in_lock, irq);

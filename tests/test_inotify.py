@@ -34,6 +34,7 @@ code = r'''
 #define IN_CLOSE_WRITE 8U
 #define IN_CREATE 0x100U
 #define IN_DELETE 0x200U
+#define IN_DELETE_SELF 0x400U
 #define IN_Q_OVERFLOW 0x4000U
 #define IN_IGNORED 0x8000U
 #define IN_ONLYDIR 0x01000000U
@@ -106,6 +107,12 @@ int main(void) {
     assert(sys_inotify_rm_watch_impl(fd, wd) == 0);
     assert(f->node->file_ops->read(f, buf, sizeof(buf)) == 16 && e->mask == IN_IGNORED);
     assert(sys_inotify_rm_watch_impl(fd, wd) == (uint64_t)-EINVAL);
+    int file_wd = (int)sys_inotify_add_watch_impl(fd, (uintptr_t)"/tmp/f", IN_DELETE_SELF);
+    inotify_vfs_event(&file_node, IN_DELETE_SELF, NULL);
+    assert(f->node->file_ops->read(f, buf, sizeof(buf)) == 32);
+    assert(e->wd == file_wd && e->mask == IN_DELETE_SELF);
+    assert(((struct in_event *)(buf + 16))->mask == IN_IGNORED);
+    assert(sys_inotify_rm_watch_impl(fd, file_wd) == (uint64_t)-EINVAL);
     inotify_vfs_event(&dir, IN_CREATE, "f");
     assert(f->node->file_ops->read(f, buf, 16) == -EAGAIN);
     f->node->file_ops->close(f); free(f); table.fds[fd] = NULL;
