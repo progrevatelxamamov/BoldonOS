@@ -240,12 +240,10 @@ int sys_ftruncate_impl(int fd, int64_t length) {
     if (length < 0) return -EINVAL;
 
     vfs_file_t *file = p->fd_table->fds[fd];
-    if (!file->node) return -EBADF;
+    if (!file->node || !(file->flags & VFS_O_WRITE)) return -EBADF;
 
-    if (file->node->file_ops != &shmem_fops) {
-        file->node->size = (uint64_t)length;
-        return 0;
-    }
+    /* Changing the cached VFS size alone does not truncate the backing file. */
+    if (file->node->file_ops != &shmem_fops) return -ENOSYS;
 
     shmem_object_t *obj = (shmem_object_t *)file->node->fs_data;
     if (!obj) return -EBADF;

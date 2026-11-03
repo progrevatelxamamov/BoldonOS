@@ -62,6 +62,7 @@ extern uint64_t sys_poll_impl(uint64_t, uint64_t, uint64_t);
 extern uint64_t sys_close_range_impl(uint64_t, uint64_t, uint64_t);
 extern uint64_t sys_renameat_impl(uint64_t, uint64_t, uint64_t, uint64_t);
 extern uint64_t sys_capget_impl(uint64_t, uint64_t);
+extern uint64_t sys_xattr_impl(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
 extern uint64_t sys_capset_impl(uint64_t, uint64_t);
 extern uint64_t sys_pidfd_open_impl(uint64_t, uint64_t);
 extern uint64_t sys_inotify_init1_impl(uint64_t);
@@ -367,6 +368,7 @@ uint64_t osdev_syscall_handler(uint64_t num,
     case 83:  return sys_mkdir_impl(a1, a2);
     case 87:  return sys_unlink_impl(a1);
     case 90:  return sys_chmod_impl(a1, a2);
+    case 188 ... 199: return sys_xattr_impl(num, a1, a2, a3, a4, a5);
     case 98:  return sys_getrusage_impl(a1, a2);
     case 99:  return sys_sysinfo_impl(a1);
     case 258: return sys_mkdirat_impl(a1, a2, a3);
@@ -398,7 +400,7 @@ uint64_t osdev_syscall_handler(uint64_t num,
     case 439: return sys_faccessat2_impl(a1, a2, a3, a4);
     case 221: return sys_fstatfs_impl(a1, a2);
     case 138: return sys_reboot_impl(a1, a2, a3, a4);
-    case 92:  return 0; // sys_truncate
+    case 92:  return (uint64_t)-ENOSYS; /* no path truncate implementation */
 
     default:
         console_print_string("[SYSCALL] ENOSYS num=");

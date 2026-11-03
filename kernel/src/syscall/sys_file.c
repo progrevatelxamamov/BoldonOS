@@ -1253,10 +1253,80 @@ uint64_t sys_pwrite64_impl(uint64_t fd, uint64_t buf, uint64_t count, uint64_t o
     process_t *p = get_current_process();
     if (!p || !p->fd_table || fd >= VFS_MAX_FD || !p->fd_table->fds[fd])
         return (uint64_t)-EBADF;
+    if (!user_range_ok(buf, count)) return (uint64_t)-EFAULT;
     vfs_file_t *file = p->fd_table->fds[fd];
     uint64_t saved = file->offset;
     file->offset = offset;
     int res = vfs_write(file, (const void *)buf, count);
     file->offset = saved;
     return (uint64_t)(int64_t)res;
+}
+
+/* Linux xattr syscalls 188..199.  Only security.capability is exposed:
+   unsupported namespaces must not be advertised as successful writes. */
+uint64_t sys_xattr_impl(uint64_t nr, uint64_t a1, uint64_t a2,
+                        uint64_t a3, uint64_t a4, uint64_t a5) {
+    if (nr < 188 || nr > 199) return (uint64_t)-ENOSYS;
+    unsigned op = (unsigned)(nr - 188) / 3;
+    unsigned variant = (unsigned)(nr - 188) % 3; /* path, lpath, fd */
+    process_t *p = get_current_process();
+    if (!p || !p->fd_table) return (uint64_t)-EBADF;
+    vfs_node_t *node;
+    if (variant == 2) {
+        if (a1 >= VFS_MAX_FD || !p->fd_table->fds[a1]) return (uint64_t)-EBADF;
+        node = p->fd_table->fds[a1]->node;
+    } else {
+        char path[512];
+        if (copy_str_from_user(path, a1, sizeof(path))) return (uint64_t)-EFAULT;
+        node = variant == 1 ? vfs_resolve_path_nofollow(path) : vfs_resolve_path(path);
+        if (!node) return (uint64_t)-ENOENT;
+    }
+    if (!node || !node->ops || !node->ops->getxattr) return (uint64_t)-EOPNOTSUPP;
+    if (vfs_check_access(node, p->fsuid, p->fsgid, VFS_PERM_READ))
+        return (uint64_t)-EACCES;
+    const char *cap_name = "security.capability";
+    char name[64];
+    if (op != 2) {
+        if (copy_str_from_user(name, a2, sizeof(name))) return (uint64_t)-EFAULT;
+        if (strcmp(name, cap_name)) return (uint64_t)-EOPNOTSUPP;
+    }
+    if (op == 0) {
+        if (vfs_check_access(node, p->fsuid, p->fsgid, VFS_PERM_WRITE))
+            return (uint64_t)-EACCES;
+        if (a4 > 24) return (uint64_t)-E2BIG;
+        if (a5) return (uint64_t)-EOPNOTSUPP; /* CREATE/REPLACE not atomic here */
+        if (node->type != VFS_TYPE_FILE || !(p->cap_effective & BOLDON_CAP_SETFCAP))
+            return (uint64_t)-EPERM;
+        if (!a4 || !user_range_ok(a3, a4)) return (uint64_t)-EFAULT;
+        uint8_t value[24];
+        memcpy(value, (const void *)a3, (size_t)a4);
+        boldon_file_caps_t decoded;
+        int rc = capability_parse_file(value, (int)a4, &decoded);
+        if (rc) return (uint64_t)(int64_t)rc;
+        return (uint64_t)(int64_t)vfs_setxattr(node, cap_name, value, a4);
+    }
+    if (op == 3) {
+        if (vfs_check_access(node, p->fsuid, p->fsgid, VFS_PERM_WRITE))
+            return (uint64_t)-EACCES;
+        if (!(p->cap_effective & BOLDON_CAP_SETFCAP)) return (uint64_t)-EPERM;
+        return (uint64_t)(int64_t)vfs_removexattr(node, cap_name);
+    }
+    uint8_t value[24];
+    int len = node->ops->getxattr(node, cap_name, value, sizeof(value));
+    if (op == 2) {
+        if (len == -ENODATA) return 0;
+        if (len < 0) return (uint64_t)(int64_t)len;
+        size_t required = strlen(cap_name) + 1;
+        if (!a3) return required;
+        if (a3 < required) return (uint64_t)-ERANGE;
+        if (!user_range_ok(a2, required)) return (uint64_t)-EFAULT;
+        memcpy((void *)a2, cap_name, required);
+        return required;
+    }
+    if (len < 0) return (uint64_t)(int64_t)len;
+    if (!a4) return (uint64_t)len;
+    if (a4 < (uint64_t)len) return (uint64_t)-ERANGE;
+    if (!user_range_ok(a3, (uint64_t)len)) return (uint64_t)-EFAULT;
+    memcpy((void *)a3, value, (size_t)len);
+    return (uint64_t)len;
 }

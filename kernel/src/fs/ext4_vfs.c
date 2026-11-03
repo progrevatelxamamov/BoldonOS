@@ -589,6 +589,23 @@ static int ext4_vfs_op_getxattr(vfs_node_t *node, const char *name,
     return actual <= (size_t)size ? (int)actual : -ERANGE;
 }
 
+static int ext4_vfs_op_setxattr(vfs_node_t *node, const char *name,
+                                const void *buf, uint64_t size) {
+    if (!node || !name || !buf || size > 24) return -EINVAL;
+    char path[512];
+    get_lwext4_path(node, path, sizeof(path));
+    int r = ext4_setxattr(path, name, strlen(name), buf, (size_t)size);
+    return r == EOK ? 0 : -r;
+}
+
+static int ext4_vfs_op_removexattr(vfs_node_t *node, const char *name) {
+    if (!node || !name) return -EINVAL;
+    char path[512];
+    get_lwext4_path(node, path, sizeof(path));
+    int r = ext4_removexattr(path, name, strlen(name));
+    return r == EOK ? 0 : -r;
+}
+
 static int ext4_vfs_op_chown(vfs_node_t *node, uint32_t uid, uint32_t gid) {
     if (!node) return -1;
 
@@ -771,6 +788,8 @@ void ext4_vfs_init(void) {
     g_ext4_node_ops.chmod = ext4_vfs_op_chmod;
     g_ext4_node_ops.chown = ext4_vfs_op_chown;
     g_ext4_node_ops.getxattr = ext4_vfs_op_getxattr;
+    g_ext4_node_ops.setxattr = ext4_vfs_op_setxattr;
+    g_ext4_node_ops.removexattr = ext4_vfs_op_removexattr;
 
     g_ext4_fs_type.mount = ext4_vfs_mount;
     g_ext4_fs_type.unmount = ext4_vfs_unmount;

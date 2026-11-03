@@ -456,13 +456,12 @@ vfs_node_t *vfs_resolve_path_ext_r(const char *path, bool parent_only, char *las
 }
 
 int vfs_check_access(vfs_node_t *node, uint32_t uid, uint32_t gid, int req_perms) {
-    if (uid == 0) {
-        process_t *p = get_current_process();
-        if (!p || (p->fsuid == uid &&
-                   (p->cap_effective & BOLDON_CAP_DAC_OVERRIDE))) {
-            /* CAP_DAC_OVERRIDE does not execute a file without any x bit. */
-            if (!(req_perms & VFS_PERM_EXEC) || (node->mode & 0111)) return 0;
-        }
+    process_t *p = get_current_process();
+    if ((!p && uid == 0) ||
+        (p && p->fsuid == uid &&
+         (p->cap_effective & BOLDON_CAP_DAC_OVERRIDE))) {
+        /* CAP_DAC_OVERRIDE does not execute a file without any x bit. */
+        if (!(req_perms & VFS_PERM_EXEC) || (node->mode & 0111)) return 0;
     }
     int perms = 0;
     if (node->uid == uid) {
@@ -517,6 +516,7 @@ vfs_file_t *vfs_open(const char *path, uint32_t flags) {
 int vfs_read(vfs_file_t *file, void *buf, uint64_t count) {
     if (!file || !file->node || !file->node->file_ops || !file->node->file_ops->read)
         return -1;
+    if (!(file->flags & VFS_O_READ)) return -EBADF;
     int result = file->node->file_ops->read(file, buf, count);
     if (result > 0) inotify_vfs_event(file->node, IN_ACCESS, NULL);
     return result;
@@ -525,6 +525,7 @@ int vfs_read(vfs_file_t *file, void *buf, uint64_t count) {
 int vfs_write(vfs_file_t *file, const void *buf, uint64_t count) {
     if (!file || !file->node || !file->node->file_ops || !file->node->file_ops->write)
         return -1;
+    if (!(file->flags & VFS_O_WRITE)) return -EBADF;
     int result = file->node->file_ops->write(file, buf, count);
     if (result > 0) inotify_vfs_event(file->node, IN_MODIFY, NULL);
     return result;
@@ -817,6 +818,23 @@ int vfs_fchmod(vfs_file_t *file, uint32_t mode) {
     if (!result) inotify_vfs_event(file->node, IN_ATTRIB, NULL);
     return result;
 }
+
+int vfs_setxattr(vfs_node_t *node, const char *name, const void *value, uint64_t size) {
+    if (!node || !node->ops || !node->ops->setxattr) return -EOPNOTSUPP;
+    if (node->mount && node->mount->read_only) return -EROFS;
+    int result = node->ops->setxattr(node, name, value, size);
+    if (!result) inotify_vfs_event(node, IN_ATTRIB, NULL);
+    return result;
+}
+
+int vfs_removexattr(vfs_node_t *node, const char *name) {
+    if (!node || !node->ops || !node->ops->removexattr) return -EOPNOTSUPP;
+    if (node->mount && node->mount->read_only) return -EROFS;
+    int result = node->ops->removexattr(node, name);
+    if (!result) inotify_vfs_event(node, IN_ATTRIB, NULL);
+    return result;
+}
+
 
 int sys_ioctl(process_fd_table_t *table, int fd, uint64_t request, void *arg) {
     if (!table || fd < 0 || fd >= VFS_MAX_FD || !table->fds[fd]) return -1;

@@ -23,6 +23,10 @@ int main(void) {
     n.mode = 0001;
     assert(vfs_check_access(&n, 0, 0, VFS_PERM_EXEC) == 0);
     n.mode = 0000;
+    p.fsuid = 77;
+    assert(vfs_check_access(&n, 77, 77, 4) == 0);
+    assert(vfs_check_access(&n, 77, 77, VFS_PERM_EXEC) == -1);
+    p.fsuid = 0;
     p.cap_effective = 0;
     assert(vfs_check_access(&n, 0, 0, 4) == -1);
     n.mode = 0004;

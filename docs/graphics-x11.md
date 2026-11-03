@@ -113,7 +113,7 @@ Could not create full-duplex pipe`: вызов 53 — `socketpair`, **не** `pi
 при завершении или сборке процесса (без `pidfd_send_signal`/`waitid(P_PIDFD)`).
 `capget` (125) и `capset` (126) поддерживают версии Linux v1/v2/v3 и
 учитывают ограниченный набор **реально представленных** прав:
-DAC_OVERRIDE, FOWNER, KILL, SETUID, SETGID, SETPCAP, SYS_ADMIN, SYS_BOOT.
+DAC_OVERRIDE, FOWNER, KILL, SETUID, SETGID, SETPCAP, SETFCAP, SYS_ADMIN, SYS_BOOT.
 Для пользовательских mkdir/unlink/link/rename проверяются права родительского
 каталога; chmod требует владельца или FOWNER, mount/umount — SYS_ADMIN,
 reboot — SYS_BOOT, чужой SIGINT — KILL. Наборы permitted/effective/inheritable,
@@ -123,10 +123,15 @@ bounding и ambient хранятся в процессе и наследуютс
 и повреждённые xattr отклоняются **до** замены процесса. File-cap наборы
 учитываются при exec вместе с bounding/inheritable и `no_new_privs`.
 Без xattr root получает ограничение bounding, обычный процесс — ambient.
-**Это ещё не полная модель Linux capabilities**: нет syscall для записи
-file-cap xattr из гостя, namespaces,
-разделения credentials по потокам и проверок capabilities для всех операций
-ядра. `PR_CAP_AMBIENT` (raise/lower/query/clear) и `PR_SET/GET_NO_NEW_PRIVS`
+Гостевые `setxattr/getxattr/listxattr/removexattr` и варианты `l*`/`f*`
+(188–199) работают только с `security.capability` на ext4. Запись и удаление
+требуют SETFCAP и права записи; изменение вызывает `IN_ATTRIB`. Неизвестные
+namespace xattr и флаги `XATTR_CREATE/REPLACE` отклоняются, а не получают
+ложный успех. `ftruncate` теперь отвергает FD без записи и не выдаёт
+фиктивный успех для файлов вне shmem; `truncate(92)` возвращает ENOSYS.
+**Это ещё не полная модель Linux capabilities**: нет user namespaces,
+разделения credentials по потокам и исчерпывающего аудита привилегированных
+путей ядра. `PR_CAP_AMBIENT` (raise/lower/query/clear) и `PR_SET/GET_NO_NEW_PRIVS`
 работают для поддерживаемых прав; fsuid/fsgid отделены от euid/egid.
 Безопасность остальных привилегированных операций не следует выводить из
 одного только успешного `capset`. Предупреждение Qt об ANSI locale

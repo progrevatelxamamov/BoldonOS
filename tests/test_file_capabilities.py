@@ -13,13 +13,14 @@ code=r'''
 #include <assert.h>
 #define BOLDON_CAP_DAC_OVERRIDE (1ULL<<1)
 #define BOLDON_CAP_SETUID (1ULL<<7)
-#define BOLDON_CAP_SUPPORTED ((1ULL<<1)|(1ULL<<3)|(1ULL<<5)|(1ULL<<6)|(1ULL<<7)|(1ULL<<8)|(1ULL<<21)|(1ULL<<22))
+#define BOLDON_CAP_SUPPORTED ((1ULL<<1)|(1ULL<<3)|(1ULL<<5)|(1ULL<<6)|(1ULL<<7)|(1ULL<<8)|(1ULL<<21)|(1ULL<<22)|(1ULL<<31))
 typedef struct vfs_node vfs_node_t;
 typedef struct { int (*getxattr)(vfs_node_t *,const char *,void *,uint64_t); } vfs_node_ops_t;
 struct vfs_node { vfs_node_ops_t *ops; };
 typedef struct { bool present,effective; uint64_t permitted,inheritable; } boldon_file_caps_t;
 typedef struct { uint32_t euid; uint64_t cap_bounding,cap_permitted,cap_effective,
                  cap_inheritable,cap_ambient; bool no_new_privs; } process_t;
+int capability_parse_file(const void *, int, boldon_file_caps_t *);
 static int result=20;
 static uint8_t xattr[24];
 static int attr(vfs_node_t *node,const char *name,void *dst,uint64_t size) {
@@ -39,6 +40,10 @@ int main(void) {
     memcpy(xattr,&magic,4);memcpy(xattr+4,&bit,4);
     assert(capability_read_file(&n,&c)==0 && c.present && c.effective);
     assert(c.permitted == BOLDON_CAP_SETUID && c.inheritable == 0);
+    result=12;magic=0x01000001U;bit=1U<<31;
+    memcpy(xattr,&magic,4);memcpy(xattr+4,&bit,4);
+    assert(capability_read_file(&n,&c)==0 && c.permitted==(1ULL<<31));
+    result=20;magic=0x02000001U;memcpy(xattr,&magic,4);
     bit=1U<<25;memcpy(xattr+4,&bit,4);
     assert(capability_read_file(&n,&c)==-EOPNOTSUPP);
     bit=BOLDON_CAP_DAC_OVERRIDE;memcpy(xattr+4,&bit,4);

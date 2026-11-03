@@ -83,6 +83,9 @@ typedef struct {
     /* Returns attribute size or negative errno; no value is synthesized. */
     int (*getxattr)(struct vfs_node *node, const char *name,
                     void *buf, uint64_t size);
+    int (*setxattr)(struct vfs_node *node, const char *name,
+                    const void *buf, uint64_t size);
+    int (*removexattr)(struct vfs_node *node, const char *name);
 } vfs_node_ops_t;
 
 typedef struct vfs_node {
@@ -166,6 +169,8 @@ int vfs_rmdir(const char *path);
 int vfs_link(const char *oldpath, const char *newpath);
 int vfs_rename(const char *oldpath, const char *newpath);
 int vfs_fchmod(vfs_file_t *file, uint32_t mode);
+int vfs_setxattr(vfs_node_t *node, const char *name, const void *value, uint64_t size);
+int vfs_removexattr(vfs_node_t *node, const char *name);
 
 int vfs_copy_file(const char *src_path, const char *dst_path);
 

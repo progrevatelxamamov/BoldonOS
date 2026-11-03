@@ -16,10 +16,17 @@ int capability_read_file(vfs_node_t *node, boldon_file_caps_t *caps) {
     int len = node->ops->getxattr(node, "security.capability", raw, sizeof(raw));
     if (len == -ENODATA) return 0;
     if (len < 0) return len == -ERANGE ? -EOPNOTSUPP : len;
+    return capability_parse_file(raw, len, caps);
+}
+
+int capability_parse_file(const void *raw, int len, boldon_file_caps_t *caps) {
+    if (!raw || !caps) return -EINVAL;
+    memset(caps, 0, sizeof(*caps));
+    const uint8_t *bytes = raw;
     if (len < 4) return -EINVAL;
 
     uint32_t magic;
-    memcpy(&magic, raw, sizeof(magic));
+    memcpy(&magic, bytes, sizeof(magic));
     uint32_t revision = magic & 0xff000000U;
     int expected = revision == 0x01000000U ? 12 :
                    revision == 0x02000000U ? 20 :
@@ -27,15 +34,15 @@ int capability_read_file(vfs_node_t *node, boldon_file_caps_t *caps) {
     if (len != expected || (magic & 0x00fffffeU)) return -EINVAL;
     if (revision == 0x03000000U) {
         uint32_t rootid;
-        memcpy(&rootid, raw + 20, sizeof(rootid));
+        memcpy(&rootid, bytes + 20, sizeof(rootid));
         if (rootid) return -EOPNOTSUPP; /* no user namespaces */
     }
     uint32_t p0, i0, p1 = 0, i1 = 0;
-    memcpy(&p0, raw + 4, 4);
-    memcpy(&i0, raw + 8, 4);
+    memcpy(&p0, bytes + 4, 4);
+    memcpy(&i0, bytes + 8, 4);
     if (len >= 20) {
-        memcpy(&p1, raw + 12, 4);
-        memcpy(&i1, raw + 16, 4);
+        memcpy(&p1, bytes + 12, 4);
+        memcpy(&i1, bytes + 16, 4);
     }
     caps->permitted = (uint64_t)p0 | ((uint64_t)p1 << 32);
     caps->inheritable = (uint64_t)i0 | ((uint64_t)i1 << 32);
