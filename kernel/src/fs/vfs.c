@@ -1,5 +1,6 @@
 #include <fs/vfs.h>
 #include <fs/inotify.h>
+#include <sys/capability.h>
 #include <mm/malloc.h>
 #include <memory.h>
 #include <gconsole.h>
@@ -99,6 +100,7 @@ int vfs_umount_fs(char drive_letter) {
     vfs_mount_t *mnt = drives[drive_letter - 'A'];
     if (!mnt) return -EINVAL;
 
+    inotify_vfs_unmount(mnt);
     if (mnt->unmount) mnt->unmount(mnt);
     mnt->dead = true;
 
@@ -454,7 +456,11 @@ vfs_node_t *vfs_resolve_path_ext_r(const char *path, bool parent_only, char *las
 }
 
 int vfs_check_access(vfs_node_t *node, uint32_t uid, uint32_t gid, int req_perms) {
-    if (uid == 0) return 0;
+    if (uid == 0) {
+        process_t *p = get_current_process();
+        if (!p || (p->euid == uid &&
+                   (p->cap_effective & BOLDON_CAP_DAC_OVERRIDE))) return 0;
+    }
     int perms = 0;
     if (node->uid == uid) {
         perms = (node->mode >> 6) & 7;
@@ -766,6 +772,29 @@ int vfs_link(const char *oldpath, const char *newpath) {
     }
 
     return 0;
+}
+
+int vfs_rename(const char *oldpath, const char *newpath) {
+    if (!oldpath || !newpath) return -EINVAL;
+    vfs_node_t *moved = vfs_resolve_path_nofollow(oldpath);
+    if (strcmp(oldpath, newpath) == 0) return moved ? 0 : -ENOENT;
+    if (!moved) return -ENOENT;
+    char old_name[256] = {0}, new_name[256] = {0};
+    vfs_node_t *from = vfs_resolve_path_ext(oldpath, true, old_name);
+    vfs_node_t *to = vfs_resolve_path_ext(newpath, true, new_name);
+    if (!from || !to) return -ENOENT;
+    if (!old_name[0] || !new_name[0]) return -EINVAL;
+    if (from->mount != to->mount) return -EXDEV;
+    if (from->type != VFS_TYPE_DIR || to->type != VFS_TYPE_DIR)
+        return -ENOTDIR;
+    if (from == to && strcmp(old_name, new_name) == 0) return 0;
+    /* The ext4 backend cannot atomically replace an existing destination;
+       refuse rather than reporting Linux rename success after a partial op. */
+    if (vfs_resolve_path_nofollow(newpath)) return -EEXIST;
+    if (!from->ops || !from->ops->rename) return -ENOSYS;
+    int result = from->ops->rename(from, old_name, to, new_name);
+    if (!result) inotify_vfs_move(from, old_name, to, new_name, moved);
+    return result;
 }
 
 int vfs_fchmod(vfs_file_t *file, uint32_t mode) {

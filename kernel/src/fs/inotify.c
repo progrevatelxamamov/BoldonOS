@@ -39,6 +39,7 @@ typedef struct in_instance {
 
 static in_instance_t *instances;
 static spinlock_t in_lock = SPINLOCK_INIT;
+static uint32_t next_move_cookie;
 
 static bool same_node(const in_watch_t *w, const vfs_node_t *node) {
     if (!node || w->mount != node->mount) return false;
@@ -46,10 +47,11 @@ static bool same_node(const in_watch_t *w, const vfs_node_t *node) {
     return w->identity == node;
 }
 
-static void enqueue(in_instance_t *in, int32_t wd, uint32_t mask, const char *name) {
+static void enqueue(in_instance_t *in, int32_t wd, uint32_t mask,
+                    uint32_t cookie, const char *name) {
     if (in->count == IN_EVENT_LIMIT) { in->overflow = true; return; }
     struct in_event *ev = &in->event[in->tail];
-    ev->wd = wd; ev->mask = mask; ev->cookie = 0; ev->len = 0;
+    ev->wd = wd; ev->mask = mask; ev->cookie = cookie; ev->len = 0;
     if (name && *name) {
         size_t n = 0;
         while (name[n] && n < 255) n++;
@@ -70,9 +72,61 @@ void inotify_vfs_event(vfs_node_t *node, uint32_t mask, const char *name) {
             in_watch_t *w = &in->watch[i];
             if (!w->active || !same_node(w, node)) continue;
             bool matched = (w->mask & mask) != 0;
-            if (matched) enqueue(in, w->wd, mask, name);
+            if (matched) enqueue(in, w->wd, mask, 0, name);
             if ((mask & IN_DELETE_SELF) || (matched && (w->options & IN_ONESHOT))) {
-                enqueue(in, w->wd, IN_IGNORED, NULL);
+                enqueue(in, w->wd, IN_IGNORED, 0, NULL);
+                w->active = false;
+            }
+        }
+    }
+    spin_unlock_irqrestore(&in_lock, irq);
+}
+
+void inotify_vfs_unmount(vfs_mount_t *mount) {
+    if (!mount) return;
+    uint64_t irq;
+    spin_lock_irqsave(&in_lock, &irq);
+    for (in_instance_t *in = instances; in; in = in->next) {
+        for (int i = 0; i < IN_WATCH_LIMIT; i++) {
+            in_watch_t *w = &in->watch[i];
+            if (!w->active || w->mount != mount) continue;
+            enqueue(in, w->wd, IN_UNMOUNT, 0, NULL);
+            enqueue(in, w->wd, IN_IGNORED, 0, NULL);
+            w->active = false;
+        }
+    }
+    spin_unlock_irqrestore(&in_lock, irq);
+}
+
+void inotify_vfs_move(vfs_node_t *old_dir, const char *old_name,
+                      vfs_node_t *new_dir, const char *new_name,
+                      vfs_node_t *moved) {
+    if (!old_dir || !new_dir || !moved) return;
+    uint32_t dir = moved->type == VFS_TYPE_DIR ? IN_ISDIR : 0;
+    uint64_t irq;
+    spin_lock_irqsave(&in_lock, &irq);
+    uint32_t cookie = ++next_move_cookie;
+    if (!cookie) cookie = ++next_move_cookie;
+    for (in_instance_t *in = instances; in; in = in->next) {
+        for (int i = 0; i < IN_WATCH_LIMIT; i++) {
+            in_watch_t *w = &in->watch[i];
+            if (!w->active) continue;
+            uint32_t mask = 0;
+            const char *name = NULL;
+            if (same_node(w, old_dir) && (w->mask & IN_MOVED_FROM)) {
+                mask = IN_MOVED_FROM | dir; name = old_name;
+                enqueue(in, w->wd, mask, cookie, name);
+            }
+            if (same_node(w, new_dir) && (w->mask & IN_MOVED_TO)) {
+                mask = IN_MOVED_TO | dir; name = new_name;
+                enqueue(in, w->wd, mask, cookie, name);
+            }
+            if (same_node(w, moved) && (w->mask & IN_MOVE_SELF)) {
+                enqueue(in, w->wd, IN_MOVE_SELF, 0, NULL);
+                mask = IN_MOVE_SELF;
+            }
+            if (mask && (w->options & IN_ONESHOT)) {
+                enqueue(in, w->wd, IN_IGNORED, 0, NULL);
                 w->active = false;
             }
         }
@@ -214,9 +268,9 @@ uint64_t sys_inotify_add_watch_impl(uint64_t fd, uint64_t path, uint64_t mask_ar
     if (i == sizeof(name) - 1) return (uint64_t)-ENAMETOOLONG;
     uint32_t mask = (uint32_t)mask_arg;
     if ((mask_arg >> 32) || !(mask & IN_ALL_EVENTS)) return (uint64_t)-EINVAL;
-    /* Tracking events on unlinked children of a watched directory requires
-       more than the VFS parent-notification hooks currently provide. */
-    if (mask & IN_EXCL_UNLINK) return (uint64_t)-ENOSYS;
+    /* Parent watches only receive events on directory entries while they
+       are linked; no subsequent child events are routed to the parent.
+       Thus IN_EXCL_UNLINK requires no additional filtering in this VFS. */
     vfs_node_t *node = (mask & IN_DONT_FOLLOW) ? vfs_resolve_path_nofollow(name)
                                                  : vfs_resolve_path(name);
     if (!node) return (uint64_t)-ENOENT;
@@ -261,7 +315,7 @@ uint64_t sys_inotify_rm_watch_impl(uint64_t fd, uint64_t wd_arg) {
         if (!w->active || w->wd != (int32_t)wd_arg) continue;
         int wd = w->wd;
         w->active = false;
-        enqueue(in, wd, IN_IGNORED, NULL);
+        enqueue(in, wd, IN_IGNORED, 0, NULL);
         spin_unlock_irqrestore(&in_lock, irq);
         return 0;
     }

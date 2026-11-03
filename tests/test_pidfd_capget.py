@@ -6,7 +6,7 @@ root = Path(__file__).resolve().parents[1]
 pidfd = (root / 'kernel/src/syscall/sys_pidfd.c').read_text()
 pidfd = '\n'.join(line for line in pidfd.splitlines() if not line.startswith('#include'))
 proc = (root / 'kernel/src/syscall/sys_proc.c').read_text()
-cap = proc[proc.index('/* capget(125) reports'):proc.index('#define IA32_FS_BASE', proc.index('/* capget(125) reports'))]
+cap = proc[proc.index('/* Linux capability ABI'):proc.index('#define IA32_FS_BASE', proc.index('/* Linux capability ABI'))]
 dispatch = (root / 'kernel/src/syscall/syscall.c').read_text()
 for label in ('SYS_CAPGET', 'SYS_PIDFD_OPEN'):
     assert f'case {label}:' in dispatch
@@ -30,15 +30,27 @@ typedef struct { int (*read)(vfs_file_t *, void *, uint64_t); uint32_t (*poll)(v
 struct vfs_node { int type; vfs_file_ops_t *file_ops; };
 struct vfs_file { vfs_node_t *node; void *private_data; uint32_t flags, refcount; };
 typedef struct { vfs_file_t *fds[VFS_MAX_FD]; } process_fd_table_t;
-typedef struct { process_fd_table_t *fd_table; uint32_t euid; } process_t;
+#define BOLDON_CAP_SETPCAP (1ULL << 8)
+#define BOLDON_CAP_SUPPORTED ((1ULL<<1)|(1ULL<<6)|(1ULL<<7)|(1ULL<<8))
+typedef struct { process_fd_table_t *fd_table; uint32_t euid; uint64_t pid;
+                 uint64_t cap_effective, cap_permitted, cap_inheritable,
+                          cap_bounding, cap_ambient; } process_t;
 static process_fd_table_t table;
-static process_t self = { .fd_table = &table, .euid = 0 };
+static process_t self = { .fd_table = &table, .euid = 0, .pid = 11,
+    .cap_effective = BOLDON_CAP_SUPPORTED,
+    .cap_permitted = BOLDON_CAP_SUPPORTED, .cap_bounding = BOLDON_CAP_SUPPORTED };
 static int state = 0;
 static uint32_t target_uid = 0;
 static int scheduler_pid_status(uint64_t pid, uint32_t *euid) {
     if (pid != 77 || state < 0) return -1;
     if (euid) *euid = target_uid;
     return state;
+}
+static int scheduler_cap_snapshot(uint64_t pid, uint64_t *e, uint64_t *p, uint64_t *i) {
+    if (pid != 77 || state != 0) return -1;
+    *e = target_uid ? 0 : BOLDON_CAP_SUPPORTED;
+    *p = *e; *i = 0;
+    return 0;
 }
 static process_t *get_current_process(void) { return &self; }
 static void *malloc_alloc(uint64_t n) { return malloc(n); }
@@ -74,13 +86,14 @@ int main(void) {
     assert(sys_capget_impl((uintptr_t)&h, (uintptr_t)data) == (uint64_t)-EINVAL);
     assert(h.version == 0x20080522U);
     assert(sys_capget_impl((uintptr_t)&h, (uintptr_t)data) == 0);
-    assert(data[0].effective == ((1U<<1)|(1U<<6)|(1U<<7)));
+    assert(data[0].effective == BOLDON_CAP_SUPPORTED);
     assert(data[0].permitted == data[0].effective && !data[0].inheritable);
     assert(data[1].effective == 0 && data[1].permitted == 0);
     h.version = 0x20071026U;
     assert(sys_capget_impl((uintptr_t)&h, (uintptr_t)data) == 0);
     assert(data[0].effective != 0 && data[1].effective == 0);
     self.euid = 1000;
+    self.cap_effective = self.cap_permitted = 0;
     h.version = 0x19980330U;
     assert(sys_capget_impl((uintptr_t)&h, (uintptr_t)data) == 0);
     assert(!data[0].effective && !data[0].permitted);
@@ -93,6 +106,18 @@ int main(void) {
     assert(sys_capget_impl((uintptr_t)&h, (uintptr_t)data) == (uint64_t)-ESRCH);
     h.pid = -1;
     assert(sys_capget_impl((uintptr_t)&h, (uintptr_t)data) == (uint64_t)-EINVAL);
+    h.pid = 0;
+    self.cap_permitted = BOLDON_CAP_SUPPORTED;
+    self.cap_effective = BOLDON_CAP_SUPPORTED;
+    data[0] = (struct linux_cap_data){ .effective = 1U<<1, .permitted = 1U<<1 };
+    data[1] = (struct linux_cap_data){0};
+    assert(sys_capset_impl((uintptr_t)&h, (uintptr_t)data) == 0);
+    assert(self.cap_permitted == (1U<<1) && self.cap_effective == (1U<<1));
+    data[0].effective |= 1U<<7; data[0].permitted |= 1U<<7;
+    assert(sys_capset_impl((uintptr_t)&h, (uintptr_t)data) == (uint64_t)-EPERM);
+    assert(self.cap_effective == (1U<<1));
+    data[0].effective = data[0].permitted = 1U<<25;
+    assert(sys_capset_impl((uintptr_t)&h, (uintptr_t)data) == (uint64_t)-EPERM);
     puts("pidfd and capget: validation, poll lifecycle, ABI versions and UID rights passed");
 }
 '''

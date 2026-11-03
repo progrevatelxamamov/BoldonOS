@@ -1051,6 +1051,18 @@ uint64_t sys_mkdir_impl(uint64_t path_ptr, uint64_t mode) {
     return sys_mkdirat_impl(-100 /* AT_FDCWD */, path_ptr, mode);
 }
 
+uint64_t sys_renameat_impl(uint64_t oldfd, uint64_t old_ptr,
+                           uint64_t newfd, uint64_t new_ptr) {
+    char oldpath[512], newpath[512];
+    if (copy_str_from_user(oldpath, old_ptr, sizeof(oldpath)) != 0 ||
+        copy_str_from_user(newpath, new_ptr, sizeof(newpath)) != 0)
+        return (uint64_t)-EFAULT;
+    if (((int64_t)oldfd != -100 && oldpath[0] != '/') ||
+        ((int64_t)newfd != -100 && newpath[0] != '/'))
+        return (uint64_t)-ENOSYS;
+    return (uint64_t)(int64_t)vfs_rename(oldpath, newpath);
+}
+
 uint64_t sys_unlinkat_impl(uint64_t dirfd, uint64_t path_ptr, uint64_t flags) {
     (void)dirfd;
 

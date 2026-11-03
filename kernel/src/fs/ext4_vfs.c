@@ -550,6 +550,21 @@ static int ext4_vfs_op_link(vfs_node_t *dir, vfs_node_t *old_node, const char *n
     return (r == EOK) ? 0 : -1;
 }
 
+static int ext4_vfs_op_rename(vfs_node_t *old_dir, const char *old_name,
+                              vfs_node_t *new_dir, const char *new_name) {
+    char from_parent[512], to_parent[512], from[512], to[512];
+    get_lwext4_path(old_dir, from_parent, sizeof(from_parent));
+    get_lwext4_path(new_dir, to_parent, sizeof(to_parent));
+    int a = snprintf(from, sizeof(from), "%s%s%s", from_parent,
+                     strcmp(from_parent, "/") == 0 ? "" : "/", old_name);
+    int b = snprintf(to, sizeof(to), "%s%s%s", to_parent,
+                     strcmp(to_parent, "/") == 0 ? "" : "/", new_name);
+    if (a < 0 || b < 0 || a >= (int)sizeof(from) || b >= (int)sizeof(to))
+        return -ENAMETOOLONG;
+    int r = ext4_frename(from, to);
+    return r == EOK ? 0 : -r;
+}
+
 static int ext4_vfs_op_chmod(vfs_node_t *node, uint32_t mode) {
     if (!node) return -1;
 
@@ -739,6 +754,7 @@ void ext4_vfs_init(void) {
     g_ext4_node_ops.rmdir = ext4_vfs_op_rmdir;
     g_ext4_node_ops.symlink = ext4_vfs_op_symlink;
     g_ext4_node_ops.link = ext4_vfs_op_link;
+    g_ext4_node_ops.rename = ext4_vfs_op_rename;
     g_ext4_node_ops.readlink = ext4_vfs_op_readlink;
     g_ext4_node_ops.stat = ext4_vfs_op_stat;
     g_ext4_node_ops.chmod = ext4_vfs_op_chmod;

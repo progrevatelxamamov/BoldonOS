@@ -106,6 +106,7 @@
 #define SYS_GETPGID     121
 #define SYS_GETSID      124
 #define SYS_CAPGET      125
+#define SYS_CAPSET      126
 #define SYS_ARCH_PRCTL  158
 #define SYS_GETTID      186
 #define SYS_TKILL       200

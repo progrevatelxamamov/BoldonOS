@@ -28,6 +28,10 @@
 #define IN_ONESHOT      0x80000000U
 
 void inotify_vfs_event(vfs_node_t *node, uint32_t mask, const char *name);
+void inotify_vfs_unmount(vfs_mount_t *mount);
+void inotify_vfs_move(vfs_node_t *old_dir, const char *old_name,
+                      vfs_node_t *new_dir, const char *new_name,
+                      vfs_node_t *moved);
 uint64_t sys_inotify_init1_impl(uint64_t flags);
 uint64_t sys_inotify_add_watch_impl(uint64_t fd, uint64_t path, uint64_t mask);
 uint64_t sys_inotify_rm_watch_impl(uint64_t fd, uint64_t wd);

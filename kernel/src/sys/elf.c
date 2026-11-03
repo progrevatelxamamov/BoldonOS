@@ -2,6 +2,7 @@
 #include "kernel.h"
 #include <sys/elf.h>
 #include <fs/vfs.h>
+#include <sys/capability.h>
 #include <mm/vmm.h>
 #include <mm/pmm.h>
 #include <mm/malloc.h>
@@ -452,6 +453,15 @@ static int sys_execve_depth(const char *pathname, char *const argv[],
             p->egid = f->node->gid;
         }
     }
+
+    /* No file capability xattrs yet. Normal exec keeps only ambient caps;
+       the traditional root exec derives supported rights from the process
+       bounding set. SUID/SGID transitions clear ambient privileges. */
+    bool privileged_exec = f->node && (f->node->mode & (04000 | 02000));
+    if (privileged_exec) p->cap_ambient = 0;
+    p->cap_permitted = p->euid == 0 ?
+        (p->cap_bounding & BOLDON_CAP_SUPPORTED) : p->cap_ambient;
+    p->cap_effective = p->cap_permitted;
 
     p->pml4        = new_pml4;
     p->brk_start   = brk_start;

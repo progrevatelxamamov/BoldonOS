@@ -74,6 +74,8 @@ typedef struct {
     int (*rmdir)(struct vfs_node *dir, const char *name);
     int (*symlink)(struct vfs_node *dir, const char *name, const char *target);
     int (*link)(struct vfs_node *dir, struct vfs_node *old_node, const char *name);
+    int (*rename)(struct vfs_node *old_dir, const char *old_name,
+                  struct vfs_node *new_dir, const char *new_name);
     int (*readlink)(struct vfs_node *node, char *buf, uint64_t size);
     int (*stat)(struct vfs_node *node, vfs_stat_t *st);
     int (*chmod)(struct vfs_node *node, uint32_t mode);
@@ -159,6 +161,7 @@ int vfs_mkdir(const char *path, uint32_t mode);
 int vfs_unlink(const char *path);
 int vfs_rmdir(const char *path);
 int vfs_link(const char *oldpath, const char *newpath);
+int vfs_rename(const char *oldpath, const char *newpath);
 int vfs_fchmod(vfs_file_t *file, uint32_t mode);
 
 int vfs_copy_file(const char *src_path, const char *dst_path);

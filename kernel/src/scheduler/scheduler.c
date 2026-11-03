@@ -2,6 +2,7 @@
 #include "kernel.h"
 #include <scheduler/scheduler.h>
 #include <scheduler/spinlock.h>
+#include <sys/capability.h>
 #include <mm/vmm.h>
 #include <mm/malloc.h>
 #include <mm/pmm.h>
@@ -246,6 +247,9 @@ process_t* create_task_user(void *addr, page_table_t *pml4,
     proc->pml4              = pml4;
     proc->is_kernel_process = false;
     proc->state             = TASK_WAITING;
+    proc->cap_bounding = BOLDON_CAP_SUPPORTED;
+    proc->cap_permitted = BOLDON_CAP_SUPPORTED;
+    proc->cap_effective = BOLDON_CAP_SUPPORTED;
 
     uint64_t flags;
     spin_lock_irqsave(&sched_lock, &flags);
@@ -285,6 +289,25 @@ int scheduler_pid_status(uint64_t pid, uint32_t *euid) {
     }
     spin_unlock_irqrestore(&sched_lock, flags);
     return status;
+}
+
+int scheduler_cap_snapshot(uint64_t pid, uint64_t *effective,
+                           uint64_t *permitted, uint64_t *inheritable) {
+    int found = -1;
+    uint64_t flags;
+    spin_lock_irqsave(&sched_lock, &flags);
+    for (int i = 1; i < MAX_TASKS; i++) {
+        process_t *p = tasks[i];
+        if (!p || p->pid != pid || p->is_kernel_process ||
+            p->state == TASK_DEAD || p->state == TASK_ZOMBIE) continue;
+        *effective = p->cap_effective;
+        *permitted = p->cap_permitted;
+        *inheritable = p->cap_inheritable;
+        found = 0;
+        break;
+    }
+    spin_unlock_irqrestore(&sched_lock, flags);
+    return found;
 }
 
 bool scheduler_detach_zombie(int slot, process_t *proc) {

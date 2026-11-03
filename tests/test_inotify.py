@@ -35,6 +35,10 @@ code = r'''
 #define IN_CREATE 0x100U
 #define IN_DELETE 0x200U
 #define IN_DELETE_SELF 0x400U
+#define IN_MOVED_FROM 0x40U
+#define IN_MOVED_TO 0x80U
+#define IN_MOVE_SELF 0x800U
+#define IN_UNMOUNT 0x2000U
 #define IN_Q_OVERFLOW 0x4000U
 #define IN_IGNORED 0x8000U
 #define IN_ONLYDIR 0x01000000U
@@ -88,6 +92,7 @@ int main(void) {
     assert(sys_inotify_add_watch_impl(fd, (uintptr_t)"/tmp/f", IN_CREATE | IN_ONLYDIR) == (uint64_t)-ENOTDIR);
     assert(sys_inotify_add_watch_impl(fd, (uintptr_t)"/tmp/f", IN_MODIFY | IN_DONT_FOLLOW) > 0);
     assert(nofollow_calls == 1);
+    assert(sys_inotify_add_watch_impl(fd, (uintptr_t)"/tmp", IN_CREATE | IN_EXCL_UNLINK) > 0);
     int wd = (int)sys_inotify_add_watch_impl(fd, (uintptr_t)"/tmp", IN_CREATE | IN_DELETE);
     assert(wd > 0);
     assert(sys_inotify_add_watch_impl(fd, (uintptr_t)"/tmp", IN_MODIFY | IN_MASK_CREATE) == (uint64_t)-EEXIST);
@@ -117,6 +122,18 @@ int main(void) {
     assert(e->wd == file_wd && e->mask == IN_DELETE_SELF);
     assert(((struct in_event *)(buf + 16))->mask == IN_IGNORED);
     assert(sys_inotify_rm_watch_impl(fd, file_wd) == (uint64_t)-EINVAL);
+    int move_wd = (int)sys_inotify_add_watch_impl(fd, (uintptr_t)"/tmp",
+                                                    IN_MOVED_FROM | IN_MOVED_TO);
+    inotify_vfs_move(&dir, "old", &same_dir, "new", &file_node);
+    assert(f->node->file_ops->read(f, buf, sizeof(buf)) == 40);
+    struct in_event *from = (struct in_event *)buf;
+    struct in_event *to = (struct in_event *)(buf + 20);
+    assert(from->wd == move_wd && from->mask == IN_MOVED_FROM);
+    assert(to->wd == move_wd && to->mask == IN_MOVED_TO);
+    assert(from->cookie && from->cookie == to->cookie);
+    assert(strcmp(from->name, "old") == 0 && strcmp(to->name, "new") == 0);
+    assert(sys_inotify_rm_watch_impl(fd, move_wd) == 0);
+    assert(f->node->file_ops->read(f, buf, sizeof(buf)) == 16);
     int once = (int)sys_inotify_add_watch_impl(fd, (uintptr_t)"/tmp/f", IN_MODIFY | IN_ONESHOT);
     inotify_vfs_event(&file_node, IN_MODIFY, NULL);
     inotify_vfs_event(&file_node, IN_MODIFY, NULL);
@@ -125,6 +142,11 @@ int main(void) {
     assert(((struct in_event *)(buf + 16))->mask == IN_IGNORED);
     inotify_vfs_event(&dir, IN_CREATE, "f");
     assert(f->node->file_ops->read(f, buf, 16) == -EAGAIN);
+    int unmount_wd = (int)sys_inotify_add_watch_impl(fd, (uintptr_t)"/tmp", IN_MODIFY);
+    inotify_vfs_unmount(&mount);
+    assert(f->node->file_ops->read(f, buf, sizeof(buf)) == 32);
+    assert(e->wd == unmount_wd && e->mask == IN_UNMOUNT);
+    assert(((struct in_event *)(buf + 16))->mask == IN_IGNORED);
     f->node->file_ops->close(f); free(f); table.fds[fd] = NULL;
     assert(instances == NULL);
     puts("inotify: watch, events, poll/read, short buffer, remove and close passed");
