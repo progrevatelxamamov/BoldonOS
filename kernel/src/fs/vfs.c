@@ -324,7 +324,8 @@ char* normalize_path(const char *path) {
     return norm;
 }
 
-vfs_node_t *vfs_resolve_path_ext(const char *path, bool parent_only, char *last_component) {
+static vfs_node_t *vfs_resolve_path_options(const char *path, bool parent_only,
+                                            char *last_component, bool nofollow_last) {
     if (!path) return NULL;
     char *norm = normalize_path(path);
     if (!norm) return NULL;
@@ -375,7 +376,7 @@ vfs_node_t *vfs_resolve_path_ext(const char *path, bool parent_only, char *last_
 
         vfs_node_t *next = current->ops->lookup(current, token);
         if (!next) { current = NULL; break; }
-        if (next->type == VFS_TYPE_SYMLINK) {
+        if (next->type == VFS_TYPE_SYMLINK && !(nofollow_last && !*p)) {
             if (++symlink_count > MAX_SYMLINK_DEPTH || !next->ops || !next->ops->readlink) {
                 current = NULL;
                 break;
@@ -435,8 +436,16 @@ vfs_node_t *vfs_resolve_path_ext(const char *path, bool parent_only, char *last_
     return current;
 }
 
+vfs_node_t *vfs_resolve_path_ext(const char *path, bool parent_only, char *last_component) {
+    return vfs_resolve_path_options(path, parent_only, last_component, false);
+}
+
 vfs_node_t *vfs_resolve_path(const char *path) {
-    return vfs_resolve_path_ext(path, false, NULL);
+    return vfs_resolve_path_options(path, false, NULL, false);
+}
+
+vfs_node_t *vfs_resolve_path_nofollow(const char *path) {
+    return vfs_resolve_path_options(path, false, NULL, true);
 }
 
 vfs_node_t *vfs_resolve_path_ext_r(const char *path, bool parent_only, char *last_component, int depth) {

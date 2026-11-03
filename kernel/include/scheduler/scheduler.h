@@ -141,6 +141,11 @@ void task_wake_thread(thread_t *t);
 process_t *get_current_process(void);
 thread_t  *get_current_thread(void);
 bool tasks_insert(process_t *proc);
+/* Snapshot a PID without exporting a process pointer that can be reaped.
+   Returns -1 if absent, 0 if running, 1 if exited/zombie. */
+int scheduler_pid_status(uint64_t pid, uint32_t *euid);
+/* Detach a reaped zombie before freeing it; protects pidfd poll snapshots. */
+bool scheduler_detach_zombie(int slot, process_t *proc);
 /* Queue SIGINT for the controlling PTY's foreground processes. If job
    control did not set a foreground pgid, restrict delivery to shell children. */
 int scheduler_tty_sigint(void *tty, uint64_t foreground_pgid);

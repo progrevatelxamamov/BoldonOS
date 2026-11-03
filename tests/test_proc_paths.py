@@ -6,7 +6,7 @@ import tempfile
 root = Path(__file__).resolve().parents[1]
 vfs = (root / 'kernel/src/fs/vfs.c').read_text()
 start = vfs.index('static void normalize_path_raw(', vfs.index('static bool letter_is_root(char c) {'))
-end = vfs.index('vfs_node_t *vfs_resolve_path_ext(', start)
+end = vfs.index('static vfs_node_t *vfs_resolve_path_options(', start)
 normalization = vfs[start:end]
 devfs = (root / 'kernel/src/fs/devfs.c').read_text()
 start = devfs.index('static const char* clean_name(')

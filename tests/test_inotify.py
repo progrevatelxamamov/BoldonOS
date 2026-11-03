@@ -67,6 +67,8 @@ static vfs_node_t same_dir = { .type=VFS_TYPE_DIR, .inode_num=42, .mount=&mount 
 static vfs_node_t file_node = { .inode_num=43, .mount=&mount };
 static process_t *get_current_process(void) { return &proc; }
 static vfs_node_t *vfs_resolve_path(const char *p) { return strcmp(p, "/tmp") == 0 ? &dir : strcmp(p, "/tmp/f") == 0 ? &file_node : NULL; }
+static int nofollow_calls;
+static vfs_node_t *vfs_resolve_path_nofollow(const char *p) { nofollow_calls++; return vfs_resolve_path(p); }
 static void *malloc_alloc(uint64_t n) { return malloc(n); }
 static void malloc_free(void *p) { free(p); }
 static void schedule_yield(void) { abort(); }
@@ -84,6 +86,8 @@ int main(void) {
     assert(sys_inotify_init1_impl(1) == (uint64_t)-EINVAL);
     assert(sys_inotify_add_watch_impl(fd, (uintptr_t)"/missing", IN_CREATE) == (uint64_t)-ENOENT);
     assert(sys_inotify_add_watch_impl(fd, (uintptr_t)"/tmp/f", IN_CREATE | IN_ONLYDIR) == (uint64_t)-ENOTDIR);
+    assert(sys_inotify_add_watch_impl(fd, (uintptr_t)"/tmp/f", IN_MODIFY | IN_DONT_FOLLOW) > 0);
+    assert(nofollow_calls == 1);
     int wd = (int)sys_inotify_add_watch_impl(fd, (uintptr_t)"/tmp", IN_CREATE | IN_DELETE);
     assert(wd > 0);
     assert(sys_inotify_add_watch_impl(fd, (uintptr_t)"/tmp", IN_MODIFY | IN_MASK_CREATE) == (uint64_t)-EEXIST);
@@ -113,6 +117,12 @@ int main(void) {
     assert(e->wd == file_wd && e->mask == IN_DELETE_SELF);
     assert(((struct in_event *)(buf + 16))->mask == IN_IGNORED);
     assert(sys_inotify_rm_watch_impl(fd, file_wd) == (uint64_t)-EINVAL);
+    int once = (int)sys_inotify_add_watch_impl(fd, (uintptr_t)"/tmp/f", IN_MODIFY | IN_ONESHOT);
+    inotify_vfs_event(&file_node, IN_MODIFY, NULL);
+    inotify_vfs_event(&file_node, IN_MODIFY, NULL);
+    assert(f->node->file_ops->read(f, buf, sizeof(buf)) == 32);
+    assert(e->wd == once && e->mask == IN_MODIFY);
+    assert(((struct in_event *)(buf + 16))->mask == IN_IGNORED);
     inotify_vfs_event(&dir, IN_CREATE, "f");
     assert(f->node->file_ops->read(f, buf, 16) == -EAGAIN);
     f->node->file_ops->close(f); free(f); table.fds[fd] = NULL;

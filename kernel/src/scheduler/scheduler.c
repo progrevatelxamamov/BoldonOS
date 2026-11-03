@@ -271,6 +271,32 @@ void scheduler_update_pml4(page_table_t *new_pml4) {
     spin_unlock_irqrestore(&sched_lock, flags);
 }
 
+int scheduler_pid_status(uint64_t pid, uint32_t *euid) {
+    if (!pid) return -1;
+    int status = -1;
+    uint64_t flags;
+    spin_lock_irqsave(&sched_lock, &flags);
+    for (int i = 1; i < MAX_TASKS; i++) {
+        process_t *p = tasks[i];
+        if (!p || p->pid != pid || p->is_kernel_process) continue;
+        if (euid) *euid = p->euid;
+        status = (p->state == TASK_DEAD || p->state == TASK_ZOMBIE) ? 1 : 0;
+        break;
+    }
+    spin_unlock_irqrestore(&sched_lock, flags);
+    return status;
+}
+
+bool scheduler_detach_zombie(int slot, process_t *proc) {
+    if (slot <= 0 || slot >= MAX_TASKS || !proc) return false;
+    uint64_t flags;
+    spin_lock_irqsave(&sched_lock, &flags);
+    bool detached = tasks[slot] == proc && proc->state == TASK_ZOMBIE;
+    if (detached) tasks[slot] = NULL;
+    spin_unlock_irqrestore(&sched_lock, flags);
+    return detached;
+}
+
 process_t *find_process_name(const char *name) {
     if (!name) return NULL;
     for (uint64_t i = 0; i < MAX_TASKS; i++) {

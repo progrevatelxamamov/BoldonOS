@@ -25,6 +25,7 @@ typedef struct {
     uint64_t inode;
     vfs_node_t *identity; /* fallback for synthetic nodes without inode numbers */
     uint32_t mask;
+    uint32_t options;
 } in_watch_t;
 
 typedef struct in_instance {
@@ -68,8 +69,9 @@ void inotify_vfs_event(vfs_node_t *node, uint32_t mask, const char *name) {
         for (int i = 0; i < IN_WATCH_LIMIT; i++) {
             in_watch_t *w = &in->watch[i];
             if (!w->active || !same_node(w, node)) continue;
-            if (w->mask & mask) enqueue(in, w->wd, mask, name);
-            if (mask & IN_DELETE_SELF) {
+            bool matched = (w->mask & mask) != 0;
+            if (matched) enqueue(in, w->wd, mask, name);
+            if ((mask & IN_DELETE_SELF) || (matched && (w->options & IN_ONESHOT))) {
                 enqueue(in, w->wd, IN_IGNORED, NULL);
                 w->active = false;
             }
@@ -212,9 +214,11 @@ uint64_t sys_inotify_add_watch_impl(uint64_t fd, uint64_t path, uint64_t mask_ar
     if (i == sizeof(name) - 1) return (uint64_t)-ENAMETOOLONG;
     uint32_t mask = (uint32_t)mask_arg;
     if ((mask_arg >> 32) || !(mask & IN_ALL_EVENTS)) return (uint64_t)-EINVAL;
-    /* These options cannot be honoured by the current VFS resolver. */
-    if (mask & (IN_DONT_FOLLOW | IN_EXCL_UNLINK | IN_ONESHOT)) return (uint64_t)-ENOSYS;
-    vfs_node_t *node = vfs_resolve_path(name);
+    /* Tracking events on unlinked children of a watched directory requires
+       more than the VFS parent-notification hooks currently provide. */
+    if (mask & IN_EXCL_UNLINK) return (uint64_t)-ENOSYS;
+    vfs_node_t *node = (mask & IN_DONT_FOLLOW) ? vfs_resolve_path_nofollow(name)
+                                                 : vfs_resolve_path(name);
     if (!node) return (uint64_t)-ENOENT;
     if ((mask & IN_ONLYDIR) && node->type != VFS_TYPE_DIR) return (uint64_t)-ENOTDIR;
     uint64_t irq;
@@ -229,6 +233,7 @@ uint64_t sys_inotify_add_watch_impl(uint64_t fd, uint64_t path, uint64_t mask_ar
             return (uint64_t)-EEXIST;
         }
         w->mask = (mask & IN_MASK_ADD) ? (w->mask | (mask & IN_ALL_EVENTS)) : (mask & IN_ALL_EVENTS);
+        w->options = mask & IN_ONESHOT;
         int wd = w->wd;
         spin_unlock_irqrestore(&in_lock, irq);
         return (uint64_t)wd;
@@ -239,7 +244,8 @@ uint64_t sys_inotify_add_watch_impl(uint64_t fd, uint64_t path, uint64_t mask_ar
     }
     *free_slot = (in_watch_t) { .active = true, .wd = ++in->next_wd,
         .mount = node->mount, .inode = node->inode_num,
-        .identity = node, .mask = mask & IN_ALL_EVENTS };
+        .identity = node, .mask = mask & IN_ALL_EVENTS,
+        .options = mask & IN_ONESHOT };
     int wd = free_slot->wd;
     spin_unlock_irqrestore(&in_lock, irq);
     return (uint64_t)wd;

@@ -293,6 +293,43 @@ static inline bool user_range_ok(uint64_t ptr, uint64_t len) {
     return end <= 0x00007FFFFFFFFFFFULL;
 }
 
+
+/* capget(125) reports only privileges that BoldonOS actually confers on
+   UID 0. capset and the rest of Linux's capability model are unsupported. */
+struct linux_cap_header { uint32_t version; int32_t pid; };
+struct linux_cap_data { uint32_t effective, permitted, inheritable; };
+
+uint64_t sys_capget_impl(uint64_t header_ptr, uint64_t data_ptr) {
+    if (!user_range_ok(header_ptr, sizeof(struct linux_cap_header)))
+        return (uint64_t)-EFAULT;
+    struct linux_cap_header *header = (struct linux_cap_header *)header_ptr;
+    uint32_t version = header->version;
+    if (version != 0x19980330U && version != 0x20071026U &&
+        version != 0x20080522U) {
+        header->version = 0x20080522U;
+        return (uint64_t)-EINVAL;
+    }
+    if (header->pid < 0) return (uint64_t)-EINVAL;
+    uint32_t euid;
+    if (header->pid == 0) {
+        process_t *self = get_current_process();
+        if (!self) return (uint64_t)-ESRCH;
+        euid = self->euid;
+    } else if (scheduler_pid_status((uint32_t)header->pid, &euid) != 0)
+        return (uint64_t)-ESRCH;
+    if (!data_ptr) return 0; /* Linux version query without data */
+    int words = version == 0x19980330U ? 1 : 2;
+    if (!user_range_ok(data_ptr, words * sizeof(struct linux_cap_data)))
+        return (uint64_t)-EFAULT;
+    struct linux_cap_data *data = (struct linux_cap_data *)data_ptr;
+    /* CAP_DAC_OVERRIDE, CAP_SETGID, CAP_SETUID are enforced by
+       vfs_check_access and sys_set{uid,gid}. */
+    uint32_t rights = euid == 0 ? ((1U << 1) | (1U << 6) | (1U << 7)) : 0;
+    data[0] = (struct linux_cap_data){ .effective = rights, .permitted = rights };
+    if (words == 2) data[1] = (struct linux_cap_data){0};
+    return 0;
+}
+
 #define IA32_FS_BASE 0xC0000100
 
 uint64_t sys_arch_prctl_impl(uint64_t code, uint64_t addr) {
@@ -676,6 +713,7 @@ uint64_t sys_wait4_impl(uint64_t pid, uint64_t wstatus, uint64_t options, uint64
         }
 
         if (zombie_child) {
+            if (!scheduler_detach_zombie(zombie_slot, zombie_child)) continue;
             uint64_t child_pid = zombie_child->pid;
             
             if (wstatus && user_range_ok(wstatus, 4)) {
@@ -684,10 +722,6 @@ uint64_t sys_wait4_impl(uint64_t pid, uint64_t wstatus, uint64_t options, uint64
                     : (uint32_t)((zombie_child->exit_code & 0xFF) << 8);
             }
 
-            if (zombie_slot >= 0) {
-                tasks[zombie_slot] = NULL;
-            }
-            
             task_free(zombie_child);
             return child_pid;
         }

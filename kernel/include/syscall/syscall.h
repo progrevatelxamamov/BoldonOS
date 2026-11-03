@@ -105,6 +105,7 @@
 #define SYS_SETSID      112
 #define SYS_GETPGID     121
 #define SYS_GETSID      124
+#define SYS_CAPGET      125
 #define SYS_ARCH_PRCTL  158
 #define SYS_GETTID      186
 #define SYS_TKILL       200
@@ -151,6 +152,7 @@
 #define SYS_UMOUNT2     166
 /* Linux's new mount API; legacy mount(2) remains the supported path. */
 #define SYS_FSOPEN      430
+#define SYS_PIDFD_OPEN  434
 
 void syscall_init(void);
 uint64_t syscall_handler(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6);

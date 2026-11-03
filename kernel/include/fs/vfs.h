@@ -142,6 +142,7 @@ void vfs_set_boot_drive(char drive_letter);
 
 char *normalize_path(const char *path);
 vfs_node_t *vfs_resolve_path(const char *path);
+vfs_node_t *vfs_resolve_path_nofollow(const char *path);
 vfs_node_t *vfs_resolve_path_ext(const char *path, bool parent_only, char *last_component);
 
 vfs_file_t *vfs_open(const char *path, uint32_t flags);

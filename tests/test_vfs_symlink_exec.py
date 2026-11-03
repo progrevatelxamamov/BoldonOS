@@ -5,8 +5,8 @@ import tempfile
 
 root = Path(__file__).resolve().parents[1]
 vfs = (root / 'kernel/src/fs/vfs.c').read_text()
-resolver = vfs[vfs.index('vfs_node_t *vfs_resolve_path_ext(const char *path, bool parent_only, char *last_component) {'):
-               vfs.index('int vfs_check_access(', vfs.index('vfs_node_t *vfs_resolve_path_ext('))]
+resolver = vfs[vfs.index('static vfs_node_t *vfs_resolve_path_options('):
+               vfs.index('int vfs_check_access(', vfs.index('static vfs_node_t *vfs_resolve_path_options('))]
 code = r'''
 #include <assert.h>
 #include <stdbool.h>
@@ -72,7 +72,7 @@ int main(void) {
     add("C:/bin", VFS_TYPE_SYMLINK, "usr/bin");
     add("C:/usr", VFS_TYPE_DIR, NULL);
     add("C:/usr/bin", VFS_TYPE_DIR, NULL);
-    add("C:/usr/bin/sh", VFS_TYPE_SYMLINK, "bash");
+    vfs_node_t *shlink = add("C:/usr/bin/sh", VFS_TYPE_SYMLINK, "bash");
     vfs_node_t *bash = add("C:/usr/bin/bash", VFS_TYPE_FILE, NULL);
     add("C:/lib64", VFS_TYPE_SYMLINK, "usr/lib");
     add("C:/usr/lib", VFS_TYPE_DIR, NULL);
@@ -85,6 +85,8 @@ int main(void) {
     vfs_node_t *devnull = add("D:/null", VFS_TYPE_FILE, NULL);
     add("C:/devlink", VFS_TYPE_SYMLINK, "/dev/null");
     assert(vfs_resolve_path("/bin/sh") == bash);
+    assert(vfs_resolve_path_nofollow("/bin/sh") == shlink);
+    assert(vfs_resolve_path_nofollow("/usr/bin/bash") == bash);
     assert(vfs_resolve_path("C:/bin/sh") == bash);
     assert(vfs_resolve_path("/etc/shell") == bash);
     assert(vfs_resolve_path("/bin/../../lib64/ld-linux-x86-64.so.2") == ld);

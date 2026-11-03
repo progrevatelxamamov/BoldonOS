@@ -60,6 +60,8 @@ extern uint64_t sys_newfstatat_impl(uint64_t, uint64_t, uint64_t, uint64_t);
 extern uint64_t sys_statx_impl(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
 extern uint64_t sys_poll_impl(uint64_t, uint64_t, uint64_t);
 extern uint64_t sys_close_range_impl(uint64_t, uint64_t, uint64_t);
+extern uint64_t sys_capget_impl(uint64_t, uint64_t);
+extern uint64_t sys_pidfd_open_impl(uint64_t, uint64_t);
 extern uint64_t sys_inotify_init1_impl(uint64_t);
 extern uint64_t sys_inotify_add_watch_impl(uint64_t, uint64_t, uint64_t);
 extern uint64_t sys_inotify_rm_watch_impl(uint64_t, uint64_t);
@@ -238,6 +240,8 @@ uint64_t osdev_syscall_handler(uint64_t num,
                                 (int32_t)a3 < 0 ? UINT64_MAX : (uint32_t)a3);
     case SYS_PPOLL:       return sys_ppoll_impl(a1, a2, a3, a4, a5);
     case SYS_CLOSE_RANGE: return sys_close_range_impl(a1, a2, a3);
+    case SYS_PIDFD_OPEN: return sys_pidfd_open_impl(a1, a2);
+    case SYS_CAPGET: return sys_capget_impl(a1, a2);
     case SYS_INOTIFY_INIT: return sys_inotify_init1_impl(0);
     case SYS_INOTIFY_INIT1: return sys_inotify_init1_impl(a1);
     case SYS_INOTIFY_ADD_WATCH: return sys_inotify_add_watch_impl(a1, a2, a3);
