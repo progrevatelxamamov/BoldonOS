@@ -534,6 +534,21 @@ uint64_t sys_close_impl(uint64_t a1) {
     return (uint64_t)(int64_t)sys_close(p->fd_table, (int)a1);
 }
 
+uint64_t sys_close_range_impl(uint64_t first_arg, uint64_t last_arg, uint64_t flags) {
+    uint32_t first = (uint32_t)first_arg, last = (uint32_t)last_arg;
+    if (first > last) return (uint64_t)-EINVAL;
+    /* CLOSE_RANGE_UNSHARE and CLOEXEC require per-descriptor state; do not
+       silently advertise those semantics with a process-wide file flag. */
+    if (flags != 0) return (uint64_t)-ENOSYS;
+    process_t *p = get_current_process();
+    if (!p || !p->fd_table) return (uint64_t)-EBADF;
+    if (first >= VFS_MAX_FD) return 0;
+    if (last >= VFS_MAX_FD) last = VFS_MAX_FD - 1;
+    for (uint32_t fd = first; fd <= last; fd++)
+        if (p->fd_table->fds[fd]) sys_close(p->fd_table, (int)fd);
+    return 0;
+}
+
 uint64_t sys_mmap_impl(uint64_t addr, uint64_t len, uint64_t prot,
                        uint64_t flags, uint64_t fd, uint64_t offset) {
     process_t *p = get_current_process();

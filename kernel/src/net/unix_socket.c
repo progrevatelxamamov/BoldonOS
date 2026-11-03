@@ -153,27 +153,35 @@ static int un_connect(socket_t *sock, const struct sockaddr *addr, socklen_t add
 }
 
 static int un_send(socket_t *sock, const void *buf, size_t len, int flags) {
-    (void)flags;
     unix_intern_t *u = (unix_intern_t *)sock->private_data;
     if (!u) return -EINVAL;
     if (u->peer_closed) return -EPIPE;
     unix_intern_t *target = u->peer ? u->peer : u;
     const uint8_t *b = (const uint8_t *)buf;
 
-    uint32_t head = target->rx_head;
-    for (size_t i = 0; i < len; i++) {
+    size_t written = 0;
+    while (written < len) {
+        uint32_t head = target->rx_head;
         uint32_t next = (head + 1) % 8192;
-        while (next == target->rx_tail) schedule_yield();
-        target->rx_buffer[head] = b[i];
-        head = next;
+        if (next == target->rx_tail) {
+            if (flags & 0x4000 /* MSG_DONTWAIT */)
+                return written ? (int)written : -EAGAIN;
+            schedule_yield();
+            if (u->peer_closed) return written ? (int)written : -EPIPE;
+            continue;
+        }
+        target->rx_buffer[head] = b[written++];
+        /* Publish each byte: a reader must see progress before a full
+           buffer forces us to yield, including writes larger than 8191. */
+        target->rx_head = next;
     }
-    target->rx_head = head;
-    return (int)len;
+    return (int)written;
 }
 
 static int un_recv(socket_t *sock, void *buf, size_t len, int flags) {
     unix_intern_t *u = (unix_intern_t *)sock->private_data;
     if (!u) return -EINVAL;
+    if (len == 0) return 0;
 
     while (u->rx_head == u->rx_tail) {
         if (u->peer_closed) return 0;
@@ -221,7 +229,11 @@ static short un_poll(socket_t *sock, short events) {
     if ((events & 1) && (u->rx_head != u->rx_tail || u->peer_closed || (u->listening && u->accept_head != u->accept_tail))) {
         revents |= 1;
     }
-    if (events & 4) revents |= 4; // POLLOUT
+    unix_intern_t *target = u->peer ? u->peer : u;
+    if ((events & 4) && !u->peer_closed &&
+        ((target->rx_head + 1) % 8192) != target->rx_tail)
+        revents |= 4; // POLLOUT only when space is available
+    if (u->peer_closed) revents |= 0x10; // POLLHUP
     return revents;
 }
 
@@ -297,6 +309,26 @@ static socket_ops_t unix_ops = {
     .poll        = un_poll,
     .close       = un_close
 };
+
+int unix_socketpair_create(int type, socket_t **left, socket_t **right) {
+    if (!left || !right) return -EINVAL;
+    *left = *right = NULL;
+    socket_t *a = unix_socket_create(type, 0);
+    if (!a) return -ENOMEM;
+    socket_t *b = unix_socket_create(type, 0);
+    if (!b) {
+        a->ops->close(a);
+        malloc_free(a);
+        return -ENOMEM;
+    }
+    unix_intern_t *ua = (unix_intern_t *)a->private_data;
+    unix_intern_t *ub = (unix_intern_t *)b->private_data;
+    ua->peer = ub;
+    ub->peer = ua;
+    *left = a;
+    *right = b;
+    return 0;
+}
 
 socket_t* unix_socket_create(int type, int protocol) {
     for (int i = 0; i < MAX_UNIX; i++) {

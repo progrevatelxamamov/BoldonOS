@@ -49,6 +49,8 @@ socket_t *get_socket_from_fd(int sockfd);
 int sys_getpeername(int sockfd, struct sockaddr *addr, socklen_t *addrlen);
 
 socket_t* unix_socket_create(int type, int protocol);
+int unix_socketpair_create(int type, socket_t **left, socket_t **right);
+int sys_socketpair(int domain, int type, int protocol, int fds[2]);
 socket_t* inet_socket_create(int type, int protocol);
 
 #endif

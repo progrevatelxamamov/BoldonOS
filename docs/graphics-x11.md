@@ -92,6 +92,18 @@ Linux. UNIX `getpeername` возвращает адрес соединённой
 размера буфера. Следующие ошибки запуска следует диагностировать отдельно;
 этот ABI-этап не реализует дисплейный драйвер, seat или Wayland-композитор.
 
+При запуске `startplasma-wayland` через `plasma-dbus-run-session-if-needed`
+следующий наблюдаемый блокер — `dbus-daemon: Unable to create reload pipe:
+Could not create full-duplex pipe`: вызов 53 — `socketpair`, **не** `pipe2`.
+Для `AF_UNIX/SOCK_STREAM` добавлена настоящая пара соединённых сокетов с
+двусторонним чтением/записью, обратным давлением, EOF после закрытия второй
+стороны и поддержкой флагов NONBLOCK/CLOEXEC. `close_range` (436) закрывает
+существующие FD для `flags=0`; режимы UNSHARE/CLOEXEC не выдаются за
+реализованные. `inotify_init1` (294), старый `inotify_init` (253),
+`pidfd_open` (434) и `capget` (125) пока остаются неподдерживаемыми —
+подставлять фиктивный успех для них опасно. Предупреждение Qt об ANSI locale
+отдельно от сбоев D-Bus; `LANG=C.UTF-8` убирает его, но не создаёт DRM/KMS.
+
 ### Если Xorg ждёт без журнала
 
 `/dev/xorgtrace` — ограниченный снимок (последние 64 события) этапов
