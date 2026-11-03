@@ -6,7 +6,7 @@ import tempfile
 root = Path(__file__).resolve().parents[1]
 source = (root / 'kernel/src/syscall/sys_file.c').read_text()
 pipe = source[source.index('static int pipe_read('):source.index('uint64_t sys_pipe2_impl(', source.index('static int pipe_read('))]
-splice = source[source.index('uint64_t sys_splice_impl('):source.index('uint64_t sys_mkdirat_impl(', source.index('uint64_t sys_splice_impl('))]
+splice = source[source.index('uint64_t sys_splice_impl('):source.index('static int mutation_parent_access(', source.index('uint64_t sys_splice_impl('))]
 assert 'case SYS_SPLICE: return sys_splice_impl(a1, a2, a3, a4, a5, a6);' in (root / 'kernel/src/syscall/syscall.c').read_text()
 code = r'''
 #include <assert.h>

@@ -113,7 +113,10 @@ Could not create full-duplex pipe`: вызов 53 — `socketpair`, **не** `pi
 при завершении или сборке процесса (без `pidfd_send_signal`/`waitid(P_PIDFD)`).
 `capget` (125) и `capset` (126) поддерживают версии Linux v1/v2/v3 и
 учитывают ограниченный набор **реально представленных** прав:
-DAC_OVERRIDE, SETUID, SETGID, SETPCAP. Наборы permitted/effective/inheritable,
+DAC_OVERRIDE, FOWNER, KILL, SETUID, SETGID, SETPCAP, SYS_ADMIN, SYS_BOOT.
+Для пользовательских mkdir/unlink/link/rename проверяются права родительского
+каталога; chmod требует владельца или FOWNER, mount/umount — SYS_ADMIN,
+reboot — SYS_BOOT, чужой SIGINT — KILL. Наборы permitted/effective/inheritable,
 bounding и ambient хранятся в процессе и наследуются при fork;
 `PR_CAPBSET_READ/DROP` управляют bounding set. При exec без file capabilities
 root получает ограничение bounding, обычный процесс — ambient. **Это ещё не

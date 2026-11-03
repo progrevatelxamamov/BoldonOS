@@ -90,6 +90,8 @@ int main(void) {
     assert(sys_inotify_init1_impl(1) == (uint64_t)-EINVAL);
     assert(sys_inotify_add_watch_impl(fd, (uintptr_t)"/missing", IN_CREATE) == (uint64_t)-ENOENT);
     assert(sys_inotify_add_watch_impl(fd, (uintptr_t)"/tmp/f", IN_CREATE | IN_ONLYDIR) == (uint64_t)-ENOTDIR);
+    assert(sys_inotify_add_watch_impl(fd, (uintptr_t)"/tmp", IN_MODIFY | IN_MASK_ADD | IN_MASK_CREATE) == (uint64_t)-EINVAL);
+    assert(sys_inotify_add_watch_impl(fd, (uintptr_t)"/tmp", IN_ISDIR | IN_MODIFY) == (uint64_t)-EINVAL);
     assert(sys_inotify_add_watch_impl(fd, (uintptr_t)"/tmp/f", IN_MODIFY | IN_DONT_FOLLOW) > 0);
     assert(nofollow_calls == 1);
     assert(sys_inotify_add_watch_impl(fd, (uintptr_t)"/tmp", IN_CREATE | IN_EXCL_UNLINK) > 0);

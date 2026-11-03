@@ -13,7 +13,7 @@ code = r'''
 #include <errno.h>
 #include <assert.h>
 #define BOLDON_CAP_SETPCAP (1ULL<<8)
-#define BOLDON_CAP_SUPPORTED ((1ULL<<1)|(1ULL<<6)|(1ULL<<7)|(1ULL<<8))
+#define BOLDON_CAP_SUPPORTED ((1ULL<<1)|(1ULL<<3)|(1ULL<<5)|(1ULL<<6)|(1ULL<<7)|(1ULL<<8)|(1ULL<<21)|(1ULL<<22))
 typedef struct { char *name; bool no_new_privs; uint64_t cap_effective, cap_permitted,
                  cap_inheritable, cap_ambient, cap_bounding; } process_t;
 static process_t p = { .cap_effective=BOLDON_CAP_SUPPORTED,

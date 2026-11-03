@@ -144,7 +144,7 @@ uint64_t sys_kill_impl(uint64_t pid, uint64_t sig) {
     process_t *p = get_current_process();
     if (!p) return (uint64_t)-ESRCH;
     if (sig == 2) {
-        int sent = 0;
+        int sent = 0, denied = 0;
         int64_t target = (int64_t)pid;
         if (target == -1) return (uint64_t)-ENOSYS; /* broadcast is not implemented */
         for (int i = 1; i < 512; i++) {
@@ -154,12 +154,26 @@ uint64_t sys_kill_impl(uint64_t pid, uint64_t sig) {
             if ((target > 0 && q->pid != pid) ||
                 (target == 0 && q->pgid != p->pgid) ||
                 (target < -1 && q->pgid != (uint64_t)-target)) continue;
+            if (p->euid != q->uid && p->euid != q->euid &&
+                !(p->cap_effective & BOLDON_CAP_KILL)) { denied++; continue; }
             __atomic_fetch_or(&q->sigpending, 1ULL << (2 - 1), __ATOMIC_RELAXED);
             sent++;
         }
-        return sent ? 0 : (uint64_t)-ESRCH;
+        return sent ? 0 : (uint64_t)(denied ? -EPERM : -ESRCH);
     }
-    if (sig == 0) return 0;
+    if (sig == 0) {
+        bool found = false;
+        for (int i = 1; i < 512; i++) {
+            process_t *q = tasks[i];
+            if (!q || q->state == TASK_DEAD || q->state == TASK_ZOMBIE ||
+                q->is_kernel_process ||
+                (pid == 0 ? q->pgid != p->pgid : q->pid != pid)) continue;
+            found = true;
+            if (p->euid == q->uid || p->euid == q->euid ||
+                (p->cap_effective & BOLDON_CAP_KILL)) return 0;
+        }
+        return (uint64_t)(found ? -EPERM : -ESRCH);
+    }
 
     if (pid == p->pid || pid == 0) {
         if (sig == 9 || sig == 15) {

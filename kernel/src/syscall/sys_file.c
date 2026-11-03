@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <fs/vfs.h>
+#include <sys/capability.h>
 #include <fs/mount.h>
 #include <disk/block.h>
 #include <disk/bcache.h>
@@ -1031,14 +1032,36 @@ uint64_t sys_splice_impl(uint64_t fd_in, uint64_t off_in, uint64_t fd_out,
     return done ? done : (uint64_t)error;
 }
 
-uint64_t sys_mkdirat_impl(uint64_t dirfd, uint64_t path_ptr, uint64_t mode) {
-    (void)dirfd;
+/* Apply the same filesystem credentials to mutations as sys_open uses.
+   Direct in-kernel VFS operations are deliberately outside this user check. */
+static int mutation_parent_access(const char *path) {
+    process_t *p = get_current_process();
+    if (!p || !p->fd_table) return -EBADF;
+    char name[256] = {0};
+    vfs_node_t *parent = vfs_resolve_path_ext(path, true, name);
+    if (!parent) return -ENOENT;
+    if (parent->type != VFS_TYPE_DIR) return -ENOTDIR;
+    return vfs_check_access(parent, p->fsuid, p->fsgid,
+                            VFS_PERM_WRITE | VFS_PERM_EXEC) ? -EACCES : 0;
+}
 
+static int mutation_owner_access(vfs_node_t *node) {
+    process_t *p = get_current_process();
+    if (!node) return -ENOENT;
+    if (!p) return -EBADF;
+    return p->fsuid == node->uid ||
+           (p->cap_effective & BOLDON_CAP_FOWNER) ? 0 : -EPERM;
+}
+
+uint64_t sys_mkdirat_impl(uint64_t dirfd, uint64_t path_ptr, uint64_t mode) {
     char kpath[256];
     if (copy_str_from_user(kpath, path_ptr, sizeof(kpath)) != 0) {
         return (uint64_t)-EFAULT;
     }
 
+    if ((int64_t)dirfd != -100 && kpath[0] != '/') return (uint64_t)-ENOSYS;
+    int access = mutation_parent_access(kpath);
+    if (access) return (uint64_t)(int64_t)access;
     int res = vfs_mkdir(kpath, (uint32_t)mode);
     if (res < 0) {
         return (uint64_t)res;
@@ -1060,17 +1083,22 @@ uint64_t sys_renameat_impl(uint64_t oldfd, uint64_t old_ptr,
     if (((int64_t)oldfd != -100 && oldpath[0] != '/') ||
         ((int64_t)newfd != -100 && newpath[0] != '/'))
         return (uint64_t)-ENOSYS;
+    int access = mutation_parent_access(oldpath);
+    if (!access) access = mutation_parent_access(newpath);
+    if (access) return (uint64_t)(int64_t)access;
     return (uint64_t)(int64_t)vfs_rename(oldpath, newpath);
 }
 
 uint64_t sys_unlinkat_impl(uint64_t dirfd, uint64_t path_ptr, uint64_t flags) {
-    (void)dirfd;
-
     char kpath[256];
     if (copy_str_from_user(kpath, path_ptr, sizeof(kpath)) != 0) {
         return (uint64_t)-EFAULT;
     }
 
+    if ((int64_t)dirfd != -100 && kpath[0] != '/') return (uint64_t)-ENOSYS;
+    if (flags & ~0x200ULL) return (uint64_t)-EINVAL;
+    int access = mutation_parent_access(kpath);
+    if (access) return (uint64_t)(int64_t)access;
     int res;
     if (flags & 0x200 /* AT_REMOVEDIR */) {
         res = vfs_rmdir(kpath);
@@ -1091,13 +1119,15 @@ uint64_t sys_rmdir_impl(uint64_t path_ptr) {
 }
 
 uint64_t sys_fchmodat_impl(uint64_t dirfd, uint64_t path_ptr, uint64_t mode, uint64_t flags) {
-    (void)dirfd; (void)flags;
-    
     char kpath[256];
     if (copy_str_from_user(kpath, path_ptr, sizeof(kpath)) != 0) {
         return (uint64_t)-EFAULT;
     }
 
+    if ((int64_t)dirfd != -100 && kpath[0] != '/') return (uint64_t)-ENOSYS;
+    if (flags) return (uint64_t)-ENOSYS;
+    int access = mutation_owner_access(vfs_resolve_path(kpath));
+    if (access) return (uint64_t)(int64_t)access;
     int res = vfs_chmod(kpath, (uint32_t)mode);
     if (res < 0) return (uint64_t)-ENOENT;
     
@@ -1117,6 +1147,8 @@ uint64_t sys_link_impl(uint64_t oldpath_ptr, uint64_t newpath_ptr) {
     if (copy_str_from_user(knew, newpath_ptr, sizeof(knew)) != 0)
         return (uint64_t)-EFAULT;
 
+    int access = mutation_parent_access(knew);
+    if (access) return (uint64_t)(int64_t)access;
     int res = vfs_link(kold, knew);
     if (res < 0) return (uint64_t)res;
 
@@ -1129,6 +1161,8 @@ uint64_t sys_fchmod_impl(uint64_t fd, uint64_t mode) {
         return (uint64_t)-EBADF;
 
     vfs_file_t *file = p->fd_table->fds[fd];
+    int access = mutation_owner_access(file->node);
+    if (access) return (uint64_t)(int64_t)access;
     int res = vfs_fchmod(file, (uint32_t)mode);
     if (res < 0) return (uint64_t)res;
 
@@ -1154,11 +1188,17 @@ uint64_t sys_fstatfs_impl(uint64_t fd, uint64_t buf) {
 
 uint64_t sys_reboot_impl(uint64_t magic, uint64_t magic2, uint64_t cmd, uint64_t arg) {
     (void)magic; (void)magic2; (void)cmd; (void)arg;
+    process_t *p = get_current_process();
+    if (!p || (!p->is_kernel_process && !(p->cap_effective & BOLDON_CAP_SYS_BOOT)))
+        return (uint64_t)-EPERM;
     outb(0x64, 0xFE);
     return 0;
 }
 uint64_t sys_mount_impl(uint64_t source, uint64_t target, uint64_t fstype,
                         uint64_t flags, uint64_t data) {
+    process_t *p = get_current_process();
+    if (!p || (!p->is_kernel_process && !(p->cap_effective & BOLDON_CAP_SYS_ADMIN)))
+        return (uint64_t)-EPERM;
     char ksource[256], ktarget[256], kfstype[64];
     memset(ksource, 0, sizeof(ksource));
     memset(ktarget, 0, sizeof(ktarget));
@@ -1175,6 +1215,9 @@ uint64_t sys_mount_impl(uint64_t source, uint64_t target, uint64_t fstype,
 }
 
 uint64_t sys_umount2_impl(uint64_t target, uint64_t flags) {
+    process_t *p = get_current_process();
+    if (!p || (!p->is_kernel_process && !(p->cap_effective & BOLDON_CAP_SYS_ADMIN)))
+        return (uint64_t)-EPERM;
     char ktarget[256];
     memset(ktarget, 0, sizeof(ktarget));
     if (!target) return (uint64_t)-EFAULT;

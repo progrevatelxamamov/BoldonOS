@@ -31,7 +31,7 @@ struct vfs_node { int type; vfs_file_ops_t *file_ops; };
 struct vfs_file { vfs_node_t *node; void *private_data; uint32_t flags, refcount; };
 typedef struct { vfs_file_t *fds[VFS_MAX_FD]; } process_fd_table_t;
 #define BOLDON_CAP_SETPCAP (1ULL << 8)
-#define BOLDON_CAP_SUPPORTED ((1ULL<<1)|(1ULL<<6)|(1ULL<<7)|(1ULL<<8))
+#define BOLDON_CAP_SUPPORTED ((1ULL<<1)|(1ULL<<3)|(1ULL<<5)|(1ULL<<6)|(1ULL<<7)|(1ULL<<8)|(1ULL<<21)|(1ULL<<22))
 typedef struct { process_fd_table_t *fd_table; uint32_t euid; uint64_t pid;
                  uint64_t cap_effective, cap_permitted, cap_inheritable,
                           cap_bounding, cap_ambient; } process_t;

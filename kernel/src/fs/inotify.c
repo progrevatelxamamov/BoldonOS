@@ -295,7 +295,12 @@ uint64_t sys_inotify_add_watch_impl(uint64_t fd, uint64_t path, uint64_t mask_ar
     }
     if (i == sizeof(name) - 1) return (uint64_t)-ENAMETOOLONG;
     uint32_t mask = (uint32_t)mask_arg;
-    if ((mask_arg >> 32) || !(mask & IN_ALL_EVENTS)) return (uint64_t)-EINVAL;
+    const uint32_t options = IN_ONLYDIR | IN_DONT_FOLLOW | IN_EXCL_UNLINK |
+                             IN_MASK_CREATE | IN_MASK_ADD | IN_ONESHOT;
+    if ((mask_arg >> 32) || !(mask & IN_ALL_EVENTS) ||
+        (mask & ~(IN_ALL_EVENTS | options)) ||
+        ((mask & IN_MASK_ADD) && (mask & IN_MASK_CREATE)))
+        return (uint64_t)-EINVAL;
     /* Parent watches only receive events on directory entries while they
        are linked; no subsequent child events are routed to the parent.
        Thus IN_EXCL_UNLINK requires no additional filtering in this VFS. */
