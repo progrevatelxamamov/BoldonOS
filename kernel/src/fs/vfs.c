@@ -460,18 +460,12 @@ int vfs_check_access(vfs_node_t *node, uint32_t uid, uint32_t gid, int req_perms
 
 vfs_file_t *vfs_open(const char *path, uint32_t flags) {
     vfs_node_t *node = vfs_resolve_path(path);
-    bool created = false;
-    vfs_node_t *create_parent = NULL;
-    char created_name[256] = {0};
-
     if (!node && (flags & VFS_O_CREAT)) {
         char filename[256];
         vfs_node_t *parent = vfs_resolve_path_ext(path, true, filename);
         if (parent && parent->ops && parent->ops->create) {
             if (parent->ops->create(parent, filename, 0644, &node) == 0 && node) {
-                created = true;
-                create_parent = parent;
-                strncpy(created_name, filename, sizeof(created_name) - 1);
+                inotify_vfs_event(parent, IN_CREATE, filename);
             }
         }
     }
@@ -498,7 +492,6 @@ vfs_file_t *vfs_open(const char *path, uint32_t flags) {
         node->size = 0;
         inotify_vfs_event(node, IN_MODIFY, NULL);
     }
-    if (created) inotify_vfs_event(create_parent, IN_CREATE, created_name);
     inotify_vfs_event(node, IN_OPEN, NULL);
     return file;
 }
