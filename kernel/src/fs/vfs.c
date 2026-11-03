@@ -719,6 +719,8 @@ int vfs_rmdir(const char *path) {
 
 int sys_open(process_fd_table_t *table, const char *path, uint32_t flags) {
     if (!table) return -EINVAL;
+    /* Do not truncate through a read-only descriptor or with read-only DAC. */
+    if ((flags & VFS_O_TRUNC) && !(flags & VFS_O_WRITE)) return -EACCES;
     
     int req_perms = 0;
     if (flags & VFS_O_READ) req_perms |= VFS_PERM_READ;

@@ -231,22 +231,28 @@ static ext4_vfs_handle_t *ext4_ensure_handle(vfs_file_t *file) {
         }
     } else {
         h->is_dir = false;
-        const char *mode = "r+";
-        if (file->flags & VFS_O_CREAT) mode = "w+";
-        else if (!(file->flags & VFS_O_WRITE)) mode = "r";
-
+        /* O_CREAT is not O_TRUNC. The VFS has already created missing
+           files; opening an existing file must never discard its contents. */
+        const char *mode = (file->flags & VFS_O_TRUNC) ? "w+" :
+                           ((file->flags & (VFS_O_APPEND | VFS_O_WRITE)) ==
+                            (VFS_O_APPEND | VFS_O_WRITE)) ? "a+" :
+                           (file->flags & VFS_O_WRITE) ? "r+" : "r";
         int r = ext4_fopen(&h->file, path, mode);
         if (r != EOK) {
-            r = ext4_fopen(&h->file, path, "r");
-            if (r != EOK) {
-                malloc_free(h);
-                return NULL;
-            }
+            /* Never disguise a failed write open as a successful read open. */
+            malloc_free(h);
+            return NULL;
         }
     }
 
     file->private_data = h;
     return h;
+}
+
+static int ext4_vfs_op_open(vfs_file_t *file) {
+    /* Make truncation and open errors visible at open(2), not at the first
+       later read/write, which might never happen. */
+    return ext4_ensure_handle(file) ? 0 : -EIO;
 }
 
 static int ext4_vfs_op_read(vfs_file_t *file, void *buf, uint64_t count) {
@@ -428,7 +434,9 @@ static int ext4_vfs_op_create(vfs_node_t *dir, const char *name, uint16_t mode, 
 
     ext4_file f;
     trace_xorg_ext4_create("bind.ext4.fopen", 0, target_path);
-    int r = ext4_fopen(&f, target_path, "w+");
+    /* A second process may create the name after VFS lookup. a+ avoids
+       truncating that file; the old w+ silently destroyed its contents. */
+    int r = ext4_fopen(&f, target_path, "a+");
     trace_xorg_ext4_create("bind.ext4.fopen.done", (uint64_t)(uint32_t)r, target_path);
     if (r != EOK) return -1;
     ext4_fclose(&f);
@@ -767,6 +775,7 @@ vfs_mount_t *ext4_vfs_mount(const char *device, void *data) {
 }
 
 void ext4_vfs_init(void) {
+    g_ext4_file_ops.open = ext4_vfs_op_open;
     g_ext4_file_ops.read = ext4_vfs_op_read;
     g_ext4_file_ops.write = ext4_vfs_op_write;
     g_ext4_file_ops.close = ext4_vfs_op_close;
