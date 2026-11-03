@@ -109,7 +109,8 @@ Could not create full-duplex pipe`: вызов 53 — `socketpair`, **не** `pi
 существующего имени при rename и относительные пути с dirfd пока не
 реализованы: `openat`, `newfstatat` и `faccessat` теперь явно отклоняют такой
 путь, а не молча подставляют рабочий каталог; `newfstatat` учитывает
-`AT_SYMLINK_NOFOLLOW`. `renameat2(316)` работает при `flags=0`; иные флаги
+`AT_SYMLINK_NOFOLLOW`. Слишком длинные пользовательские пути отклоняются,
+вместо того чтобы открывать их обрезанный префикс. `renameat2(316)` работает при `flags=0`; иные флаги
 возвращают ENOSYS. `FIONREAD` сообщает число байт в очереди inotify. На umount наблюдения снимаются с IN_UNMOUNT/IN_IGNORED.
 Ограничение — 64 watch и 64 события на экземпляр. `pidfd_open` (434) теперь выдаёт FD с готовностью `poll`
 при завершении или сборке процесса (без `pidfd_send_signal`/`waitid(P_PIDFD)`).

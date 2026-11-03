@@ -146,16 +146,17 @@ static inline bool user_range_ok(uint64_t ptr, uint64_t len) {
 
 static int copy_str_from_user(char *dst, uint64_t src_user_ptr, size_t max_len) {
     if (!src_user_ptr || !user_range_ok(src_user_ptr, 1)) return -EFAULT;
+    if (!max_len) return -ENAMETOOLONG;
 
-    size_t i = 0;
-    for (; i < max_len - 1; i++) {
+    for (size_t i = 0; i < max_len; i++) {
         if (!user_range_ok(src_user_ptr + i, 1)) return -EFAULT;
         char c = *(const char *)(src_user_ptr + i);
         dst[i] = c;
         if (c == '\0') return 0;
     }
-    dst[i] = '\0';
-    return 0;
+    dst[max_len - 1] = '\0';
+    /* Never execute a mutation against a silently truncated pathname. */
+    return -ENAMETOOLONG;
 }
 
 uint64_t sys_memfd_create_w(uint64_t name, uint64_t flags) {
