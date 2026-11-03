@@ -46,6 +46,7 @@ typedef struct socket {
 
 extern vfs_file_ops_t generic_socket_vfs_ops;
 socket_t *get_socket_from_fd(int sockfd);
+int sys_getpeername(int sockfd, struct sockaddr *addr, socklen_t *addrlen);
 
 socket_t* unix_socket_create(int type, int protocol);
 socket_t* inet_socket_create(int type, int protocol);

@@ -129,6 +129,13 @@ int sys_getsockname(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
     return sock->ops->getsockname(sock, addr, addrlen);
 }
 
+int sys_getpeername(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
+    socket_t *sock = get_socket_from_fd(sockfd);
+    if (!sock) return -EBADF;
+    if (!sock->ops || !sock->ops->getpeername) return -EOPNOTSUPP;
+    return sock->ops->getpeername(sock, addr, addrlen);
+}
+
 short socket_poll_events(vfs_file_t *file, short events) {
     if (!file || !file->node || file->node->file_ops != &generic_socket_vfs_ops) return 0;
     socket_t *sock = (socket_t *)file->node->fs_data;
