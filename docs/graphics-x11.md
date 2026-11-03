@@ -118,9 +118,13 @@ DAC_OVERRIDE, FOWNER, KILL, SETUID, SETGID, SETPCAP, SYS_ADMIN, SYS_BOOT.
 каталога; chmod требует владельца или FOWNER, mount/umount — SYS_ADMIN,
 reboot — SYS_BOOT, чужой SIGINT — KILL. Наборы permitted/effective/inheritable,
 bounding и ambient хранятся в процессе и наследуются при fork;
-`PR_CAPBSET_READ/DROP` управляют bounding set. При exec без file capabilities
-root получает ограничение bounding, обычный процесс — ambient. **Это ещё не
-полная модель Linux capabilities**: нет file capability xattrs, namespaces,
+`PR_CAPBSET_READ/DROP` управляют bounding set. На ext4 ELF теперь читается
+`security.capability` (Linux v1/v2/v3, v3 только rootid=0); неизвестные права
+и повреждённые xattr отклоняются **до** замены процесса. File-cap наборы
+учитываются при exec вместе с bounding/inheritable и `no_new_privs`.
+Без xattr root получает ограничение bounding, обычный процесс — ambient.
+**Это ещё не полная модель Linux capabilities**: нет syscall для записи
+file-cap xattr из гостя, namespaces,
 разделения credentials по потокам и проверок capabilities для всех операций
 ядра. `PR_CAP_AMBIENT` (raise/lower/query/clear) и `PR_SET/GET_NO_NEW_PRIVS`
 работают для поддерживаемых прав; fsuid/fsgid отделены от euid/egid.

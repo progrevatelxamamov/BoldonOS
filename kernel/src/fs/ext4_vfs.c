@@ -578,6 +578,17 @@ static int ext4_vfs_op_chmod(vfs_node_t *node, uint32_t mode) {
     return 0;
 }
 
+static int ext4_vfs_op_getxattr(vfs_node_t *node, const char *name,
+                                 void *buf, uint64_t size) {
+    if (!node || !name || !buf || size > 0x7fffffffULL) return -EINVAL;
+    char path[512];
+    get_lwext4_path(node, path, sizeof(path));
+    size_t actual = 0;
+    int r = ext4_getxattr(path, name, strlen(name), buf, (size_t)size, &actual);
+    if (r != EOK) return -r;
+    return actual <= (size_t)size ? (int)actual : -ERANGE;
+}
+
 static int ext4_vfs_op_chown(vfs_node_t *node, uint32_t uid, uint32_t gid) {
     if (!node) return -1;
 
@@ -759,6 +770,7 @@ void ext4_vfs_init(void) {
     g_ext4_node_ops.stat = ext4_vfs_op_stat;
     g_ext4_node_ops.chmod = ext4_vfs_op_chmod;
     g_ext4_node_ops.chown = ext4_vfs_op_chown;
+    g_ext4_node_ops.getxattr = ext4_vfs_op_getxattr;
 
     g_ext4_fs_type.mount = ext4_vfs_mount;
     g_ext4_fs_type.unmount = ext4_vfs_unmount;

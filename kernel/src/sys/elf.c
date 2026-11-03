@@ -212,6 +212,14 @@ static int sys_execve_depth(const char *pathname, char *const argv[],
     if (ehdr.e_phentsize != sizeof(Elf64_Phdr)) { vfs_close(f); errno = ENOEXEC; return -1; }
     if (ehdr.e_phnum == 0) { vfs_close(f); errno = ENOEXEC; return -1; }
 
+    boldon_file_caps_t file_caps;
+    int cap_status = capability_read_file(f->node, &file_caps);
+    if (cap_status < 0) {
+        vfs_close(f);
+        errno = -cap_status;
+        return -1;
+    }
+
     void *pml4_phys = pmm_alloc_page_and_clear();
     if (!pml4_phys) { vfs_close(f); errno = ENOMEM; return -1; }
 
@@ -457,17 +465,11 @@ static int sys_execve_depth(const char *pathname, char *const argv[],
         p->fd_table->gid = p->fsgid;
     }
 
-    /* No file capability xattrs yet. Normal exec keeps only ambient caps;
-       the traditional root exec derives supported rights from the process
-       bounding set. SUID/SGID transitions clear ambient privileges. */
-    bool privileged_exec = f->node && !p->no_new_privs &&
-                           (f->node->mode & (04000 | 02000));
-    if (privileged_exec) p->cap_ambient = 0;
-    uint64_t old_permitted = p->cap_permitted;
-    p->cap_permitted = p->euid == 0 ?
-        (p->cap_bounding & BOLDON_CAP_SUPPORTED) : p->cap_ambient;
-    if (p->no_new_privs) p->cap_permitted &= old_permitted;
-    p->cap_effective = p->cap_permitted;
+    /* File capabilities take precedence over legacy root-on-exec. SUID,
+       SGID and file-cap xattrs clear ambient rights on a privileged exec. */
+    bool setid = f->node && !p->no_new_privs &&
+                 (f->node->mode & (04000 | 02000));
+    capability_apply_exec(p, &file_caps, setid);
 
     p->pml4        = new_pml4;
     p->brk_start   = brk_start;

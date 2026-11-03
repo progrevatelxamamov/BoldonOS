@@ -80,6 +80,9 @@ typedef struct {
     int (*stat)(struct vfs_node *node, vfs_stat_t *st);
     int (*chmod)(struct vfs_node *node, uint32_t mode);
     int (*chown)(struct vfs_node *node, uint32_t uid, uint32_t gid);
+    /* Returns attribute size or negative errno; no value is synthesized. */
+    int (*getxattr)(struct vfs_node *node, const char *name,
+                    void *buf, uint64_t size);
 } vfs_node_ops_t;
 
 typedef struct vfs_node {
