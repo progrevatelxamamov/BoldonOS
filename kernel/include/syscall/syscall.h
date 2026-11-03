@@ -33,6 +33,7 @@
 #define SYS_MSYNC       26
 #define SYS_MINCORE     27
 #define SYS_MADVISE     28
+#define SYS_SCHED_GETAFFINITY 204
 #define SYS_DUP         32
 #define SYS_DUP2        33
 #define SYS_PAUSE       34

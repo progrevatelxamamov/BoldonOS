@@ -116,6 +116,8 @@ static int un_accept(socket_t *sock, struct sockaddr *addr, socklen_t *addrlen, 
     if (!srv_sock) return -ENOMEM;
 
     unix_intern_t *srv_u = (unix_intern_t *)srv_sock->private_data;
+    /* The accepted endpoint represents the listener's address to its peer. */
+    srv_u->addr = u->addr;
     srv_u->peer = client;
     client->peer = srv_u;
     *new_sock = srv_sock;
@@ -196,6 +198,22 @@ static int un_getsockname(socket_t *sock, struct sockaddr *addr, socklen_t *addr
     return 0;
 }
 
+static int un_getpeername(socket_t *sock, struct sockaddr *addr, socklen_t *addrlen) {
+    unix_intern_t *u = sock ? (unix_intern_t *)sock->private_data : NULL;
+    if (!u || !u->peer || u->peer_closed) return -ENOTCONN;
+    if (!addr || !addrlen) return -EFAULT;
+
+    struct sockaddr_un peer_addr = u->peer->addr;
+    peer_addr.sun_family = AF_UNIX;
+    size_t actual = offsetof(struct sockaddr_un, sun_path);
+    if (peer_addr.sun_path[0])
+        actual += strlen(peer_addr.sun_path) + 1;
+    size_t copied = *addrlen < actual ? *addrlen : actual;
+    memcpy(addr, &peer_addr, copied);
+    *addrlen = (socklen_t)actual;
+    return 0;
+}
+
 static short un_poll(socket_t *sock, short events) {
     unix_intern_t *u = (unix_intern_t *)sock->private_data;
     if (!u) return 0;
@@ -273,6 +291,7 @@ static socket_ops_t unix_ops = {
     .send        = un_send, 
     .recv        = un_recv,
     .getsockname = un_getsockname, 
+    .getpeername = un_getpeername,
     .getsockopt  = un_getsockopt, 
     .setsockopt  = un_setsockopt,
     .poll        = un_poll,
