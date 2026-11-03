@@ -479,6 +479,16 @@ static int sys_execve_depth(const char *pathname, char *const argv[],
         malloc_free(phdrs); vfs_close(f); errno = ESRCH; return -1;
     }
 
+    /* Close-on-exec after loading succeeds, while disk/TTY interrupts are
+       still enabled: socket close can itself touch the filesystem. */
+    if (p->fd_table) {
+        for (int fd = 0; fd < VFS_MAX_FD; fd++) {
+            vfs_file_t *open_file = p->fd_table->fds[fd];
+            if (open_file && (open_file->flags & VFS_O_CLOEXEC))
+                sys_close(p->fd_table, fd);
+        }
+    }
+
     if (xorgtrace_exec_target(pathname))
         xorgtrace_stage("exec.entry", p->pid, (uint64_t)xorgtrace_exec_target(pathname));
     __asm__ volatile("cli");

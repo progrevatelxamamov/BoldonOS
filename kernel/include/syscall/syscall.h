@@ -126,6 +126,7 @@
 #define SYS_FACCESSAT   269
 #define SYS_PSELECT6    270
 #define SYS_PPOLL       271
+#define SYS_CLOSE_RANGE 436
 #define SYS_SET_ROBUST_LIST 273
 #define SYS_UTIMENSAT   280
 #define SYS_SIGNALFD    282

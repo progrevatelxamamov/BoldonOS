@@ -33,6 +33,14 @@ uint64_t sys_socket_impl(uint64_t domain, uint64_t type, uint64_t protocol) {
     return (uint64_t)res;
 }
 
+uint64_t sys_socketpair_impl(uint64_t domain, uint64_t type, uint64_t protocol,
+                             uint64_t fds_ptr) {
+    if (!fds_ptr || !user_range_ok(fds_ptr, 2 * sizeof(int)))
+        return (uint64_t)-EFAULT;
+    return (uint64_t)(int64_t)sys_socketpair((int)domain, (int)type,
+                                             (int)protocol, (int *)fds_ptr);
+}
+
 uint64_t sys_bind_impl(uint64_t sockfd, uint64_t addr_ptr, uint64_t addrlen) {
     if (!addr_ptr || !user_range_ok(addr_ptr, addrlen))
         return (uint64_t)-EFAULT;

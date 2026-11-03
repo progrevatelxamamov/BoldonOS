@@ -24,6 +24,8 @@ static int sock_vfs_close(vfs_file_t *file) {
         sock->ops->close(sock);
     }
     malloc_free(sock);
+    malloc_free(file->node); /* one node per socket file; final ref only */
+    file->node = NULL;
     return 0;
 }
 
@@ -39,12 +41,14 @@ static int allocate_socket_fd(socket_t *sock) {
     if (!p || !p->fd_table) return -EINVAL;
 
     vfs_node_t *node = malloc_alloc(sizeof(vfs_node_t));
+    if (!node) return -ENOMEM;
     memset(node, 0, sizeof(vfs_node_t));
     node->type = VFS_TYPE_CHAR_DEV;
     node->file_ops = &generic_socket_vfs_ops;
     node->fs_data = sock;
 
     vfs_file_t *file = malloc_alloc(sizeof(vfs_file_t));
+    if (!file) { malloc_free(node); return -ENOMEM; }
     memset(file, 0, sizeof(vfs_file_t));
     file->node = node;
     file->flags = VFS_O_RDWR;
@@ -80,6 +84,41 @@ int sys_socket(int domain, int type, int protocol) {
 
     if (!sock) return -97;
     return allocate_socket_fd(sock);
+}
+
+int sys_socketpair(int domain, int type, int protocol, int fds[2]) {
+    /* Linux x86-64 SOCK_NONBLOCK and SOCK_CLOEXEC. Only the stream
+       transport has byte-stream semantics in the current UNIX backend. */
+    const int nonblock = 00004000, cloexec = 02000000;
+    if (domain != AF_UNIX) return -EAFNOSUPPORT;
+    if (protocol != 0) return -EPROTONOSUPPORT;
+    if (type & ~(15 | nonblock | cloexec)) return -EINVAL;
+    if ((type & 15) != SOCK_STREAM) return -ESOCKTNOSUPPORT;
+    process_t *p = get_current_process();
+    if (!p || !p->fd_table) return -EINVAL;
+
+    socket_t *a, *b;
+    int res = unix_socketpair_create(SOCK_STREAM, &a, &b);
+    if (res < 0) return res;
+    int first = allocate_socket_fd(a);
+    if (first < 0) {
+        a->ops->close(a); malloc_free(a);
+        b->ops->close(b); malloc_free(b);
+        return first;
+    }
+    int second = allocate_socket_fd(b);
+    if (second < 0) {
+        sys_close(p->fd_table, first);
+        b->ops->close(b); malloc_free(b);
+        return second;
+    }
+    uint32_t flags = ((type & nonblock) ? VFS_O_NONBLOCK : 0) |
+                     ((type & cloexec) ? VFS_O_CLOEXEC : 0);
+    p->fd_table->fds[first]->flags |= flags;
+    p->fd_table->fds[second]->flags |= flags;
+    fds[0] = first;
+    fds[1] = second;
+    return 0;
 }
 
 int sys_bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {

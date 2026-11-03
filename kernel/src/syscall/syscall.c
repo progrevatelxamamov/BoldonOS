@@ -59,10 +59,12 @@ extern uint64_t sys_fstat_impl(uint64_t, uint64_t);
 extern uint64_t sys_newfstatat_impl(uint64_t, uint64_t, uint64_t, uint64_t);
 extern uint64_t sys_statx_impl(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
 extern uint64_t sys_poll_impl(uint64_t, uint64_t, uint64_t);
+extern uint64_t sys_close_range_impl(uint64_t, uint64_t, uint64_t);
 extern uint64_t sys_ppoll_impl(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
 extern uint64_t sys_madvise_impl(uint64_t, uint64_t, uint64_t);
 extern uint64_t sys_sched_getaffinity_impl(uint64_t, uint64_t, uint64_t);
 extern uint64_t sys_getpeername_impl(uint64_t, uint64_t, uint64_t);
+extern uint64_t sys_socketpair_impl(uint64_t, uint64_t, uint64_t, uint64_t);
 extern uint64_t sys_fcntl_impl(uint64_t, uint64_t, uint64_t);
 extern uint64_t sys_lseek_impl(uint64_t, uint64_t, uint64_t);
 extern uint64_t sys_access_impl(uint64_t, uint64_t);
@@ -232,6 +234,7 @@ uint64_t osdev_syscall_handler(uint64_t num,
     case SYS_POLL:        return sys_poll_impl(a1, a2,
                                 (int32_t)a3 < 0 ? UINT64_MAX : (uint32_t)a3);
     case SYS_PPOLL:       return sys_ppoll_impl(a1, a2, a3, a4, a5);
+    case SYS_CLOSE_RANGE: return sys_close_range_impl(a1, a2, a3);
     case SYS_MADVISE:     return sys_madvise_impl(a1, a2, a3);
     case SYS_SCHED_GETAFFINITY: return sys_sched_getaffinity_impl(a1, a2, a3);
     case SYS_LSEEK:       return sys_lseek_impl(a1, a2, a3);
@@ -360,6 +363,7 @@ uint64_t osdev_syscall_handler(uint64_t num,
     case 86: return sys_link_impl(a1, a2);   /* SYS_LINK */
     case 91: return sys_fchmod_impl(a1, a2); /* SYS_FCHMOD */
     case 41: return sys_socket_impl(a1, a2, a3);      /* SYS_SOCKET */
+    case SYS_SOCKETPAIR: return sys_socketpair_impl(a1, a2, a3, a4);
     case 43: return sys_accept_impl(a1, a2, a3);      /* SYS_ACCEPT */
     case 49: return sys_bind_impl(a1, a2, a3);        /* SYS_BIND */
     case 50: return sys_listen_impl(a1, a2);          /* SYS_LISTEN */
