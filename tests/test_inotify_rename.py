@@ -21,10 +21,11 @@ code = r'''
 typedef struct vfs_node vfs_node_t;
 typedef struct vfs_mount { int id; } vfs_mount_t;
 typedef struct { int (*rename)(vfs_node_t *,const char *,vfs_node_t *,const char *); } vfs_node_ops_t;
-struct vfs_node { int type; vfs_mount_t *mount; vfs_node_ops_t *ops; };
+struct vfs_node { int type; vfs_mount_t *mount; vfs_node_ops_t *ops; uint64_t inode_num; };
 static vfs_mount_t mount1={1}, mount2={2};
-static vfs_node_t parent={VFS_TYPE_DIR,&mount1,NULL}, other={VFS_TYPE_DIR,&mount2,NULL};
-static vfs_node_t item={VFS_TYPE_FILE,&mount1,NULL};
+static vfs_node_t parent={VFS_TYPE_DIR,&mount1,NULL,1}, other={VFS_TYPE_DIR,&mount2,NULL,2};
+static vfs_node_t item={VFS_TYPE_FILE,&mount1,NULL,42};
+static vfs_node_t target={VFS_TYPE_FILE,&mount1,NULL,99};
 static int backend_result, calls, notifications, exists;
 static int rename_backend(vfs_node_t *a,const char *b,vfs_node_t *c,const char *d) {
     (void)a;(void)b;(void)c;(void)d;calls++;return backend_result;
@@ -32,7 +33,7 @@ static int rename_backend(vfs_node_t *a,const char *b,vfs_node_t *c,const char *
 static vfs_node_ops_t ops={rename_backend};
 static vfs_node_t *vfs_resolve_path_nofollow(const char *path) {
     if (!strcmp(path,"old")) return &item;
-    if (!strcmp(path,"new") && exists) return &item;
+    if (!strcmp(path,"new") && exists) return &target;
     return NULL;
 }
 static vfs_node_t *vfs_resolve_path_ext(const char *path, int parent_only, char *name) {
@@ -53,6 +54,9 @@ int main(void) {
     assert(vfs_rename("old","other")==-EXDEV);
     exists=1;
     assert(vfs_rename("old","new")==-EEXIST && !calls);
+    target.inode_num = item.inode_num;
+    assert(vfs_rename("old","new")==0 && !calls && !notifications);
+    target.inode_num = 99;
     exists=0;backend_result=-EIO;
     assert(vfs_rename("old","new")==-EIO && calls==1 && !notifications);
     backend_result=0;

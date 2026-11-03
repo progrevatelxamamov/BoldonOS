@@ -115,7 +115,11 @@ Could not create full-duplex pipe`: вызов 53 — `socketpair`, **не** `pi
 учитывают ограниченный набор **реально представленных** прав:
 DAC_OVERRIDE, FOWNER, KILL, SETUID, SETGID, SETPCAP, SETFCAP, SYS_ADMIN, SYS_BOOT.
 Для пользовательских mkdir/unlink/link/rename проверяются права родительского
-каталога; chmod требует владельца или FOWNER, mount/umount — SYS_ADMIN,
+каталога; обход пути также требует права поиска у каждого каталога (включая
+цели символьных ссылок), а exec требует исполняемый файл и право исполнения
+как у основного ELF/скрипта, так и у ELF-интерпретатора. Rename двух имён
+одного inode — no-op, замена другого inode остаётся отклонённой.
+Chmod требует владельца или FOWNER, mount/umount — SYS_ADMIN,
 reboot — SYS_BOOT, чужой SIGINT — KILL. Наборы permitted/effective/inheritable,
 bounding и ambient хранятся в процессе и наследуются при fork;
 `PR_CAPBSET_READ/DROP` управляют bounding set. На ext4 ELF теперь читается

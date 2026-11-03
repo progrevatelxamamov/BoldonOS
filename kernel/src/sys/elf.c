@@ -91,6 +91,18 @@ static int map_segment(page_table_t *pml4, vfs_file_t *f,
     return 0;
 }
 
+/* execve does not go through the user sys_open DAC check: it opens its
+   binary internally, so apply the execute check before reading/loading it. */
+static int exec_file_access(vfs_file_t *file) {
+    process_t *p = get_current_process();
+    if (!file || !file->node || file->node->type != VFS_TYPE_FILE)
+        return -EACCES;
+    if (p && !p->is_kernel_process &&
+        vfs_check_access(file->node, p->fsuid, p->fsgid, VFS_PERM_EXEC))
+        return -EACCES;
+    return 0;
+}
+
 static int load_interp(page_table_t *pml4, const char *interp_path,
                        uint64_t interp_base, uint64_t *entry_out)
 {
@@ -100,6 +112,10 @@ static int load_interp(page_table_t *pml4, const char *interp_path,
         console_print_string(interp_path);
         console_print_string("\n");
         return -ENOENT;
+    }
+    if (exec_file_access(ifile)) {
+        vfs_close(ifile);
+        return -EACCES;
     }
 
     Elf64_Ehdr iehdr;
@@ -172,6 +188,9 @@ static int sys_execve_depth(const char *pathname, char *const argv[],
 
     vfs_file_t *f = vfs_open(pathname, VFS_O_READ);
     if (!f) { errno = ENOENT; return -1; }
+    if (exec_file_access(f)) {
+        vfs_close(f); errno = EACCES; return -1;
+    }
     if (xorgtrace_exec_target(pathname)) {
         process_t *current = get_current_process();
         xorgtrace_stage("exec.open", current ? current->pid : 0,

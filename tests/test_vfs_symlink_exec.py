@@ -14,6 +14,7 @@ code = r'''
 #include <stdlib.h>
 #include <string.h>
 #define MAX_SYMLINK_DEPTH 8
+#define VFS_PERM_EXEC 1
 typedef enum { VFS_TYPE_DIR, VFS_TYPE_FILE, VFS_TYPE_SYMLINK } vfs_node_type_t;
 typedef struct vfs_node vfs_node_t;
 typedef struct {
@@ -30,6 +31,14 @@ static vfs_node_t nodes[32];
 static unsigned count;
 static vfs_mount_t cmount, dmount;
 static vfs_mount_t *drives[26];
+typedef struct { bool is_kernel_process; uint32_t fsuid, fsgid; } process_t;
+static process_t caller;
+static bool deny_usr;
+static process_t *get_current_process(void) { return &caller; }
+static int vfs_check_access(vfs_node_t *node, uint32_t uid, uint32_t gid, int perms) {
+    (void)uid; (void)gid; (void)perms;
+    return deny_usr && !strcmp(node->path, "C:/usr") ? -1 : 0;
+}
 static void malloc_free(void *p) { free(p); }
 static vfs_node_t *lookup(vfs_node_t *dir, const char *name) {
     char path[512];
@@ -97,6 +106,11 @@ int main(void) {
     char name[256] = {0};
     assert(vfs_resolve_path_ext("/bin/new", true, name) == &nodes[4]);
     assert(!strcmp(name, "new"));
+    deny_usr = true;
+    assert(vfs_resolve_path("/usr/bin/bash") == NULL);
+    assert(vfs_resolve_path_ext("/usr/bin/new", true, name) == NULL);
+    caller.is_kernel_process = true;
+    assert(vfs_resolve_path("/usr/bin/bash") == bash);
     return 0;
 }
 '''

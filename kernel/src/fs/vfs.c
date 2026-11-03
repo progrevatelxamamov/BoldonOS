@@ -361,6 +361,16 @@ static vfs_node_t *vfs_resolve_path_options(const char *path, bool parent_only,
         token[t] = '\0';
         while (*p == '/') p++;
 
+        /* A final-file DAC check is not enough: each traversed directory
+           must grant search permission, including parents of mutations. */
+        process_t *caller = get_current_process();
+        if (caller && !caller->is_kernel_process &&
+            (current->type != VFS_TYPE_DIR ||
+             vfs_check_access(current, caller->fsuid, caller->fsgid,
+                              VFS_PERM_EXEC))) {
+            current = NULL;
+            break;
+        }
         if (t == 1 && token[0] == '.') continue;
         if (t == 2 && token[0] == '.' && token[1] == '.') {
             if (parent_count) current = parents[--parent_count];
@@ -799,9 +809,14 @@ int vfs_rename(const char *oldpath, const char *newpath) {
     if (from->type != VFS_TYPE_DIR || to->type != VFS_TYPE_DIR)
         return -ENOTDIR;
     if (from == to && strcmp(old_name, new_name) == 0) return 0;
-    /* The ext4 backend cannot atomically replace an existing destination;
-       refuse rather than reporting Linux rename success after a partial op. */
-    if (vfs_resolve_path_nofollow(newpath)) return -EEXIST;
+    /* Renaming a hardlink over another name of the same inode is a no-op.
+       Never substitute unlink+rename for an atomic replacement. */
+    vfs_node_t *existing = vfs_resolve_path_nofollow(newpath);
+    if (existing) {
+        if (existing->mount == moved->mount && existing->inode_num &&
+            existing->inode_num == moved->inode_num) return 0;
+        return -EEXIST;
+    }
     if (!from->ops || !from->ops->rename) return -ENOSYS;
     int result = from->ops->rename(from, old_name, to, new_name);
     if (!result) inotify_vfs_move(from, old_name, to, new_name, moved);
