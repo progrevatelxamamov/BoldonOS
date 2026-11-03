@@ -380,9 +380,13 @@ uint64_t sys_stat_impl(uint64_t path, uint64_t statbuf) {
 
 uint64_t sys_newfstatat_impl(uint64_t dirfd, uint64_t path,
                              uint64_t statbuf, uint64_t flags) {
-    (void)dirfd; (void)flags;
-    if (!path || !statbuf) return (uint64_t)-EFAULT;
-    vfs_node_t *node = vfs_resolve_path((const char *)path);
+    char kpath[512];
+    if (!statbuf || !user_range_ok(statbuf, sizeof(struct linux_stat)) ||
+        copy_str_from_user(kpath, path, sizeof(kpath))) return (uint64_t)-EFAULT;
+    if ((int64_t)dirfd != -100 && kpath[0] != '/') return (uint64_t)-ENOSYS;
+    if (flags & ~0x100ULL) return (uint64_t)-ENOSYS;
+    vfs_node_t *node = flags & 0x100 /* AT_SYMLINK_NOFOLLOW */ ?
+        vfs_resolve_path_nofollow(kpath) : vfs_resolve_path(kpath);
     if (!node) return (uint64_t)-ENOENT;
     fill_linux_stat(node, (struct linux_stat *)statbuf);
     return 0;
@@ -521,12 +525,21 @@ static inline uint32_t translate_linux_open_flags(uint64_t linux_flags) {
     return vfs_flags;
 }
 
-uint64_t sys_open_impl(uint64_t a1, uint64_t a2, uint64_t a3) {
-    (void)a3;
+uint64_t sys_openat_impl(uint64_t dirfd, uint64_t path, uint64_t flags) {
     process_t *p = get_current_process();
     if (!p || !p->fd_table) return (uint64_t)-EBADF;
-    if (!a1) return (uint64_t)-EFAULT;
-    return (uint64_t)(int64_t)sys_open(p->fd_table, (const char *)a1, translate_linux_open_flags((uint32_t)a2));
+    char kpath[512];
+    if (copy_str_from_user(kpath, path, sizeof(kpath))) return (uint64_t)-EFAULT;
+    /* Absolute paths ignore dirfd; relative dirfd resolution is not yet
+       implemented and must never silently use the process cwd instead. */
+    if ((int64_t)dirfd != -100 && kpath[0] != '/') return (uint64_t)-ENOSYS;
+    return (uint64_t)(int64_t)sys_open(p->fd_table, kpath,
+                                      translate_linux_open_flags(flags));
+}
+
+uint64_t sys_open_impl(uint64_t path, uint64_t flags, uint64_t mode) {
+    (void)mode;
+    return sys_openat_impl((uint64_t)-100, path, flags);
 }
 
 uint64_t sys_close_impl(uint64_t a1) {
@@ -1170,8 +1183,13 @@ uint64_t sys_fchmod_impl(uint64_t fd, uint64_t mode) {
 }
 
 uint64_t sys_faccessat2_impl(uint64_t dfd, uint64_t filename, uint64_t mode, uint64_t flags) {
-    (void)dfd; (void)flags;
-    return sys_access_impl(filename, mode);
+    char path[512];
+    if (copy_str_from_user(path, filename, sizeof(path))) return (uint64_t)-EFAULT;
+    if ((int64_t)dfd != -100 && path[0] != '/') return (uint64_t)-ENOSYS;
+    /* access(2) uses real credentials; AT_EACCESS and nofollow need distinct
+       handling, not a silent alias to the existing access approximation. */
+    if (flags) return (uint64_t)-ENOSYS;
+    return sys_access_impl((uint64_t)path, mode);
 }
 
 uint64_t sys_fstatfs_impl(uint64_t fd, uint64_t buf) {

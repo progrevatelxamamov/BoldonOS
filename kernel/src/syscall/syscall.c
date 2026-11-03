@@ -19,32 +19,12 @@
 #define EFER_SCE             (1ULL << 0)
 #define EFER_NXE (1ULL << 11)
 
-static inline uint32_t translate_linux_open_flags(uint64_t linux_flags) {
-    uint32_t vfs_flags = 0;
-    uint64_t acc = linux_flags & 3; // O_ACCMODE (0 = O_RDONLY, 1 = O_WRONLY, 2 = O_RDWR)
-
-    if (acc == 1) {
-        vfs_flags |= VFS_O_WRITE;
-    } else if (acc == 2) {
-        vfs_flags |= (VFS_O_READ | VFS_O_WRITE);
-    } else {
-        vfs_flags |= VFS_O_READ; 
-    }
-
-    if (linux_flags & 0100)     vfs_flags |= VFS_O_CREAT;
-    if (linux_flags & 01000)    vfs_flags |= VFS_O_TRUNC;
-    if (linux_flags & 02000)    vfs_flags |= VFS_O_APPEND;
-    if (linux_flags & 04000)    vfs_flags |= VFS_O_NONBLOCK;
-    if (linux_flags & 02000000) vfs_flags |= VFS_O_CLOEXEC;
-
-    return vfs_flags;
-}
-
 extern void syscall_entry_stub(void);
 
 extern uint64_t sys_read_impl(uint64_t, uint64_t, uint64_t);
 extern uint64_t sys_write_impl(uint64_t, uint64_t, uint64_t);
 extern uint64_t sys_open_impl(uint64_t, uint64_t, uint64_t);
+extern uint64_t sys_openat_impl(uint64_t, uint64_t, uint64_t);
 extern uint64_t sys_close_impl(uint64_t);
 extern uint64_t sys_ioctl_impl(uint64_t, uint64_t, uint64_t);
 extern uint64_t sys_mount_impl(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
@@ -272,15 +252,10 @@ uint64_t osdev_syscall_handler(uint64_t num,
     case SYS_FCNTL:       return sys_fcntl_impl(a1, a2, a3);
     case SYS_FTRUNCATE:   return sys_ftruncate_w(a1, a2);
     case SYS_MEMFD_CREATE: return sys_memfd_create_w(a1, a2);
-    case SYS_OPENAT: {
-        process_t *p = get_current_process();
-        if (!p || !a2) return (uint64_t)-EFAULT;
-        uint32_t flags = translate_linux_open_flags((uint32_t)a3);
-        return sys_open(p->fd_table, (const char *)a2, (uint32_t)flags);
-    }
+    case SYS_OPENAT: return sys_openat_impl(a1, a2, a3);
     case SYS_NEWFSTATAT:  return sys_newfstatat_impl(a1, a2, a3, a4);
     case SYS_STATX:       return sys_statx_impl(a1, a2, a3, a4, a5);
-    case SYS_FACCESSAT:   return sys_access_impl(a2, a3);
+    case SYS_FACCESSAT:   return sys_faccessat2_impl(a1, a2, a3, 0);
     case SYS_GETCWD:      return sys_getcwd_impl(a1, a2);
     case SYS_CHDIR:       return sys_chdir_impl(a1);
 
