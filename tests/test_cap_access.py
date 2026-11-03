@@ -10,7 +10,8 @@ code = r'''
 #include <stdlib.h>
 #include <assert.h>
 #define BOLDON_CAP_DAC_OVERRIDE (1ULL << 1)
-typedef struct { uint32_t euid; uint64_t cap_effective; } process_t;
+#define VFS_PERM_EXEC 1
+typedef struct { uint32_t fsuid; uint64_t cap_effective; } process_t;
 typedef struct { uint32_t uid, gid, mode; } vfs_node_t;
 static process_t p = { 0, BOLDON_CAP_DAC_OVERRIDE };
 static process_t *get_current_process(void) { return &p; }
@@ -18,6 +19,10 @@ static process_t *get_current_process(void) { return &p; }
 int main(void) {
     vfs_node_t n = { .uid = 123, .gid = 123, .mode = 0000 };
     assert(vfs_check_access(&n, 0, 0, 4) == 0);
+    assert(vfs_check_access(&n, 0, 0, VFS_PERM_EXEC) == -1);
+    n.mode = 0001;
+    assert(vfs_check_access(&n, 0, 0, VFS_PERM_EXEC) == 0);
+    n.mode = 0000;
     p.cap_effective = 0;
     assert(vfs_check_access(&n, 0, 0, 4) == -1);
     n.mode = 0004;

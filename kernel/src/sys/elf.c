@@ -445,22 +445,28 @@ static int sys_execve_depth(const char *pathname, char *const argv[],
         malloc_free(phdrs); vfs_close(f); errno = ESRCH; return -1;
     }
 
-    if (f->node) {
-        if (f->node->mode & 04000 /* SUID */) {
-            p->euid = f->node->uid;
-        }
-        if (f->node->mode & 02000 /* SGID */) {
-            p->egid = f->node->gid;
-        }
+    if (f->node && !p->no_new_privs) {
+        if (f->node->mode & 04000 /* SUID */) p->euid = f->node->uid;
+        if (f->node->mode & 02000 /* SGID */) p->egid = f->node->gid;
+    }
+    /* exec resets filesystem credentials even for ordinary binaries. */
+    p->fsuid = p->euid;
+    p->fsgid = p->egid;
+    if (p->fd_table) {
+        p->fd_table->uid = p->fsuid;
+        p->fd_table->gid = p->fsgid;
     }
 
     /* No file capability xattrs yet. Normal exec keeps only ambient caps;
        the traditional root exec derives supported rights from the process
        bounding set. SUID/SGID transitions clear ambient privileges. */
-    bool privileged_exec = f->node && (f->node->mode & (04000 | 02000));
+    bool privileged_exec = f->node && !p->no_new_privs &&
+                           (f->node->mode & (04000 | 02000));
     if (privileged_exec) p->cap_ambient = 0;
+    uint64_t old_permitted = p->cap_permitted;
     p->cap_permitted = p->euid == 0 ?
         (p->cap_bounding & BOLDON_CAP_SUPPORTED) : p->cap_ambient;
+    if (p->no_new_privs) p->cap_permitted &= old_permitted;
     p->cap_effective = p->cap_permitted;
 
     p->pml4        = new_pml4;

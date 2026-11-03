@@ -458,8 +458,11 @@ vfs_node_t *vfs_resolve_path_ext_r(const char *path, bool parent_only, char *las
 int vfs_check_access(vfs_node_t *node, uint32_t uid, uint32_t gid, int req_perms) {
     if (uid == 0) {
         process_t *p = get_current_process();
-        if (!p || (p->euid == uid &&
-                   (p->cap_effective & BOLDON_CAP_DAC_OVERRIDE))) return 0;
+        if (!p || (p->fsuid == uid &&
+                   (p->cap_effective & BOLDON_CAP_DAC_OVERRIDE))) {
+            /* CAP_DAC_OVERRIDE does not execute a file without any x bit. */
+            if (!(req_perms & VFS_PERM_EXEC) || (node->mode & 0111)) return 0;
+        }
     }
     int perms = 0;
     if (node->uid == uid) {
@@ -711,8 +714,15 @@ int sys_open(process_fd_table_t *table, const char *path, uint32_t flags) {
     if (flags & VFS_O_WRITE) req_perms |= VFS_PERM_WRITE;
 
     vfs_node_t *node = vfs_resolve_path(path);
-    if (node && vfs_check_access(node, table->uid, table->gid, req_perms) != 0) {
-        return -EACCES; 
+    if (node && vfs_check_access(node, table->uid, table->gid, req_perms) != 0)
+        return -EACCES;
+    if (!node && (flags & VFS_O_CREAT)) {
+        char name[256];
+        vfs_node_t *parent = vfs_resolve_path_ext(path, true, name);
+        if (!parent) return -ENOENT;
+        if (vfs_check_access(parent, table->uid, table->gid,
+                             VFS_PERM_WRITE | VFS_PERM_EXEC) != 0)
+            return -EACCES;
     }
 
     vfs_file_t *file = vfs_open(path, flags);

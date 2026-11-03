@@ -54,7 +54,7 @@ code = r'''
 typedef struct vfs_mount { int unused; } vfs_mount_t;
 typedef struct vfs_node vfs_node_t;
 typedef struct vfs_file vfs_file_t;
-typedef struct { int (*read)(vfs_file_t *, void *, uint64_t); uint32_t (*poll)(vfs_file_t *, uint32_t); int (*close)(vfs_file_t *); } vfs_file_ops_t;
+typedef struct { int (*read)(vfs_file_t *, void *, uint64_t); uint32_t (*poll)(vfs_file_t *, uint32_t); int (*ioctl)(vfs_file_t *, uint64_t, void *); int (*close)(vfs_file_t *); } vfs_file_ops_t;
 struct vfs_node { int type; uint64_t inode_num; vfs_mount_t *mount; vfs_file_ops_t *file_ops; };
 struct vfs_file { vfs_node_t *node; void *private_data; uint32_t flags, refcount; };
 typedef struct { vfs_file_t *fds[VFS_MAX_FD]; } process_fd_table_t;
@@ -98,6 +98,8 @@ int main(void) {
     assert(sys_inotify_add_watch_impl(fd, (uintptr_t)"/tmp", IN_MODIFY | IN_MASK_CREATE) == (uint64_t)-EEXIST);
     assert(sys_inotify_add_watch_impl(fd, (uintptr_t)"/tmp", IN_MODIFY | IN_MASK_ADD) == (uint64_t)wd);
     inotify_vfs_event(&same_dir, IN_CREATE, "f");
+    int unread = 0;
+    assert(f->node->file_ops->ioctl(f, 0x541B, &unread) == 0 && unread == 20);
     assert(f->node->file_ops->poll(f, 1) == 1);
     char buf[1024] = {0};
     assert(f->node->file_ops->read(f, buf, 16) == -EINVAL); /* indivisible event */
@@ -134,6 +136,12 @@ int main(void) {
     assert(strcmp(from->name, "old") == 0 && strcmp(to->name, "new") == 0);
     assert(sys_inotify_rm_watch_impl(fd, move_wd) == 0);
     assert(f->node->file_ops->read(f, buf, sizeof(buf)) == 16);
+    int one_move = (int)sys_inotify_add_watch_impl(fd, (uintptr_t)"/tmp",
+                                      IN_MOVED_FROM | IN_MOVED_TO | IN_ONESHOT);
+    inotify_vfs_move(&dir, "old", &same_dir, "new", &file_node);
+    assert(f->node->file_ops->read(f, buf, sizeof(buf)) == 36);
+    assert(e->wd == one_move && e->mask == IN_MOVED_FROM);
+    assert(((struct in_event *)(buf + 20))->mask == IN_IGNORED);
     int once = (int)sys_inotify_add_watch_impl(fd, (uintptr_t)"/tmp/f", IN_MODIFY | IN_ONESHOT);
     inotify_vfs_event(&file_node, IN_MODIFY, NULL);
     inotify_vfs_event(&file_node, IN_MODIFY, NULL);

@@ -67,16 +67,19 @@ typedef struct process {
     uint32_t uid;
     uint32_t euid;
     uint32_t suid;
+    uint32_t fsuid;
 
     uint32_t gid;
     uint32_t egid;
     uint32_t sgid;
+    uint32_t fsgid;
 
     uint32_t umask;
     /* Supported Linux capability subset; all sets are per-process until
        thread credentials are represented separately. */
     uint64_t cap_permitted, cap_effective, cap_inheritable;
     uint64_t cap_bounding, cap_ambient;
+    bool no_new_privs;
 } process_t;
 
 struct cpu_local_data {

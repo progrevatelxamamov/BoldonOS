@@ -116,10 +116,20 @@ void inotify_vfs_move(vfs_node_t *old_dir, const char *old_name,
             if (same_node(w, old_dir) && (w->mask & IN_MOVED_FROM)) {
                 mask = IN_MOVED_FROM | dir; name = old_name;
                 enqueue(in, w->wd, mask, cookie, name);
+                if (w->options & IN_ONESHOT) {
+                    enqueue(in, w->wd, IN_IGNORED, 0, NULL);
+                    w->active = false;
+                    continue;
+                }
             }
             if (same_node(w, new_dir) && (w->mask & IN_MOVED_TO)) {
                 mask = IN_MOVED_TO | dir; name = new_name;
                 enqueue(in, w->wd, mask, cookie, name);
+                if (w->options & IN_ONESHOT) {
+                    enqueue(in, w->wd, IN_IGNORED, 0, NULL);
+                    w->active = false;
+                    continue;
+                }
             }
             if (same_node(w, moved) && (w->mask & IN_MOVE_SELF)) {
                 enqueue(in, w->wd, IN_MOVE_SELF, 0, NULL);
@@ -178,6 +188,22 @@ static int in_read(vfs_file_t *file, void *buf, uint64_t len) {
     }
 }
 
+static bool user_range(uint64_t p, uint64_t len);
+
+static int in_ioctl(vfs_file_t *file, uint64_t request, void *arg) {
+    if (request != 0x541B /* FIONREAD */) return -ENOTTY;
+    if (!user_range((uint64_t)arg, sizeof(int))) return -EFAULT;
+    in_instance_t *in = file->private_data;
+    uint64_t irq;
+    spin_lock_irqsave(&in_lock, &irq);
+    uint32_t bytes = in->overflow ? 16 : 0;
+    for (uint32_t i = 0; i < in->count; i++)
+        bytes += 16 + in->event[(in->head + i) % IN_EVENT_LIMIT].len;
+    spin_unlock_irqrestore(&in_lock, irq);
+    *(int *)arg = (int)bytes;
+    return 0;
+}
+
 static int in_close(vfs_file_t *file) {
     in_instance_t *in = file->private_data;
     uint64_t irq;
@@ -192,7 +218,9 @@ static int in_close(vfs_file_t *file) {
     return 0;
 }
 
-static vfs_file_ops_t in_ops = { .read = in_read, .poll = in_poll, .close = in_close };
+static vfs_file_ops_t in_ops = {
+    .read = in_read, .poll = in_poll, .ioctl = in_ioctl, .close = in_close
+};
 
 static bool user_range(uint64_t p, uint64_t len) {
     if (p < 0x10000 || p > 0x00007fffffffffffULL ||

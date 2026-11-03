@@ -597,11 +597,14 @@ uint64_t sys_clone_impl(uint64_t flags, uint64_t child_stack,
     child->cap_inheritable = p->cap_inheritable;
     child->cap_bounding = p->cap_bounding;
     child->cap_ambient = p->cap_ambient;
+    child->no_new_privs = p->no_new_privs;
     child->euid = p->euid;
     child->suid = p->suid;
+    child->fsuid = p->fsuid;
     child->gid  = p->gid;
     child->egid = p->egid;
     child->sgid = p->sgid;
+    child->fsgid = p->fsgid;
 
     memcpy(child->cwd, p->cwd, sizeof(p->cwd));
 
@@ -840,7 +843,8 @@ uint64_t sys_setuid_impl(uint64_t uid) {
         return (uint64_t)-EPERM;
     }
 
-    if (p->fd_table) p->fd_table->uid = p->euid;
+    p->fsuid = p->euid;
+    if (p->fd_table) p->fd_table->uid = p->fsuid;
 
     return 0;
 }
@@ -861,7 +865,8 @@ uint64_t sys_setgid_impl(uint64_t gid) {
         return (uint64_t)-EPERM;
     }
 
-    if (p->fd_table) p->fd_table->gid = p->egid;
+    p->fsgid = p->egid;
+    if (p->fd_table) p->fd_table->gid = p->fsgid;
 
     return 0;
 }
@@ -1095,9 +1100,15 @@ uint64_t sys_getresgid(uint32_t *rgid, uint32_t *egid, uint32_t *sgid) {
 #define PR_GET_NAME       16
 #define PR_CAPBSET_READ   23
 #define PR_CAPBSET_DROP   24
+#define PR_SET_NO_NEW_PRIVS 38
+#define PR_GET_NO_NEW_PRIVS 39
+#define PR_CAP_AMBIENT 47
+#define PR_CAP_AMBIENT_IS_SET 1
+#define PR_CAP_AMBIENT_RAISE 2
+#define PR_CAP_AMBIENT_LOWER 3
+#define PR_CAP_AMBIENT_CLEAR_ALL 4
 
 uint64_t sys_prctl_impl(uint64_t option, uint64_t arg2, uint64_t arg3, uint64_t arg4, uint64_t arg5) {
-    (void)arg3; (void)arg4; (void)arg5;
     process_t *p = get_current_process();
     if (!p) return (uint64_t)-ESRCH;
 
@@ -1135,6 +1146,36 @@ uint64_t sys_prctl_impl(uint64_t option, uint64_t arg2, uint64_t arg3, uint64_t 
             return 1;
         case PR_SET_DUMPABLE:
             return 0;
+        case PR_SET_NO_NEW_PRIVS:
+            if (arg2 != 1 || arg3 || arg4 || arg5) return (uint64_t)-EINVAL;
+            p->no_new_privs = true;
+            return 0;
+        case PR_GET_NO_NEW_PRIVS:
+            if (arg2 || arg3 || arg4 || arg5) return (uint64_t)-EINVAL;
+            return p->no_new_privs ? 1 : 0;
+        case PR_CAP_AMBIENT:
+            if (arg4 || arg5) return (uint64_t)-EINVAL;
+            if (arg2 == PR_CAP_AMBIENT_CLEAR_ALL) {
+                if (arg3) return (uint64_t)-EINVAL;
+                p->cap_ambient = 0;
+                return 0;
+            }
+            if (arg3 > 63 || !(BOLDON_CAP_SUPPORTED & (1ULL << arg3)))
+                return (uint64_t)-EINVAL;
+            if (arg2 == PR_CAP_AMBIENT_IS_SET)
+                return (p->cap_ambient >> arg3) & 1U;
+            if (arg2 == PR_CAP_AMBIENT_LOWER) {
+                p->cap_ambient &= ~(1ULL << arg3);
+                return 0;
+            }
+            if (arg2 == PR_CAP_AMBIENT_RAISE) {
+                uint64_t bit = 1ULL << arg3;
+                if (!(p->cap_permitted & bit) || !(p->cap_inheritable & bit))
+                    return (uint64_t)-EPERM;
+                p->cap_ambient |= bit;
+                return 0;
+            }
+            return (uint64_t)-EINVAL;
         case PR_CAPBSET_READ:
             if (arg2 > 63) return (uint64_t)-EINVAL;
             return (p->cap_bounding >> arg2) & 1U;
@@ -1157,11 +1198,18 @@ uint64_t sys_setfsuid_impl(uint64_t fsuid_raw) {
     process_t *p = get_current_process();
     if (!p) return 0;
 
-    uint32_t old_fsuid = p->euid;
+    uint32_t old_fsuid = p->fsuid;
     uint32_t new_fsuid = (uint32_t)fsuid_raw;
 
-    if (new_fsuid == p->uid || new_fsuid == p->euid || p->euid == 0) {
-        p->euid = new_fsuid;
+    if (new_fsuid == p->uid || new_fsuid == p->euid ||
+        new_fsuid == p->suid || new_fsuid == p->fsuid ||
+        (p->cap_effective & BOLDON_CAP_SETUID)) {
+        p->fsuid = new_fsuid;
+        if (old_fsuid == 0 && new_fsuid != 0)
+            p->cap_effective &= ~BOLDON_CAP_DAC_OVERRIDE;
+        else if (old_fsuid != 0 && new_fsuid == 0)
+            p->cap_effective |= p->cap_permitted & BOLDON_CAP_DAC_OVERRIDE;
+        if (p->fd_table) p->fd_table->uid = new_fsuid;
     }
 
     return (uint64_t)old_fsuid;
@@ -1171,11 +1219,14 @@ uint64_t sys_setfsgid_impl(uint64_t fsgid_raw) {
     process_t *p = get_current_process();
     if (!p) return 0;
 
-    uint32_t old_fsgid = p->egid;
+    uint32_t old_fsgid = p->fsgid;
     uint32_t new_fsgid = (uint32_t)fsgid_raw;
 
-    if (new_fsgid == p->gid || new_fsgid == p->egid || p->euid == 0) {
-        p->egid = new_fsgid;
+    if (new_fsgid == p->gid || new_fsgid == p->egid ||
+        new_fsgid == p->sgid || new_fsgid == p->fsgid ||
+        (p->cap_effective & BOLDON_CAP_SETGID)) {
+        p->fsgid = new_fsgid;
+        if (p->fd_table) p->fd_table->gid = new_fsgid;
     }
 
     return (uint64_t)old_fsgid;

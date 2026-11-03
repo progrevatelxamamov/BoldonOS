@@ -107,7 +107,8 @@ Could not create full-duplex pipe`: вызов 53 — `socketpair`, **не** `pi
 в рамках событий VFS. VFS/ext4 теперь выдаёт парные MOVED_FROM/TO
 с общим cookie для `rename(82)`/`renameat(264)` и IN_MOVE_SELF; замена
 существующего имени при rename и относительные пути с dirfd пока не
-реализованы. На umount наблюдения снимаются с IN_UNMOUNT/IN_IGNORED.
+реализованы. `renameat2(316)` работает при `flags=0`; иные флаги
+возвращают ENOSYS. `FIONREAD` сообщает число байт в очереди inotify. На umount наблюдения снимаются с IN_UNMOUNT/IN_IGNORED.
 Ограничение — 64 watch и 64 события на экземпляр. `pidfd_open` (434) теперь выдаёт FD с готовностью `poll`
 при завершении или сборке процесса (без `pidfd_send_signal`/`waitid(P_PIDFD)`).
 `capget` (125) и `capset` (126) поддерживают версии Linux v1/v2/v3 и
@@ -116,9 +117,12 @@ DAC_OVERRIDE, SETUID, SETGID, SETPCAP. Наборы permitted/effective/inherita
 bounding и ambient хранятся в процессе и наследуются при fork;
 `PR_CAPBSET_READ/DROP` управляют bounding set. При exec без file capabilities
 root получает ограничение bounding, обычный процесс — ambient. **Это ещё не
-полная модель Linux capabilities**: нет file capability xattrs, namespace,
-`PR_CAP_AMBIENT`, разделения credentials по потокам и проверок capabilities
-для всех операций ядра. Предупреждение Qt об ANSI locale
+полная модель Linux capabilities**: нет file capability xattrs, namespaces,
+разделения credentials по потокам и проверок capabilities для всех операций
+ядра. `PR_CAP_AMBIENT` (raise/lower/query/clear) и `PR_SET/GET_NO_NEW_PRIVS`
+работают для поддерживаемых прав; fsuid/fsgid отделены от euid/egid.
+Безопасность остальных привилегированных операций не следует выводить из
+одного только успешного `capset`. Предупреждение Qt об ANSI locale
 отдельно от сбоев D-Bus; `LANG=C.UTF-8` убирает его, но не создаёт DRM/KMS.
 
 ### Если Xorg ждёт без журнала

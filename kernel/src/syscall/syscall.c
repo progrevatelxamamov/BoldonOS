@@ -244,6 +244,8 @@ uint64_t osdev_syscall_handler(uint64_t num,
     case SYS_CLOSE_RANGE: return sys_close_range_impl(a1, a2, a3);
     case SYS_RENAME: return sys_renameat_impl((uint64_t)-100, a1, (uint64_t)-100, a2);
     case SYS_RENAMEAT: return sys_renameat_impl(a1, a2, a3, a4);
+    case SYS_RENAMEAT2: return a5 ? (uint64_t)-ENOSYS :
+                               sys_renameat_impl(a1, a2, a3, a4);
     case SYS_PIDFD_OPEN: return sys_pidfd_open_impl(a1, a2);
     case SYS_CAPGET: return sys_capget_impl(a1, a2);
     case SYS_CAPSET: return sys_capset_impl(a1, a2);

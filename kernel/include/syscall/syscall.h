@@ -147,6 +147,7 @@
 #define SYS_SPLICE      275
 #define SYS_EVENTFD2    290
 #define SYS_PRLIMIT64   302
+#define SYS_RENAMEAT2   316
 #define SYS_MEMFD_CREATE 319
 #define SYS_STATX       332
 #define SYS_MOUNT       165
