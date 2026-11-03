@@ -1,4 +1,5 @@
 #include <fs/vfs.h>
+#include <fs/inotify.h>
 #include <mm/malloc.h>
 #include <memory.h>
 #include <gconsole.h>
@@ -459,12 +460,19 @@ int vfs_check_access(vfs_node_t *node, uint32_t uid, uint32_t gid, int req_perms
 
 vfs_file_t *vfs_open(const char *path, uint32_t flags) {
     vfs_node_t *node = vfs_resolve_path(path);
+    bool created = false;
+    vfs_node_t *create_parent = NULL;
+    char created_name[256] = {0};
 
     if (!node && (flags & VFS_O_CREAT)) {
         char filename[256];
         vfs_node_t *parent = vfs_resolve_path_ext(path, true, filename);
         if (parent && parent->ops && parent->ops->create) {
-            parent->ops->create(parent, filename, 0644, &node);
+            if (parent->ops->create(parent, filename, 0644, &node) == 0 && node) {
+                created = true;
+                create_parent = parent;
+                strncpy(created_name, filename, sizeof(created_name) - 1);
+            }
         }
     }
 
@@ -488,21 +496,27 @@ vfs_file_t *vfs_open(const char *path, uint32_t flags) {
 
     if ((flags & VFS_O_TRUNC) && node->size > 0 && node->file_ops && node->file_ops->write) {
         node->size = 0;
+        inotify_vfs_event(node, IN_MODIFY, NULL);
     }
-
+    if (created) inotify_vfs_event(create_parent, IN_CREATE, created_name);
+    inotify_vfs_event(node, IN_OPEN, NULL);
     return file;
 }
 
 int vfs_read(vfs_file_t *file, void *buf, uint64_t count) {
     if (!file || !file->node || !file->node->file_ops || !file->node->file_ops->read)
         return -1;
-    return file->node->file_ops->read(file, buf, count);
+    int result = file->node->file_ops->read(file, buf, count);
+    if (result > 0) inotify_vfs_event(file->node, IN_ACCESS, NULL);
+    return result;
 }
 
 int vfs_write(vfs_file_t *file, const void *buf, uint64_t count) {
     if (!file || !file->node || !file->node->file_ops || !file->node->file_ops->write)
         return -1;
-    return file->node->file_ops->write(file, buf, count);
+    int result = file->node->file_ops->write(file, buf, count);
+    if (result > 0) inotify_vfs_event(file->node, IN_MODIFY, NULL);
+    return result;
 }
 
 int vfs_readdir(vfs_file_t *file, vfs_dirent_t *dirent) {
@@ -518,6 +532,9 @@ int vfs_close(vfs_file_t *file) {
         return 0;
     }
 
+    if (file->node && file->node->type == VFS_TYPE_FILE)
+        inotify_vfs_event(file->node,
+            (file->flags & VFS_O_WRITE) ? IN_CLOSE_WRITE : IN_CLOSE_NOWRITE, NULL);
     int res = 0;
     if (file->node && file->node->file_ops && file->node->file_ops->close) {
         res = file->node->file_ops->close(file);
@@ -565,18 +582,21 @@ int vfs_stat(const char *path, vfs_stat_t *st) {
 int vfs_chmod(const char *path, uint32_t mode) {
     vfs_node_t *node = vfs_resolve_path(path);
     if (!node) return -1;
-    if (node->ops && node->ops->chmod) return node->ops->chmod(node, mode);
-    node->mode = mode;
-    return 0;
+    int result = 0;
+    if (node->ops && node->ops->chmod) result = node->ops->chmod(node, mode);
+    else node->mode = mode;
+    if (!result) inotify_vfs_event(node, IN_ATTRIB, NULL);
+    return result;
 }
 
 int vfs_chown(const char *path, uint32_t uid, uint32_t gid) {
     vfs_node_t *node = vfs_resolve_path(path);
     if (!node) return -1;
-    if (node->ops && node->ops->chown) return node->ops->chown(node, uid, gid);
-    node->uid = uid;
-    node->gid = gid;
-    return 0;
+    int result = 0;
+    if (node->ops && node->ops->chown) result = node->ops->chown(node, uid, gid);
+    else { node->uid = uid; node->gid = gid; }
+    if (!result) inotify_vfs_event(node, IN_ATTRIB, NULL);
+    return result;
 }
 
 int vfs_copy_file(const char *src_path, const char *dst_path) {
@@ -619,7 +639,9 @@ int vfs_mkdir(const char *path, uint32_t mode) {
     if (parent->type != VFS_TYPE_DIR) return -ENOTDIR;
 
     if (parent->ops && parent->ops->mkdir) {
-        return parent->ops->mkdir(parent, dirname, mode);
+        int result = parent->ops->mkdir(parent, dirname, mode);
+        if (!result) inotify_vfs_event(parent, IN_CREATE | IN_ISDIR, dirname);
+        return result;
     }
 
     return -EROFS;
@@ -639,7 +661,12 @@ int vfs_unlink(const char *path) {
     if (parent->type != VFS_TYPE_DIR) return -ENOTDIR;
 
     if (parent->ops && parent->ops->unlink) {
-        return parent->ops->unlink(parent, filename);
+        int result = parent->ops->unlink(parent, filename);
+        if (!result) {
+            inotify_vfs_event(parent, IN_DELETE, filename);
+            inotify_vfs_event(node, IN_DELETE_SELF, NULL);
+        }
+        return result;
     }
 
     return -EROFS;
@@ -657,7 +684,12 @@ int vfs_rmdir(const char *path) {
     if (!parent) return -ENOENT;
 
     if (parent->ops && parent->ops->rmdir) {
-        return parent->ops->rmdir(parent, filename);
+        int result = parent->ops->rmdir(parent, filename);
+        if (!result) {
+            inotify_vfs_event(parent, IN_DELETE | IN_ISDIR, filename);
+            inotify_vfs_event(node, IN_DELETE_SELF, NULL);
+        }
+        return result;
     }
 
     return -EROFS;
@@ -723,7 +755,12 @@ int vfs_link(const char *oldpath, const char *newpath) {
     if (parent->type != VFS_TYPE_DIR) return -ENOTDIR;
 
     if (parent->ops && parent->ops->link) {
-        return parent->ops->link(parent, old_node, filename);
+        int result = parent->ops->link(parent, old_node, filename);
+        if (!result) {
+            inotify_vfs_event(parent, IN_CREATE, filename);
+            inotify_vfs_event(old_node, IN_ATTRIB, NULL);
+        }
+        return result;
     }
 
     return 0;
@@ -732,12 +769,12 @@ int vfs_link(const char *oldpath, const char *newpath) {
 int vfs_fchmod(vfs_file_t *file, uint32_t mode) {
     if (!file || !file->node) return -EBADF;
 
-    if (file->node->ops && file->node->ops->chmod) {
-        return file->node->ops->chmod(file->node, mode);
-    }
-
-    file->node->mode = mode;
-    return 0;
+    int result = 0;
+    if (file->node->ops && file->node->ops->chmod)
+        result = file->node->ops->chmod(file->node, mode);
+    else file->node->mode = mode;
+    if (!result) inotify_vfs_event(file->node, IN_ATTRIB, NULL);
+    return result;
 }
 
 int sys_ioctl(process_fd_table_t *table, int fd, uint64_t request, void *arg) {
