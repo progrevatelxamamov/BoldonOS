@@ -214,8 +214,8 @@ uint64_t sys_lseek_impl(uint64_t fd, uint64_t offset, uint64_t whence) {
 }
 
 uint64_t sys_poll_impl(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout) {
-    if (nfds == 0) return 0;
-    if (!user_range_ok(fds_ptr, nfds * sizeof(struct pollfd)))
+    if (nfds > VFS_MAX_FD) return (uint64_t)-EINVAL;
+    if (nfds && !user_range_ok(fds_ptr, nfds * sizeof(struct pollfd)))
         return (uint64_t)-EFAULT;
 
     process_t *p = get_current_process();
@@ -229,7 +229,12 @@ uint64_t sys_poll_impl(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout) {
         for (uint64_t i = 0; i < nfds; i++) {
             fds[i].revents = 0;
             int fd = fds[i].fd;
-            if (fd < 0 || fd >= VFS_MAX_FD || !p->fd_table->fds[fd]) continue;
+            if (fd < 0) continue; /* Linux ignores negative descriptors. */
+            if (fd >= VFS_MAX_FD || !p->fd_table->fds[fd]) {
+                fds[i].revents = 0x20; /* POLLNVAL (Linux ABI) */
+                ready++;
+                continue;
+            }
 
             vfs_file_t *file = p->fd_table->fds[fd];
             short rev = 0;
@@ -251,11 +256,46 @@ uint64_t sys_poll_impl(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout) {
             if (rev) { fds[i].revents = rev; ready++; }
         }
         if (ready > 0) return (uint64_t)ready;
+        if (p->sigpending & ~p->sigmask) return (uint64_t)-EINTR;
         if (timeout == 0) return 0;
         if (timeout != (uint64_t)-1 && get_monotonic_ms() - start >= timeout)
             return 0;
         schedule_yield();
     }
+}
+
+uint64_t sys_ppoll_impl(uint64_t fds_ptr, uint64_t nfds, uint64_t ts_ptr,
+                        uint64_t sigmask_ptr, uint64_t sigsetsize) {
+    uint64_t timeout = (uint64_t)-1;
+    if (ts_ptr) {
+        if (!user_range_ok(ts_ptr, sizeof(struct linux_timespec)))
+            return (uint64_t)-EFAULT;
+        const struct linux_timespec *ts = (const struct linux_timespec *)ts_ptr;
+        if (ts->tv_sec < 0 || ts->tv_nsec < 0 || ts->tv_nsec >= 1000000000LL)
+            return (uint64_t)-EINVAL;
+        /* The kernel timer is millisecond-resolution; round UP so a
+           sub-millisecond ppoll never returns before its deadline. */
+        if ((uint64_t)ts->tv_sec > (INT64_MAX - 999) / 1000)
+            timeout = INT64_MAX;
+        else {
+            timeout = (uint64_t)ts->tv_sec * 1000 +
+                      ((uint64_t)ts->tv_nsec + 999999) / 1000000;
+        }
+    }
+    process_t *p = get_current_process();
+    if (!p) return (uint64_t)-ESRCH;
+    if (!sigmask_ptr) return sys_poll_impl(fds_ptr, nfds, timeout);
+    if (sigsetsize != sizeof(uint64_t)) return (uint64_t)-EINVAL;
+    if (!user_range_ok(sigmask_ptr, sizeof(uint64_t))) return (uint64_t)-EFAULT;
+
+    /* The current kernel tracks a process-wide mask. Restore it even on
+       timeout/error; a per-thread mask is required for full Linux parity. */
+    uint64_t previous = p->sigmask;
+    p->sigmask = *(const uint64_t *)sigmask_ptr &
+                 ~((1ULL << (9 - 1)) | (1ULL << (19 - 1))); /* KILL, STOP */
+    uint64_t result = sys_poll_impl(fds_ptr, nfds, timeout);
+    p->sigmask = previous;
+    return result;
 }
 
 uint64_t sys_fcntl_impl(uint64_t fd, uint64_t cmd, uint64_t arg) {

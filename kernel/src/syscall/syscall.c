@@ -59,6 +59,10 @@ extern uint64_t sys_fstat_impl(uint64_t, uint64_t);
 extern uint64_t sys_newfstatat_impl(uint64_t, uint64_t, uint64_t, uint64_t);
 extern uint64_t sys_statx_impl(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
 extern uint64_t sys_poll_impl(uint64_t, uint64_t, uint64_t);
+extern uint64_t sys_ppoll_impl(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+extern uint64_t sys_madvise_impl(uint64_t, uint64_t, uint64_t);
+extern uint64_t sys_sched_getaffinity_impl(uint64_t, uint64_t, uint64_t);
+extern uint64_t sys_getpeername_impl(uint64_t, uint64_t, uint64_t);
 extern uint64_t sys_fcntl_impl(uint64_t, uint64_t, uint64_t);
 extern uint64_t sys_lseek_impl(uint64_t, uint64_t, uint64_t);
 extern uint64_t sys_access_impl(uint64_t, uint64_t);
@@ -225,7 +229,11 @@ uint64_t osdev_syscall_handler(uint64_t num,
     case SYS_STAT:        return sys_stat_impl(a1, a2);
     case SYS_FSTAT:       return sys_fstat_impl(a1, a2);
     case SYS_LSTAT:       return sys_stat_impl(a1, a2);
-    case SYS_POLL:        return sys_poll_impl(a1, a2, a3);
+    case SYS_POLL:        return sys_poll_impl(a1, a2,
+                                (int32_t)a3 < 0 ? UINT64_MAX : (uint32_t)a3);
+    case SYS_PPOLL:       return sys_ppoll_impl(a1, a2, a3, a4, a5);
+    case SYS_MADVISE:     return sys_madvise_impl(a1, a2, a3);
+    case SYS_SCHED_GETAFFINITY: return sys_sched_getaffinity_impl(a1, a2, a3);
     case SYS_LSEEK:       return sys_lseek_impl(a1, a2, a3);
     case SYS_MMAP:        return sys_mmap_impl(a1, a2, a3, a4, a5, a6);
     case SYS_MPROTECT:    return sys_mprotect_impl(a1, a2, a3);
@@ -356,6 +364,7 @@ uint64_t osdev_syscall_handler(uint64_t num,
     case 49: return sys_bind_impl(a1, a2, a3);        /* SYS_BIND */
     case 50: return sys_listen_impl(a1, a2);          /* SYS_LISTEN */
     case 51: return sys_getsockname_impl(a1, a2, a3);  /* SYS_GETSOCKNAME */
+    case SYS_GETPEERNAME: return sys_getpeername_impl(a1, a2, a3);
     case 55: return sys_getsockopt_impl(a1, a2, a3, a4, a5); /* SYS_GETSOCKOPT */
     case 54: return sys_setsockopt_impl(a1, a2, a3, a4, a5); /* SYS_SETSOCKOPT */
     case 42: return sys_connect_impl(a1, a2, a3); /* SYS_CONNECT */

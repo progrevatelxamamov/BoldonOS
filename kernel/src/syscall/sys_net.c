@@ -108,6 +108,17 @@ uint64_t sys_getsockname_impl(uint64_t sockfd, uint64_t addr_ptr, uint64_t addrl
     return (uint64_t)res;
 }
 
+uint64_t sys_getpeername_impl(uint64_t sockfd, uint64_t addr_ptr, uint64_t addrlen_ptr) {
+    if (!addrlen_ptr || !user_range_ok(addrlen_ptr, sizeof(socklen_t)))
+        return (uint64_t)-EFAULT;
+    socklen_t len = *(socklen_t *)addrlen_ptr;
+    if (!addr_ptr || !user_range_ok(addr_ptr, len))
+        return (uint64_t)-EFAULT;
+    int res = sys_getpeername((int)sockfd, (struct sockaddr *)addr_ptr,
+                              (socklen_t *)addrlen_ptr);
+    return (uint64_t)(int64_t)res;
+}
+
 uint64_t sys_getsockopt_impl(uint64_t sockfd, uint64_t level, uint64_t optname, uint64_t optval_ptr, uint64_t optlen_ptr) {
     if (!optval_ptr || !optlen_ptr) return (uint64_t)-EFAULT;
     if (!user_range_ok(optlen_ptr, sizeof(socklen_t))) return (uint64_t)-EFAULT;
