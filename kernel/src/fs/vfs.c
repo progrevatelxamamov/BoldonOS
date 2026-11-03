@@ -34,6 +34,21 @@ static char boot_drive_letter = 'C';
 static void normalize_path_raw(const char *path, char *norm, size_t cap);
 static bool letter_is_root(char c);
 
+/* Writable executables must not keep file-granted privileges after their
+   contents change. Treat xattr I/O failures as a reason to refuse mutation. */
+static int vfs_drop_file_caps(vfs_node_t *node) {
+    if (!node || node->type != VFS_TYPE_FILE || !node->ops ||
+        !node->ops->getxattr) return 0;
+    uint8_t value[24];
+    int len = node->ops->getxattr(node, "security.capability", value, sizeof(value));
+    if (len == -ENODATA) return 0;
+    if (len < 0) return len;
+    if (!node->ops->removexattr) return -EOPNOTSUPP;
+    int result = node->ops->removexattr(node, "security.capability");
+    if (!result) inotify_vfs_event(node, IN_ATTRIB, NULL);
+    return result == -ENODATA ? 0 : result;
+}
+
 void vfs_init(void) {
     memset(drives, 0, sizeof(drives));
     memset(fs_types, 0, sizeof(fs_types));
@@ -498,6 +513,7 @@ vfs_file_t *vfs_open(const char *path, uint32_t flags) {
     }
 
     if (!node) return NULL;
+    if ((flags & VFS_O_TRUNC) && vfs_drop_file_caps(node)) return NULL;
 
     vfs_file_t *file = malloc_alloc(sizeof(vfs_file_t));
     if (!file) return NULL;
@@ -536,6 +552,10 @@ int vfs_write(vfs_file_t *file, const void *buf, uint64_t count) {
     if (!file || !file->node || !file->node->file_ops || !file->node->file_ops->write)
         return -1;
     if (!(file->flags & VFS_O_WRITE)) return -EBADF;
+    if (count) {
+        int drop = vfs_drop_file_caps(file->node);
+        if (drop) return drop;
+    }
     int result = file->node->file_ops->write(file, buf, count);
     if (result > 0) inotify_vfs_event(file->node, IN_MODIFY, NULL);
     return result;
