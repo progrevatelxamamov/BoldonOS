@@ -129,7 +129,9 @@ DAC_OVERRIDE, FOWNER, KILL, SETUID, SETGID, SETPCAP, SETFCAP, SYS_ADMIN, SYS_BOO
 как у основного ELF/скрипта, так и у ELF-интерпретатора. Rename двух имён
 одного inode — no-op, замена другого inode остаётся отклонённой.
 Chmod требует владельца или FOWNER, mount/umount — SYS_ADMIN,
-reboot — SYS_BOOT, чужой SIGINT — KILL. Наборы permitted/effective/inheritable,
+reboot — SYS_BOOT, чужой SIGINT — KILL; `KDSETMODE` на консольном
+символьном устройстве теперь требует SYS_ADMIN, поскольку меняет владельца
+общего framebuffer. Наборы permitted/effective/inheritable,
 bounding и ambient хранятся в процессе и наследуются при fork;
 `PR_CAPBSET_READ/DROP` управляют bounding set. На ext4 ELF теперь читается
 `security.capability` (Linux v1/v2/v3, v3 только rootid=0); неизвестные права

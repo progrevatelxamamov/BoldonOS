@@ -193,6 +193,7 @@ uint64_t sys_munmap_impl(uint64_t addr, uint64_t len) {
 
 uint64_t sys_access_impl(uint64_t path, uint64_t mode) {
     if (!path || !user_range_ok(path, 1)) return (uint64_t)-EFAULT;
+    if (mode & ~7ULL) return (uint64_t)-EINVAL;
 
     vfs_node_t *node = vfs_resolve_path((const char *)path);
     if (!node) return (uint64_t)-ENOENT;
@@ -624,6 +625,11 @@ uint64_t sys_mmap_impl(uint64_t addr, uint64_t len, uint64_t prot,
     return virt_addr;
 }
 
+static bool console_mode_allowed(process_t *p) {
+    return p && (p->is_kernel_process ||
+                 (p->cap_effective & BOLDON_CAP_SYS_ADMIN));
+}
+
 uint64_t sys_ioctl_impl(uint64_t a1, uint64_t a2, uint64_t a3) {
     process_t *p = get_current_process();
     if (!p || !p->fd_table) return (uint64_t)-EBADF;
@@ -635,6 +641,8 @@ uint64_t sys_ioctl_impl(uint64_t a1, uint64_t a2, uint64_t a3) {
     vfs_file_t *file = p->fd_table->fds[fd];
 
     if (file && file->node && file->node->type == VFS_TYPE_CHAR_DEV && a2 == 0x4B3A) {
+        /* This ioctl actually changes the shared framebuffer owner. */
+        if (!console_mode_allowed(p)) return (uint64_t)-EPERM;
         if (a3 == 2) {
             gconsole_acquire_framebuffer();
             return 0;
@@ -658,7 +666,8 @@ uint64_t sys_ioctl_impl(uint64_t a1, uint64_t a2, uint64_t a3) {
     }
 
     switch (a2) {
-        case 0x4B3A: /* KDSETMODE */
+        case 0x4B3A: /* KDSETMODE is only valid for the handled console char device */
+            return (uint64_t)-ENOTTY;
         case 0x4B3B: /* KDGETMODE */
         case 0x4B4B: /* KDGKBMODE */
         case 0x4B45: /* KDSKBMODE */
