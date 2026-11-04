@@ -11,6 +11,7 @@
 #include <disk/block.h>
 #include <disk/bcache.h>
 #include <scheduler/scheduler.h>
+#include <syscall/xorgtrace.h>
 #include <errno.h>
 #include <memory.h>
 #include <mm/vmm.h>
@@ -472,7 +473,21 @@ uint64_t sys_write_impl(uint64_t a1, uint64_t a2, uint64_t a3) {
     process_t *p = get_current_process();
     if (!p || !p->fd_table) return (uint64_t)-EBADF;
     if (!a2 || !user_range_ok(a2, a3)) return (uint64_t)-EFAULT;
-    return (uint64_t)(int64_t)sys_write(p->fd_table, (int)a1, (const void *)a2, a3);
+    int64_t result = sys_write(p->fd_table, (int)a1, (const void *)a2, a3);
+    /* dbus-run-session passes a pipe write fd to dbus-daemon for its bus
+       address. If that write fails, capture the descriptor state before the
+       daemon's subsequent fcntl scan overwrites the syscall ring. Do not
+       log the buffer or the address (which may contain sensitive data). */
+    if (result < 0 && p->trace_desktop && p->name &&
+        strcmp(p->name, "dbus-daemon") == 0) {
+        vfs_file_t *f = a1 < VFS_MAX_FD ? p->fd_table->fds[a1] : NULL;
+        uint64_t detail = ((a1 & 0xffffULL) << 48) |
+                          ((uint64_t)(f ? f->flags & 0xffffU : 0) << 32) |
+                          ((uint64_t)(f && f->node) << 31) |
+                          ((uint32_t)(-result));
+        xorgtrace_stage("dbus.write.fail", p->pid, detail);
+    }
+    return (uint64_t)result;
 }
 
 uint64_t sys_writev_impl(uint64_t a1, uint64_t a2, uint64_t a3) {
