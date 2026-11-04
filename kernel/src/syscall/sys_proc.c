@@ -12,6 +12,7 @@
 #include <memory.h>
 #include <errno.h>
 #include <cpu/time.h>
+#include <sys/random.h>
 
 #define IA32_FS_BASE 0xC0000100
 
@@ -91,11 +92,14 @@ uint64_t sys_geteuid_impl(void) { process_t *p = get_current_process(); return p
 uint64_t sys_getgid_impl(void)  { process_t *p = get_current_process(); return p ? p->gid  : 0; }
 uint64_t sys_getegid_impl(void) { process_t *p = get_current_process(); return p ? p->egid : 0; }
 
+static inline bool user_range_ok(uint64_t ptr, uint64_t len);
+
 uint64_t sys_getrandom_impl(uint64_t buf, uint64_t count, uint64_t flags) {
-    (void)flags;
-    if (!buf) return (uint64_t)-EFAULT;
-    uint8_t *p = (uint8_t *)buf;
-    for (uint64_t i = 0; i < count; i++) p[i] = (uint8_t)(i * 31 + 17);
+    /* GRND_NONBLOCK, GRND_RANDOM, GRND_INSECURE. Other bits are invalid. */
+    if (flags & ~7ULL) return (uint64_t)-EINVAL;
+    if (!count) return 0;
+    if (!user_range_ok(buf, count)) return (uint64_t)-EFAULT;
+    random_fill((void *)buf, count);
     return count;
 }
 

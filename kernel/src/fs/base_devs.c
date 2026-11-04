@@ -3,7 +3,7 @@
 #include <errno.h>
 #include <memory.h>
 #include <stdint.h>
-#include <cpu/time.h>
+#include <sys/random.h>
 
 static int null_read(vfs_file_t *f, void *buf, uint64_t count) {
     (void)f; (void)buf; (void)count;
@@ -28,18 +28,11 @@ static int zero_write(vfs_file_t *f, const void *buf, uint64_t count) {
     return (int)count;
 }
 
-static uint32_t rng_state = 0;
-
 static int urandom_read(vfs_file_t *f, void *buf, uint64_t count) {
     (void)f;
-    rng_state = (uint32_t)get_unix_time() / 2;
-    if (!buf) return -EFAULT;
-
-    uint8_t *p = (uint8_t *)buf;
-    for (uint64_t i = 0; i < count; i++) {
-        rng_state = rng_state * 1103515245 + 12345;
-        p[i] = (uint8_t)(rng_state >> 16);
-    }
+    if (!buf && count) return -EFAULT;
+    if (count > 0x7fffffffU) count = 0x7fffffffU;
+    random_fill(buf, count);
     return (int)count;
 }
 

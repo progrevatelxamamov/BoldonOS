@@ -29,6 +29,11 @@ int main(void) {
     result("capget", syscall(SYS_capget, &hdr, caps), 0);
     if (!(caps[0].effective & (1U << 31))) failed++;
 
+    unsigned char random_a[16], random_b[16];
+    result("getrandom first", syscall(SYS_getrandom, random_a, sizeof(random_a), 0), 16);
+    result("getrandom second", syscall(SYS_getrandom, random_b, sizeof(random_b), 0), 16);
+    if (!memcmp(random_a, random_b, sizeof(random_a))) failed++;
+
     int fd = syscall(SYS_inotify_init1, IN_NONBLOCK);
     if (fd < 0) failed++;
     int wd = syscall(SYS_inotify_add_watch, fd, "/tmp", IN_CREATE | IN_MOVED_TO);
