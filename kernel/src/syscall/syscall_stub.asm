@@ -80,15 +80,18 @@ syscall_entry_stub:
     ; КРИТИЧЕСКАЯ СЕКЦИЯ: Запрещаем прерывания перед сменой стека и GS!
     cli
 
+    ; r10 is not clobbered by the Linux syscall ABI. Temporarily save the
+    ; return value instead of overwriting a restored userspace register.
+    push rax
+    mov ax, 0x1B
+    mov ds, ax
+    mov es, ax
+    pop rax
+
     pop rcx                   ; RIP пользователя -> в RCX (для SYSRET)
     add rsp, 8                ; Пропускаем CS (0x23)
     pop r11                   ; RFLAGS пользователя -> в R11 (для SYSRET)
     pop rsp                   ; RSP пользователя -> в RSP
-
-    ; Устанавливаем пользовательские сегменты DS и ES:
-    mov r10, 0x1B
-    mov ds, r10w
-    mov es, r10w
 
     swapgs                    ; Возвращаем User GS
     o64 sysret                  ; Безопасный возврат в Ring 3 (автоматически включит IF)

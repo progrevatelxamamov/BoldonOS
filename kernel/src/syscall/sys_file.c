@@ -393,10 +393,27 @@ uint64_t sys_newfstatat_impl(uint64_t dirfd, uint64_t path,
     char kpath[512];
     if (!statbuf || !user_range_ok(statbuf, sizeof(struct linux_stat)) ||
         copy_str_from_user(kpath, path, sizeof(kpath))) return (uint64_t)-EFAULT;
-    if ((int32_t)dirfd != -100 && kpath[0] != '/') return (uint64_t)-ENOSYS;
-    if (flags & ~0x100ULL) return (uint64_t)-ENOSYS;
-    vfs_node_t *node = flags & 0x100 /* AT_SYMLINK_NOFOLLOW */ ?
-        vfs_resolve_path_nofollow(kpath) : vfs_resolve_path(kpath);
+    /* Linux accepts AT_NO_AUTOMOUNT (a no-op on modern kernels), and libc
+       uses AT_EMPTY_PATH to implement fstat on an existing descriptor. */
+    if (flags & ~(0x100ULL | 0x800ULL | 0x1000ULL)) return (uint64_t)-EINVAL;
+    vfs_node_t *node;
+    if (!kpath[0]) {
+        if (!(flags & 0x1000)) return (uint64_t)-ENOENT;
+        if ((int32_t)dirfd == -100) {
+            node = vfs_resolve_path(".");
+        } else {
+            process_t *p = get_current_process();
+            int fd = (int32_t)dirfd;
+            if (!p || !p->fd_table || fd < 0 || fd >= VFS_MAX_FD ||
+                !p->fd_table->fds[fd] || !p->fd_table->fds[fd]->node)
+                return (uint64_t)-EBADF;
+            node = p->fd_table->fds[fd]->node;
+        }
+    } else {
+        if ((int32_t)dirfd != -100 && kpath[0] != '/') return (uint64_t)-ENOSYS;
+        node = flags & 0x100 /* AT_SYMLINK_NOFOLLOW */ ?
+            vfs_resolve_path_nofollow(kpath) : vfs_resolve_path(kpath);
+    }
     if (!node) return (uint64_t)-ENOENT;
     fill_linux_stat(node, (struct linux_stat *)statbuf);
     return 0;
