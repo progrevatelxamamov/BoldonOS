@@ -9,6 +9,7 @@ printf '%s\n' '=== BoldonOS guest diagnostic begin ==='
 printf 'pid=%s\n' "$$"
 
 probe="/tmp/boldon-io-$$.txt"
+io_ok=0
 if [ ! -d /tmp ]; then
     printf '%s\n' 'IO SKIP: /tmp does not exist (not treating this as a write failure)'
 else
@@ -21,13 +22,20 @@ else
         printf 'IO read_rc=%s content=<%s>\n' "$read_rc" "$content"
         if [ "$read_rc" -eq 0 ] && [ "$content" = "BOLDON_IO_$$" ]; then
             printf '%s\n' 'IO PASS: write, close and reopen/read'
+            io_ok=1
         else
             printf '%s\n' 'IO FAIL: file is empty, different, or unreadable'
         fi
     else
         printf '%s\n' 'IO FAIL: shell could not write temporary file'
     fi
-    rm -f "$probe"
+    # Do not launch rm (or any more commands from disk) on a failed I/O test.
+    if [ "$io_ok" -eq 1 ]; then rm -f "$probe"; fi
+fi
+
+if [ "$io_ok" -ne 1 ]; then
+    printf '%s\n' 'STOP: file I/O did not pass; do not launch D-Bus from this script.'
+    exit 1
 fi
 
 printf '%s\n' '=== baseline tools ==='
@@ -39,8 +47,10 @@ for tool in dbus-run-session dbus-daemon timeout startplasma-wayland; do
     fi
 done
 
-printf '%s\n' '=== D-Bus wrapper (bounded observation) ==='
-if command -v timeout >/dev/null 2>&1 && command -v dbus-run-session >/dev/null 2>&1; then
+printf '%s\n' '=== D-Bus wrapper (opt-in; skipped by default) ==='
+if [ "${RUN_DBUS_PROBE:-0}" = 1 ] &&
+   command -v timeout >/dev/null 2>&1 &&
+   command -v dbus-run-session >/dev/null 2>&1; then
     # Do not redirect the daemon's stdout into a second file: it would mask
     # whether the wrapper's inherited pipe or ordinary file I/O is failing.
     # Keep the test in the background: timeout itself may not be able to
@@ -57,7 +67,7 @@ if command -v timeout >/dev/null 2>&1 && command -v dbus-run-session >/dev/null 
         printf 'DBUS wrapper_rc=%s (124 means timeout)\n' "$?"
     fi
 else
-    printf '%s\n' 'DBUS SKIP: timeout or dbus-run-session is unavailable'
+    printf '%s\n' 'DBUS SKIP: disabled by default (or required tools missing)'
 fi
 
 printf '%s\n' '=== recent guest syscall trace ==='
