@@ -141,7 +141,7 @@ void launch_init_process(void) {
     create_task_kernel((void *)pty_input_task, "pty-input");
 
     /* Переменные окружения для старта init-скрипта */
-    char *argv[] = { "/bin/sh", "/etc/init.sh", NULL };
+    char *argv[] = { "/bin/sh", NULL };
     char *envp[] = {
         "PATH=/bin:/usr/bin:/sbin:/usr/sbin",
         "HOME=/root",
