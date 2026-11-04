@@ -814,7 +814,7 @@ int vfs_link(const char *oldpath, const char *newpath) {
         return result;
     }
 
-    return 0;
+    return -EROFS;
 }
 
 int vfs_rename(const char *oldpath, const char *newpath) {
@@ -837,11 +837,17 @@ int vfs_rename(const char *oldpath, const char *newpath) {
     if (existing) {
         if (existing->mount == moved->mount && existing->inode_num &&
             existing->inode_num == moved->inode_num) return 0;
-        return -EEXIST;
+        if (existing->type == VFS_TYPE_DIR && moved->type != VFS_TYPE_DIR)
+            return -EISDIR;
+        if (existing->type != VFS_TYPE_DIR && moved->type == VFS_TYPE_DIR)
+            return -ENOTDIR;
     }
     if (!from->ops || !from->ops->rename) return -ENOSYS;
     int result = from->ops->rename(from, old_name, to, new_name);
-    if (!result) inotify_vfs_move(from, old_name, to, new_name, moved);
+    if (!result) {
+        if (existing) inotify_vfs_event(existing, IN_DELETE_SELF, NULL);
+        inotify_vfs_move(from, old_name, to, new_name, moved);
+    }
     return result;
 }
 

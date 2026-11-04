@@ -1016,9 +1016,19 @@ int ext4_xattr_get(struct ext4_inode_ref *inode_ref, uint8_t name_index,
 		*data_len = 0;
 
 	ibody_finder.i = i;
-	ret = ext4_xattr_ibody_find_entry(inode_ref, &ibody_finder);
-	if (ret != EOK)
-		goto out;
+	/* An inode with extra space need not have an in-inode xattr header.
+	 * mke2fs leaves that area zero until the first attribute is written.
+	 * The setter initializes the header, but a read must treat its absence
+	 * as an empty ibody rather than an I/O error (notably on execve). */
+	if (ext4_inode_get_extra_isize(&fs->sb, inode_ref->inode) &&
+	    EXT4_XATTR_IHDR(&fs->sb, inode_ref->inode)->h_magic == 0) {
+		memset(&ibody_finder.s, 0, sizeof(ibody_finder.s));
+		ibody_finder.s.not_found = true;
+	} else {
+		ret = ext4_xattr_ibody_find_entry(inode_ref, &ibody_finder);
+		if (ret != EOK)
+			goto out;
+	}
 
 	if (!ibody_finder.s.not_found) {
 		value_len = to_le32(ibody_finder.s.here->e_value_size);

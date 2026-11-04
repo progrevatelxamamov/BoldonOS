@@ -373,6 +373,10 @@ static vfs_node_t *ext4_vfs_op_lookup(vfs_node_t *dir, const char *name) {
     node->inode_num = ino;
     node->size = size;
     node->mode = mode;
+    if (ext4_owner_get(p_path, &node->uid, &node->gid) != EOK) {
+        malloc_free(node);
+        return NULL;
+    }
     node->refcount = 1;
     node->mount = dir->mount;
     node->ops = &g_ext4_node_ops;
@@ -749,6 +753,16 @@ vfs_mount_t *ext4_vfs_mount(const char *device, void *data) {
         return NULL;
     }
     (void)ext4_mount_setup_locks(dev->mount_path, &ext4_os_locks);
+    /* Enable the on-disk journal so multi-metadata operations such as
+       replace-rename can commit as one transaction. */
+    r = ext4_journal_start(dev->mount_path);
+    if (r != EOK) {
+        ext4_umount(dev->mount_path);
+        ext4_device_unregister(dev->mp_name);
+        dev->used = false;
+        g_ext4_count--;
+        return NULL;
+    }
 
     vfs_mount_t *mnt = malloc_alloc(sizeof(vfs_mount_t));
     if (!mnt) return NULL;
@@ -763,6 +777,14 @@ vfs_mount_t *ext4_vfs_mount(const char *device, void *data) {
     strncpy(root->name, "", 255);
     root->inode_num = 2;
     root->type = VFS_TYPE_DIR;
+    /* Path traversal checks search permission on the mount root before
+       looking up its first component. Populate its on-disk credentials. */
+    if (ext4_mode_get("/", &root->mode) != EOK ||
+        ext4_owner_get("/", &root->uid, &root->gid) != EOK) {
+        malloc_free(root);
+        malloc_free(mnt);
+        return NULL;
+    }
     root->refcount = 1;
     root->mount = mnt;
     root->ops = &g_ext4_node_ops;
@@ -813,6 +835,7 @@ int ext4_vfs_unmount(vfs_mount_t *mnt) {
     if (!dev->used) return 0;
 
     ext4_cache_flush(dev->mount_path);
+    ext4_journal_stop(dev->mount_path);
     ext4_umount(dev->mount_path);
     ext4_device_unregister(dev->mp_name);
 

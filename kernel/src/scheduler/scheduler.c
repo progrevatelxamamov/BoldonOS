@@ -182,6 +182,12 @@ process_t* create_task_kernel_arg(void *addr, uint64_t arg, const char *name) {
     proc->pml4              = get_kernel_pml4();
     proc->is_kernel_process = true;
     proc->state             = TASK_WAITING;
+    /* Kernel-created init enters userspace through execve. Give it the
+       same initial bounding set as a root user task so the exec transition
+       does not silently strip every capability, including CAP_SETFCAP. */
+    proc->cap_bounding = BOLDON_CAP_SUPPORTED;
+    proc->cap_permitted = BOLDON_CAP_SUPPORTED;
+    proc->cap_effective = BOLDON_CAP_SUPPORTED;
     t->is_kernel            = true;
 
     if (!tasks_insert(proc)) {
