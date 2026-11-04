@@ -551,13 +551,20 @@ int vfs_read(vfs_file_t *file, void *buf, uint64_t count) {
 int vfs_write(vfs_file_t *file, const void *buf, uint64_t count) {
     if (!file || !file->node || !file->node->file_ops || !file->node->file_ops->write)
         return -1;
+    vfs_node_t *node = file->node;
     if (!(file->flags & VFS_O_WRITE)) return -EBADF;
     if (count) {
-        int drop = vfs_drop_file_caps(file->node);
+        int drop = vfs_drop_file_caps(node);
         if (drop) return drop;
     }
-    int result = file->node->file_ops->write(file, buf, count);
-    if (result > 0) inotify_vfs_event(file->node, IN_MODIFY, NULL);
+    /* Dropping file capabilities may perform filesystem I/O and yield. Do
+       not dispatch a write through a node that changed or disappeared while
+       that work was in progress. Full concurrent-close safety also needs
+       descriptor lifetime synchronization. */
+    if (file->node != node || !node->file_ops || !node->file_ops->write)
+        return -EBADF;
+    int result = node->file_ops->write(file, buf, count);
+    if (result > 0) inotify_vfs_event(node, IN_MODIFY, NULL);
     return result;
 }
 
