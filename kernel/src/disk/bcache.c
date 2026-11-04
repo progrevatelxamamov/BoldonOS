@@ -69,14 +69,17 @@ static bcache_entry_t *alloc_entry(const char *dev, uint64_t page_lba) {
 
     if (victim->valid && victim->dirty) {
         struct block_device *d = find_device(victim->dev_name);
-        if (d && d->write) {
-            d->write(d->local_device_struct, victim->page_lba, BCACHE_PAGE_SECTORS, victim->data);
-        }
+        if (!d || !d->write || d->write(d->local_device_struct,
+                                         victim->page_lba,
+                                         BCACHE_PAGE_SECTORS,
+                                         victim->data) != 0)
+            return NULL; /* never evict an unflushed dirty page */
         victim->dirty = false;
     }
 
     if (!victim->data) {
         void *phys = pmm_alloc_page();
+        if (!phys) return NULL;
         victim->data = (uint8_t *)((uint64_t)phys + get_bootinfo().hhdm->offset);
     }
 
@@ -108,11 +111,14 @@ int bcache_read(const char *dev_name, uint64_t lba, uint64_t count, void *buf) {
         bcache_entry_t *e = find_entry(dev_name, page_lba);
         if (!e) {
             e = alloc_entry(dev_name, page_lba);
+            if (!e) { spin_unlock_irqrestore(&bcache_lock, flags); return -1; }
             spin_unlock_irqrestore(&bcache_lock, flags);
-            
-            dev->read(dev->local_device_struct, page_lba, BCACHE_PAGE_SECTORS, e->data);
-            
+
+            int rc = dev->read(dev->local_device_struct, page_lba,
+                               BCACHE_PAGE_SECTORS, e->data);
+
             spin_lock_irqsave(&bcache_lock, &flags);
+            if (rc != 0) { spin_unlock_irqrestore(&bcache_lock, flags); return -1; }
             e->valid = true;
         }
 
@@ -147,15 +153,23 @@ int bcache_write(const char *dev_name, uint64_t lba, uint64_t count, void *buf) 
         bcache_entry_t *e = find_entry(dev_name, page_lba);
         if (!e) {
             e = alloc_entry(dev_name, page_lba);
+            if (!e) { spin_unlock_irqrestore(&bcache_lock, flags); return -1; }
             if (to_transfer < BCACHE_PAGE_SECTORS) {
                 spin_unlock_irqrestore(&bcache_lock, flags);
-                dev->read(dev->local_device_struct, page_lba, BCACHE_PAGE_SECTORS, e->data);
+                int rc = dev->read(dev->local_device_struct, page_lba,
+                                   BCACHE_PAGE_SECTORS, e->data);
                 spin_lock_irqsave(&bcache_lock, &flags);
+                if (rc != 0) { spin_unlock_irqrestore(&bcache_lock, flags); return -1; }
             }
         }
 
         memcpy(e->data + offset_in_page, in, to_transfer * dev->sector_size);
+        /* A write miss allocates an invalid entry. Publish it only after
+           the whole cache page is initialized (or its untouched sectors
+           were read above). Otherwise reads miss the write and flush skips
+           it entirely, silently losing filesystem metadata. */
         e->dirty = true;
+        e->valid = true;
 
         in += to_transfer * dev->sector_size;
         cur_lba += to_transfer;
@@ -175,8 +189,12 @@ int bcache_flush(const char *dev_name) {
 
     for (int i = 0; i < BCACHE_SLOTS; i++) {
         if (entries[i].valid && entries[i].dirty && my_strcmp(entries[i].dev_name, dev_name) == 0) {
-            if (dev->write) {
-                dev->write(dev->local_device_struct, entries[i].page_lba, BCACHE_PAGE_SECTORS, entries[i].data);
+            if (!dev->write || dev->write(dev->local_device_struct,
+                                           entries[i].page_lba,
+                                           BCACHE_PAGE_SECTORS,
+                                           entries[i].data) != 0) {
+                spin_unlock_irqrestore(&bcache_lock, flags);
+                return -1; /* retain dirty data for retry */
             }
             entries[i].dirty = false;
         }
@@ -184,9 +202,8 @@ int bcache_flush(const char *dev_name) {
 
     spin_unlock_irqrestore(&bcache_lock, flags);
 
-    if (dev->flush) {
-        dev->flush(dev->local_device_struct);
-    }
+    if (dev->flush && dev->flush(dev->local_device_struct) != 0)
+        return -1;
     return 0;
 }
 int bcache_drop_device(const char *dev_name) {
@@ -200,9 +217,13 @@ int bcache_drop_device(const char *dev_name) {
             continue;
         if (entries[i].dirty) {
             struct block_device *d = find_device(dev_name);
-            if (d && d->write)
-                d->write(d->local_device_struct, entries[i].page_lba,
-                         BCACHE_PAGE_SECTORS, entries[i].data);
+            if (!d || !d->write || d->write(d->local_device_struct,
+                                             entries[i].page_lba,
+                                             BCACHE_PAGE_SECTORS,
+                                             entries[i].data) != 0) {
+                spin_unlock_irqrestore(&bcache_lock, flags);
+                return -1;
+            }
         }
         entries[i].dirty = false;
         entries[i].valid = false;

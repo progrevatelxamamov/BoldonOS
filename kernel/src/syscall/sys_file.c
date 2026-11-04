@@ -1259,8 +1259,9 @@ uint64_t sys_fsync_impl(uint64_t fd) {
     if (!p || !p->fd_table || fd >= VFS_MAX_FD || !p->fd_table->fds[fd])
         return (uint64_t)-EBADF;
     for (int i = 0; i < MAX_BLOCK_DEVICES; i++) {
-        if (block_devices[i].sector_count > 0 && block_devices[i].name[0])
-            bcache_flush(block_devices[i].name);
+        if (block_devices[i].sector_count > 0 && block_devices[i].name[0] &&
+            bcache_flush(block_devices[i].name) != 0)
+            return (uint64_t)-EIO;
     }
     return 0;
 }

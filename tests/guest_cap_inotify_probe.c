@@ -67,9 +67,22 @@ int main(void) {
     }
     result("mkdir A", syscall(SYS_mkdir, "/tmp/dirA", 0755), 0);
     result("mkdir B", syscall(SYS_mkdir, "/tmp/dirB", 0755), 0);
-    long dir_replace = syscall(SYS_rename, "/tmp/dirA", "/tmp/dirB");
-    if (dir_replace != -1 || errno != EOPNOTSUPP) failed++;
-    result("refuse unsafe directory replacement", dir_replace, -1);
+    result("replace empty directory", syscall(SYS_rename, "/tmp/dirA", "/tmp/dirB"), 0);
+    result("mkdir after block reuse", syscall(SYS_mkdir, "/tmp/dirB/sub", 0755), 0);
+    result("access new subdirectory", syscall(SYS_access, "/tmp/dirB/sub", 0), 0);
+    result("mkdir nonempty target", syscall(SYS_mkdir, "/tmp/occupied", 0755), 0);
+    int occupied_file = syscall(SYS_open, "/tmp/occupied/child", O_CREAT | O_RDWR, 0644);
+    if (occupied_file < 0) failed++;
+    else syscall(SYS_close, occupied_file);
+    long nonempty = syscall(SYS_rename, "/tmp/dirB", "/tmp/occupied");
+    if (nonempty != -1 || errno != ENOTEMPTY) failed++;
+    result("reject nonempty directory", nonempty, -1);
+    long cycle = syscall(SYS_rename, "/tmp/dirB", "/tmp/dirB/sub/cycle");
+    if (cycle != -1 || errno != EINVAL) failed++;
+    result("reject descendant move", cycle, -1);
+    result("move directory between parents",
+           syscall(SYS_rename, "/tmp/dirB/sub", "/tmp/occupied/moved"), 0);
+    result("access moved directory", syscall(SYS_access, "/tmp/occupied/moved", 0), 0);
     result("fsync directory", syscall(SYS_fsync, 1), 0);
 
     memset(caps, 0, sizeof(caps));

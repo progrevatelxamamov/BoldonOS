@@ -236,10 +236,17 @@ static int ext4_link(struct ext4_mountpoint *mp, struct ext4_inode_ref *parent,
 			       EXT4_INODE_MODE_DIRECTORY);
 	if (is_dir && !rename) {
 
-		/* New indexed directories written through lwext4's DX initializer
-		 * are not persisted correctly with this journal/cache combination.
-		 * A linear directory is valid even when the superblock advertises
-		 * DIR_INDEX; do not write a corrupt HTree root. */
+#if CONFIG_DIR_INDEX_ENABLE
+		/* Initialize directory index if supported */
+		if (ext4_sb_feature_com(&mp->fs.sb, EXT4_FCOM_DIR_INDEX)) {
+			r = ext4_dir_dx_init(ch, parent);
+			if (r != EOK)
+				return r;
+
+			ext4_inode_set_flag(ch->inode, EXT4_INODE_FLAG_INDEX);
+			ch->dirty = true;
+		} else
+#endif
 		{
 			r = ext4_dir_add_entry(ch, ".", strlen("."), ch);
 			if (r != EOK) {
@@ -1347,16 +1354,35 @@ static int ext4_rename_check_ancestor(struct ext4_mountpoint *mp,
         struct ext4_inode_ref ref;
         r = ext4_fs_get_inode_ref(&mp->fs, current, &ref);
         if (r != EOK) return r;
-        struct ext4_dir_search_result found;
-        r = ext4_dir_find_entry(&found, &ref, "..", 2);
-        if (r == EOK) {
-            uint32_t parent = ext4_dir_en_get_inode(found.dentry);
-            r = ext4_dir_destroy_result(&ref, &found);
-            if (r == EOK) current = parent;
+        /* The HTree lookup hashes names in leaf blocks; '.' and '..' live
+         * in block zero (the index root), not in a leaf. Read that block
+         * directly for both indexed and linear directories. */
+        ext4_fsblk_t block_id;
+        r = ext4_fs_get_inode_dblk_idx(&ref, 0, &block_id, false);
+        if (r != EOK) { ext4_fs_put_inode_ref(&ref); return r; }
+        struct ext4_block block;
+        r = ext4_trans_block_get(mp->fs.bdev, &block, block_id);
+        if (r != EOK) { ext4_fs_put_inode_ref(&ref); return r; }
+        uint32_t block_size = ext4_sb_get_block_size(&mp->fs.sb);
+        struct ext4_dir_en *dot = (void *)block.data;
+        uint16_t dot_len = ext4_dir_en_get_entry_len(dot);
+        uint32_t parent = 0;
+        if (dot_len >= 8 && dot_len <= block_size - 12 &&
+            ext4_dir_en_get_name_len(&mp->fs.sb, dot) == 1 &&
+            dot->name[0] == '.') {
+            struct ext4_dir_en *dotdot = (void *)(block.data + dot_len);
+            uint16_t parent_len = ext4_dir_en_get_entry_len(dotdot);
+            if (parent_len >= 12 && parent_len <= block_size - dot_len &&
+                ext4_dir_en_get_name_len(&mp->fs.sb, dotdot) == 2 &&
+                dotdot->name[0] == '.' && dotdot->name[1] == '.')
+                parent = ext4_dir_en_get_inode(dotdot);
         }
+        int release = ext4_block_set(mp->fs.bdev, &block);
         int put = ext4_fs_put_inode_ref(&ref);
-        if (r != EOK) return r == ENOENT ? EINVAL : r;
+        if (release != EOK) return release;
         if (put != EOK) return put;
+        if (!parent || parent == current) return EINVAL;
+        current = parent;
     }
     return ELOOP;
 }
@@ -1437,10 +1463,9 @@ int ext4_frename(const char *path, const char *new_path)
 			r = source_dir ? ENOTDIR : EISDIR;
 			goto Finish;
 		}
-		/* Directory block reuse after replace currently produces invalid
-		 * '.'/'..' entries on journal replay. Refuse it rather than report
-		 * success and damage the filesystem. */
-		if (source_dir) { r = EOPNOTSUPP; goto Finish; }
+		/* ext4_unlink checks that a directory is empty. The destination
+		 * name, parent link counts and the moved '..' entry are changed in
+		 * the same journal transaction before the old inode is retired. */
 		bool is_goal;
 		const char *name = new_path + target_name_off;
 		int len = ext4_path_check(name, &is_goal);
@@ -1454,11 +1479,22 @@ int ext4_frename(const char *path, const char *new_path)
 	r = ext4_remove_orig_reference(path, name_off, &parent_ref, &child_ref);
 	if (r != EOK) goto Finish;
 
-	if (target_exists && !ext4_inode_get_links_cnt(target_ref.inode)) {
-		r = ext4_trunc_inode(mp, target_ref.index, 0);
+	if (target_exists) {
+		bool target_dir = ext4_inode_is_type(&mp->fs.sb, target_ref.inode,
+						    EXT4_INODE_MODE_DIRECTORY);
+		if (target_dir) {
+			/* ext4_unlink removed the parent name; '.' and '..' remain. */
+			ext4_inode_set_links_cnt(target_ref.inode, 0);
+			target_ref.dirty = true;
+			r = ext4_trunc_dir(mp, &target_parent_ref, &target_ref);
+		} else if (!ext4_inode_get_links_cnt(target_ref.inode)) {
+			r = ext4_trunc_inode(mp, target_ref.index, 0);
+		}
 		if (r != EOK) goto Finish;
-		ext4_inode_set_del_time(target_ref.inode, -1L);
-		r = ext4_fs_free_inode(&target_ref);
+		if (target_dir || !ext4_inode_get_links_cnt(target_ref.inode)) {
+			ext4_inode_set_del_time(target_ref.inode, -1L);
+			r = ext4_fs_free_inode(&target_ref);
+		}
 	}
 
 Finish:
