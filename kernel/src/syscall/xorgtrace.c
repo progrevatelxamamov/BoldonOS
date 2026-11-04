@@ -32,6 +32,16 @@ int xorgtrace_exec_target(const char *path) {
     for (const char *p = path; *p; p++) if (*p == '/') base = p + 1;
     if (!strcmp(base, "Xorg")) return 2;
     if (!strcmp(base, "Xorg.wrap") || !strcmp(base, "X")) return 1;
+    /* The same bounded trace also covers the desktop startup chain. A
+       script may exec /bin/sh: exec.begin/open still identify its target. */
+    if (!strcmp(base, "plasma-dbus-run-session-if-needed")) return 3;
+    if (!strcmp(base, "startplasma-wayland")) return 4;
+    if (!strcmp(base, "dbus-daemon")) return 5;
+    if (!strcmp(base, "dbus-run-session")) return 6;
+    if (!strcmp(base, "kwin_wayland")) return 7;
+    if (!strcmp(base, "plasma_session")) return 8;
+    if (!strcmp(base, "ksmserver")) return 9;
+    if (!strcmp(base, "kded6")) return 10;
     return 0;
 }
 

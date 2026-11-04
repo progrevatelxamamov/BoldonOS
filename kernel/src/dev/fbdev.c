@@ -272,7 +272,10 @@ static void *fb_dev_mmap(vfs_file_t *file, void *addr, uint64_t len, int prot, i
     }
     if ((virt & 4095ULL) != 0) return NULL;
 
-    uint64_t page_flags = PTE_PRESENT | PTE_USER | PTE_PWT | PTE_HUGE;
+    /* vmm_map_page installs 4 KiB PTEs. Bit 7 there is PAT, not the
+       huge-page flag used at PDE level: setting PTE_HUGE here silently
+       selects a different framebuffer cache type. */
+    uint64_t page_flags = PTE_PRESENT | PTE_USER | PTE_PWT;
     if (prot & FB_PROT_WRITE) page_flags |= PTE_WRITABLE;
 
     uint64_t pages = aligned_len / 4096;
