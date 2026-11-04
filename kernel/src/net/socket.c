@@ -69,7 +69,10 @@ socket_t* get_socket_from_fd(int sockfd) {
     process_t *p = get_current_process();
     if (!p || !p->fd_table || sockfd < 0 || sockfd >= VFS_MAX_FD || !p->fd_table->fds[sockfd]) return NULL;
     vfs_file_t *file = p->fd_table->fds[sockfd];
-    if (file->node->file_ops != &generic_socket_vfs_ops) return NULL;
+    /* A descriptor may refer to a VFS file without a node (or one being
+       torn down). Reject it rather than dereferencing node->file_ops at
+       NULL + offsetof(vfs_node_t, file_ops). */
+    if (!file->node || file->node->file_ops != &generic_socket_vfs_ops) return NULL;
     return (socket_t *)file->node->fs_data;
 }
 
