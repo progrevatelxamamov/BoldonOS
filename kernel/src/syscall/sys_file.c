@@ -309,7 +309,7 @@ uint64_t sys_fcntl_impl(uint64_t fd, uint64_t cmd, uint64_t arg) {
 
     if (cmd == 0 || cmd == 1030) {
         int min_fd = (int)arg;
-        if (min_fd < 0) min_fd = 0;
+        if (min_fd < 0 || min_fd >= VFS_MAX_FD) return (uint64_t)-EINVAL;
         for (int n = min_fd; n < VFS_MAX_FD; n++) {
             if (!p->fd_table->fds[n]) {
                 p->fd_table->fds[n] = p->fd_table->fds[fd];
@@ -322,7 +322,14 @@ uint64_t sys_fcntl_impl(uint64_t fd, uint64_t cmd, uint64_t arg) {
 
     if (cmd == 1 /* F_GETFD */) return 0;
     if (cmd == 2 /* F_SETFD */) return 0;
-    if (cmd == 3 /* F_GETFL */) return p->fd_table->fds[fd]->flags;
+    if (cmd == 3 /* F_GETFL */) {
+        uint32_t f = p->fd_table->fds[fd]->flags;
+        uint64_t linux_fl = (f & VFS_O_RDWR) == VFS_O_RDWR ? 2 :
+                            (f & VFS_O_WRITE) ? 1 : 0;
+        if (f & VFS_O_APPEND) linux_fl |= 02000;
+        if (f & VFS_O_NONBLOCK) linux_fl |= 04000;
+        return linux_fl;
+    }
     if (cmd == 4 /* F_SETFL */) {
         uint32_t linux_fl = (uint32_t)arg;
         uint32_t vfs_fl = p->fd_table->fds[fd]->flags & ~(VFS_O_NONBLOCK | VFS_O_APPEND);
@@ -386,7 +393,7 @@ uint64_t sys_newfstatat_impl(uint64_t dirfd, uint64_t path,
     char kpath[512];
     if (!statbuf || !user_range_ok(statbuf, sizeof(struct linux_stat)) ||
         copy_str_from_user(kpath, path, sizeof(kpath))) return (uint64_t)-EFAULT;
-    if ((int64_t)dirfd != -100 && kpath[0] != '/') return (uint64_t)-ENOSYS;
+    if ((int32_t)dirfd != -100 && kpath[0] != '/') return (uint64_t)-ENOSYS;
     if (flags & ~0x100ULL) return (uint64_t)-ENOSYS;
     vfs_node_t *node = flags & 0x100 /* AT_SYMLINK_NOFOLLOW */ ?
         vfs_resolve_path_nofollow(kpath) : vfs_resolve_path(kpath);
@@ -549,7 +556,7 @@ uint64_t sys_openat_impl(uint64_t dirfd, uint64_t path, uint64_t flags) {
     if (copy_str_from_user(kpath, path, sizeof(kpath))) return (uint64_t)-EFAULT;
     /* Absolute paths ignore dirfd; relative dirfd resolution is not yet
        implemented and must never silently use the process cwd instead. */
-    if ((int64_t)dirfd != -100 && kpath[0] != '/') return (uint64_t)-ENOSYS;
+    if ((int32_t)dirfd != -100 && kpath[0] != '/') return (uint64_t)-ENOSYS;
     return (uint64_t)(int64_t)sys_open(p->fd_table, kpath,
                                       translate_linux_open_flags(flags));
 }
@@ -780,6 +787,10 @@ uint64_t exceptfds_ptr, uint64_t timeout_ptr, uint64_t sigmask_ptr) {
     }
 }
 
+uint64_t sys_dup_impl(uint64_t oldfd) {
+    return sys_fcntl_impl(oldfd, 0 /* F_DUPFD */, 0);
+}
+
 uint64_t sys_dup2_impl(uint64_t oldfd, uint64_t newfd) {
     process_t *p = get_current_process();
     if (!p || !p->fd_table) return (uint64_t)-EBADF;
@@ -832,8 +843,11 @@ uint64_t sys_getdents64_impl(uint64_t fd_raw, uint64_t dirp_raw, uint64_t count_
     if (!buf || count < sizeof(struct linux_dirent64)) return (uint64_t)-EINVAL;
 
     process_t *curr = get_current_process();
+    if (!curr || !curr->fd_table || fd < 0 || fd >= VFS_MAX_FD ||
+        !curr->fd_table->fds[fd]) return (uint64_t)-EBADF;
+    if (!user_range_ok(dirp_raw, count)) return (uint64_t)-EFAULT;
     vfs_file_t *file = curr->fd_table->fds[fd];
-    if (!file || !file->node || file->node->type != VFS_TYPE_DIR) return (uint64_t)-EBADF;
+    if (!file->node || file->node->type != VFS_TYPE_DIR) return (uint64_t)-ENOTDIR;
 
     size_t total_bytes = 0;
 
@@ -1097,7 +1111,7 @@ uint64_t sys_mkdirat_impl(uint64_t dirfd, uint64_t path_ptr, uint64_t mode) {
         return (uint64_t)-EFAULT;
     }
 
-    if ((int64_t)dirfd != -100 && kpath[0] != '/') return (uint64_t)-ENOSYS;
+    if ((int32_t)dirfd != -100 && kpath[0] != '/') return (uint64_t)-ENOSYS;
     int access = mutation_parent_access(kpath);
     if (access) return (uint64_t)(int64_t)access;
     int res = vfs_mkdir(kpath, (uint32_t)mode);
@@ -1118,8 +1132,8 @@ uint64_t sys_renameat_impl(uint64_t oldfd, uint64_t old_ptr,
     if (copy_str_from_user(oldpath, old_ptr, sizeof(oldpath)) != 0 ||
         copy_str_from_user(newpath, new_ptr, sizeof(newpath)) != 0)
         return (uint64_t)-EFAULT;
-    if (((int64_t)oldfd != -100 && oldpath[0] != '/') ||
-        ((int64_t)newfd != -100 && newpath[0] != '/'))
+    if (((int32_t)oldfd != -100 && oldpath[0] != '/') ||
+        ((int32_t)newfd != -100 && newpath[0] != '/'))
         return (uint64_t)-ENOSYS;
     int access = mutation_parent_access(oldpath);
     if (!access) access = mutation_parent_access(newpath);
@@ -1133,7 +1147,7 @@ uint64_t sys_unlinkat_impl(uint64_t dirfd, uint64_t path_ptr, uint64_t flags) {
         return (uint64_t)-EFAULT;
     }
 
-    if ((int64_t)dirfd != -100 && kpath[0] != '/') return (uint64_t)-ENOSYS;
+    if ((int32_t)dirfd != -100 && kpath[0] != '/') return (uint64_t)-ENOSYS;
     if (flags & ~0x200ULL) return (uint64_t)-EINVAL;
     int access = mutation_parent_access(kpath);
     if (access) return (uint64_t)(int64_t)access;
@@ -1162,7 +1176,7 @@ uint64_t sys_fchmodat_impl(uint64_t dirfd, uint64_t path_ptr, uint64_t mode, uin
         return (uint64_t)-EFAULT;
     }
 
-    if ((int64_t)dirfd != -100 && kpath[0] != '/') return (uint64_t)-ENOSYS;
+    if ((int32_t)dirfd != -100 && kpath[0] != '/') return (uint64_t)-ENOSYS;
     if (flags) return (uint64_t)-ENOSYS;
     int access = mutation_owner_access(vfs_resolve_path(kpath));
     if (access) return (uint64_t)(int64_t)access;
@@ -1210,7 +1224,7 @@ uint64_t sys_fchmod_impl(uint64_t fd, uint64_t mode) {
 uint64_t sys_faccessat2_impl(uint64_t dfd, uint64_t filename, uint64_t mode, uint64_t flags) {
     char path[512];
     if (copy_str_from_user(path, filename, sizeof(path))) return (uint64_t)-EFAULT;
-    if ((int64_t)dfd != -100 && path[0] != '/') return (uint64_t)-ENOSYS;
+    if ((int32_t)dfd != -100 && path[0] != '/') return (uint64_t)-ENOSYS;
     /* access(2) uses real credentials; AT_EACCESS and nofollow need distinct
        handling, not a silent alias to the existing access approximation. */
     if (flags) return (uint64_t)-ENOSYS;

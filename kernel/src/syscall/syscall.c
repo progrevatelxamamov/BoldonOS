@@ -108,6 +108,7 @@ extern uint64_t sys_getresgid_impl(uint64_t, uint64_t, uint64_t);
 extern uint64_t sys_pselect6_impl(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
 
 extern uint64_t sys_dup2_impl(uint64_t, uint64_t);
+extern uint64_t sys_dup_impl(uint64_t);
 extern uint64_t sys_readlink_impl(uint64_t, uint64_t, uint64_t);
 extern uint64_t sys_getdents64_impl(uint64_t, uint64_t, uint64_t);
 extern uint64_t sys_wait4_impl(uint64_t, uint64_t, uint64_t, uint64_t);
@@ -327,7 +328,7 @@ uint64_t osdev_syscall_handler(uint64_t num,
     case SYS_PRLIMIT64:       return sys_prlimit64_impl(a1, a2, a3, a4);
     case SYS_GETPGRP: return sys_getpgid_impl(0);
     case SYS_PSELECT6: return sys_pselect6_impl(a1, a2, a3, a4, a5, a6);
-    case SYS_DUP:  return sys_dup2_impl(a1, a2);
+    case SYS_DUP:  return sys_dup_impl(a1);
     case SYS_WAIT4:  return sys_wait4_impl(a1, a2, a3, a4);
     case SYS_READLINK:  return sys_readlink_impl(a1, a2, a3);
     case SYS_TIME: return sys_time_impl(a1);

@@ -780,17 +780,17 @@ int sys_open(process_fd_table_t *table, const char *path, uint32_t flags) {
 }
 
 int sys_read(process_fd_table_t *table, int fd, void *buf, uint64_t count) {
-    if (!table || fd < 0 || fd >= VFS_MAX_FD || !table->fds[fd]) return -1;
+    if (!table || fd < 0 || fd >= VFS_MAX_FD || !table->fds[fd]) return -EBADF;
     return vfs_read(table->fds[fd], buf, count);
 }
 
 int sys_write(process_fd_table_t *table, int fd, const void *buf, uint64_t count) {
-    if (!table || fd < 0 || fd >= VFS_MAX_FD || !table->fds[fd]) return -1;
+    if (!table || fd < 0 || fd >= VFS_MAX_FD || !table->fds[fd]) return -EBADF;
     return vfs_write(table->fds[fd], buf, count);
 }
 
 int sys_close(process_fd_table_t *table, int fd) {
-    if (!table || fd < 0 || fd >= VFS_MAX_FD || !table->fds[fd]) return -1;
+    if (!table || fd < 0 || fd >= VFS_MAX_FD || !table->fds[fd]) return -EBADF;
     int res = vfs_close(table->fds[fd]);
     table->fds[fd] = NULL;
     return res;
