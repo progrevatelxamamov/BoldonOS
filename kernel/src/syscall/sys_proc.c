@@ -608,6 +608,7 @@ uint64_t sys_clone_impl(uint64_t flags, uint64_t child_stack,
     child->brk_current = p->brk_current;
     child->mmap_base = p->mmap_base;
     child->name = p->name ? kstrdup(p->name) : kstrdup("child");
+    child->trace_desktop = p->trace_desktop;
 
     child->uid  = p->uid;
     child->cap_effective = p->cap_effective;

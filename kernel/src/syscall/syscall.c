@@ -394,11 +394,12 @@ uint64_t syscall_handler(uint64_t num,
 {
     process_t *p = get_current_process();
     const char *name = p ? p->name : NULL;
-    bool xorg = name && (!strcmp(name, "Xorg") || !strcmp(name, "Xorg.wrap") ||
-                         !strcmp(name, "X"));
+    int target = xorgtrace_exec_target(name);
+    bool xorg = target == 1 || target == 2;
+    bool desktop = p && (p->trace_desktop || target >= 3);
     bool xinit_spawn = name && !strcmp(name, "xinit") &&
                        (num == SYS_CLONE || num == SYS_FORK || num == SYS_EXECVE);
-    uint64_t ticket = (xorg || xinit_spawn) ?
+    uint64_t ticket = (xorg || desktop || xinit_spawn) ?
         xorgtrace_syscall_enter(p->pid, num, a1, a2) : 0;
     uint64_t ret = osdev_syscall_handler(num, a1, a2, a3, a4, a5, a6);
     xorgtrace_syscall_exit(ticket, (int64_t)ret);

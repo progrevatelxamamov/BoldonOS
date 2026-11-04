@@ -39,8 +39,8 @@ static int devfs_register_device(const char *name, int type, vfs_file_ops_t *ops
     return 0;
 }
 ''' + trace + r'''
-typedef struct { uint64_t pid; const char *name; } process_t;
-static process_t current = { 77, "sh" };
+typedef struct { uint64_t pid; const char *name; bool trace_desktop; } process_t;
+static process_t current = { 77, "sh", false };
 static process_t *get_current_process(void) { return &current; }
 #define SYS_CLONE 56
 #define SYS_FORK 57
@@ -98,6 +98,22 @@ int main(void) {
     assert(exit_lines == 3); // no extra exits for pending calls
     for (int i=0; i<30; i++) xorgtrace_stage("bind.unix.lookup", 77, i);
     assert(stage_lines == 24); // initial exec marker + bounded bind stages
+    assert(xorgtrace_exec_target("/usr/lib/plasma-dbus-run-session-if-needed") == 3);
+    assert(xorgtrace_exec_target("/usr/bin/startplasma-wayland") == 4);
+    assert(xorgtrace_exec_target("/usr/bin/dbus-daemon") == 5);
+    assert(xorgtrace_exec_target("/usr/bin/kwin_wayland") == 7);
+    current.name = "sh"; current.trace_desktop = true; // interpreter of traced script
+    syscall_handler(99, 0, 0, 0, 0, 0, 0);
+    current.trace_desktop = false;
+    current.name = "dbus-daemon";
+    syscall_handler(98, 0, 0, 0, 0, 0, 0);
+    vfs_file_t desktop = {0};
+    assert(trace_ops.open(&desktop) == 0);
+    memset(text, 0, sizeof(text));
+    assert(trace_ops.read(&desktop, text, sizeof(text)) > 0);
+    assert(strstr(text, "num=99"));
+    assert(strstr(text, "num=98"));
+    trace_ops.close(&desktop);
     return 0;
 }
 '''

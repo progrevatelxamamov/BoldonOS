@@ -659,8 +659,13 @@ int sys_execve(const char *pathname, char *const argv[], char *const envp[]) {
     int target = xorgtrace_exec_target(pathname);
     process_t *p = target ? get_current_process() : NULL;
     uint64_t pid = p ? p->pid : 0;
+    bool was_traced = p && p->trace_desktop;
+    /* A script is executed by /bin/sh, so its process name alone cannot
+       identify it later. Keep tracing that process and its forked children. */
+    if (p && target >= 3) p->trace_desktop = true;
     if (target) xorgtrace_stage("exec.begin", pid, (uint64_t)target);
     int result = sys_execve_depth(pathname, argv, envp, 0);
     if (target && result < 0) xorgtrace_stage("exec.fail", pid, (uint64_t)errno);
+    if (p && result < 0) p->trace_desktop = was_traced;
     return result;
 }

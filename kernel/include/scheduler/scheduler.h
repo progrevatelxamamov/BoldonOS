@@ -45,6 +45,8 @@ typedef struct process {
     page_table_t *pml4;
     struct thread *threads[256];
     char *name;
+    /* Bounded desktop-startup syscall trace, inherited by script children. */
+    bool trace_desktop;
     struct process *parent;
     process_fd_table_t *fd_table;
     uint64_t brk_start;
