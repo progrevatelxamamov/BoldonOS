@@ -802,19 +802,6 @@ uint64_t sys_dup2_impl(uint64_t oldfd, uint64_t newfd) {
     return newfd;
 }
 
-/* dup(2) allocates the lowest available fd; it is not dup2(oldfd, 0).
-   Overwriting fd 0 here breaks shells that save stdout before redirection. */
-uint64_t sys_dup_impl(uint64_t oldfd) {
-    process_t *p = get_current_process();
-    if (!p || !p->fd_table || oldfd >= VFS_MAX_FD ||
-        !p->fd_table->fds[oldfd]) return (uint64_t)-EBADF;
-    for (int fd = 0; fd < VFS_MAX_FD; fd++) {
-        if (!p->fd_table->fds[fd])
-            return sys_dup2_impl(oldfd, (uint64_t)fd);
-    }
-    return (uint64_t)-EMFILE;
-}
-
 uint64_t sys_readlink_impl(uint64_t path, uint64_t buf, uint64_t bufsiz) {
     if (!path || !buf || bufsiz == 0) return (uint64_t)-EFAULT;
     if (!user_range_ok(path, 1) || !user_range_ok(buf, bufsiz)) return (uint64_t)-EFAULT;
