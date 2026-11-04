@@ -2,6 +2,7 @@
 #include "kernel.h"
 #include <sys/elf.h>
 #include <fs/vfs.h>
+#include <sys/capability.h>
 #include <mm/vmm.h>
 #include <mm/pmm.h>
 #include <mm/malloc.h>
@@ -90,6 +91,18 @@ static int map_segment(page_table_t *pml4, vfs_file_t *f,
     return 0;
 }
 
+/* execve does not go through the user sys_open DAC check: it opens its
+   binary internally, so apply the execute check before reading/loading it. */
+static int exec_file_access(vfs_file_t *file) {
+    process_t *p = get_current_process();
+    if (!file || !file->node || file->node->type != VFS_TYPE_FILE)
+        return -EACCES;
+    if (p && !p->is_kernel_process &&
+        vfs_check_access(file->node, p->fsuid, p->fsgid, VFS_PERM_EXEC))
+        return -EACCES;
+    return 0;
+}
+
 static int load_interp(page_table_t *pml4, const char *interp_path,
                        uint64_t interp_base, uint64_t *entry_out)
 {
@@ -99,6 +112,10 @@ static int load_interp(page_table_t *pml4, const char *interp_path,
         console_print_string(interp_path);
         console_print_string("\n");
         return -ENOENT;
+    }
+    if (exec_file_access(ifile)) {
+        vfs_close(ifile);
+        return -EACCES;
     }
 
     Elf64_Ehdr iehdr;
@@ -171,6 +188,9 @@ static int sys_execve_depth(const char *pathname, char *const argv[],
 
     vfs_file_t *f = vfs_open(pathname, VFS_O_READ);
     if (!f) { errno = ENOENT; return -1; }
+    if (exec_file_access(f)) {
+        vfs_close(f); errno = EACCES; return -1;
+    }
     if (xorgtrace_exec_target(pathname)) {
         process_t *current = get_current_process();
         xorgtrace_stage("exec.open", current ? current->pid : 0,
@@ -210,6 +230,14 @@ static int sys_execve_depth(const char *pathname, char *const argv[],
     if (ehdr.e_machine != EM_X86_64) { vfs_close(f); errno = ENOEXEC; return -1; }
     if (ehdr.e_phentsize != sizeof(Elf64_Phdr)) { vfs_close(f); errno = ENOEXEC; return -1; }
     if (ehdr.e_phnum == 0) { vfs_close(f); errno = ENOEXEC; return -1; }
+
+    boldon_file_caps_t file_caps;
+    int cap_status = capability_read_file(f->node, &file_caps);
+    if (cap_status < 0) {
+        vfs_close(f);
+        errno = -cap_status;
+        return -1;
+    }
 
     void *pml4_phys = pmm_alloc_page_and_clear();
     if (!pml4_phys) { vfs_close(f); errno = ENOMEM; return -1; }
@@ -444,14 +472,23 @@ static int sys_execve_depth(const char *pathname, char *const argv[],
         malloc_free(phdrs); vfs_close(f); errno = ESRCH; return -1;
     }
 
-    if (f->node) {
-        if (f->node->mode & 04000 /* SUID */) {
-            p->euid = f->node->uid;
-        }
-        if (f->node->mode & 02000 /* SGID */) {
-            p->egid = f->node->gid;
-        }
+    if (f->node && !p->no_new_privs) {
+        if (f->node->mode & 04000 /* SUID */) p->euid = f->node->uid;
+        if (f->node->mode & 02000 /* SGID */) p->egid = f->node->gid;
     }
+    /* exec resets filesystem credentials even for ordinary binaries. */
+    p->fsuid = p->euid;
+    p->fsgid = p->egid;
+    if (p->fd_table) {
+        p->fd_table->uid = p->fsuid;
+        p->fd_table->gid = p->fsgid;
+    }
+
+    /* File capabilities take precedence over legacy root-on-exec. SUID,
+       SGID and file-cap xattrs clear ambient rights on a privileged exec. */
+    bool setid = f->node && !p->no_new_privs &&
+                 (f->node->mode & (04000 | 02000));
+    capability_apply_exec(p, &file_caps, setid);
 
     p->pml4        = new_pml4;
     p->brk_start   = brk_start;

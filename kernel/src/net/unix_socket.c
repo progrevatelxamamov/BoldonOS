@@ -82,9 +82,19 @@ static int un_bind(socket_t *sock, const struct sockaddr *addr, socklen_t addrle
             return -EADDRINUSE;
         }
 
+        /* bind creates a pathname through VFS, not the syscall mutation
+           wrapper: enforce directory DAC here as well. */
+        char leaf[256] = {0};
+        vfs_node_t *parent = vfs_resolve_path_ext(u->addr.sun_path, true, leaf);
+        process_t *caller = get_current_process();
+        if (!parent || parent->type != VFS_TYPE_DIR || !leaf[0]) return -ENOENT;
+        if (caller && vfs_check_access(parent, caller->fsuid, caller->fsgid,
+                                       VFS_PERM_WRITE | VFS_PERM_EXEC))
+            return -EACCES;
         trace_unix_bind("bind.unix.create", 0);
         u->path_node_created = unix_create_path_node(u->addr.sun_path);
         trace_unix_bind("bind.unix.create.done", u->path_node_created);
+        if (!u->path_node_created) return -EIO;
     }
 
     u->bound = true;
@@ -290,7 +300,13 @@ static int un_close(socket_t *sock) {
     u->peer = NULL;
 
     if (remove_path) {
-        vfs_unlink(path);
+        char leaf[256] = {0};
+        vfs_node_t *parent = vfs_resolve_path_ext(path, true, leaf);
+        process_t *caller = get_current_process();
+        if (parent && leaf[0] &&
+            (!caller || !vfs_check_access(parent, caller->fsuid, caller->fsgid,
+                                           VFS_PERM_WRITE | VFS_PERM_EXEC)))
+            vfs_unlink(path);
     }
     return 0;
 }

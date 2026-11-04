@@ -3,6 +3,7 @@
 #include "mm/pmm.h"
 #include "mm/malloc.h"
 #include "mm/vmm.h"
+#include <sys/capability.h>
 #include <desc/gdt.h>
 #include <stdint.h>
 #include <sys/elf.h>
@@ -143,7 +144,7 @@ uint64_t sys_kill_impl(uint64_t pid, uint64_t sig) {
     process_t *p = get_current_process();
     if (!p) return (uint64_t)-ESRCH;
     if (sig == 2) {
-        int sent = 0;
+        int sent = 0, denied = 0;
         int64_t target = (int64_t)pid;
         if (target == -1) return (uint64_t)-ENOSYS; /* broadcast is not implemented */
         for (int i = 1; i < 512; i++) {
@@ -153,12 +154,26 @@ uint64_t sys_kill_impl(uint64_t pid, uint64_t sig) {
             if ((target > 0 && q->pid != pid) ||
                 (target == 0 && q->pgid != p->pgid) ||
                 (target < -1 && q->pgid != (uint64_t)-target)) continue;
+            if (p->euid != q->uid && p->euid != q->euid &&
+                !(p->cap_effective & BOLDON_CAP_KILL)) { denied++; continue; }
             __atomic_fetch_or(&q->sigpending, 1ULL << (2 - 1), __ATOMIC_RELAXED);
             sent++;
         }
-        return sent ? 0 : (uint64_t)-ESRCH;
+        return sent ? 0 : (uint64_t)(denied ? -EPERM : -ESRCH);
     }
-    if (sig == 0) return 0;
+    if (sig == 0) {
+        bool found = false;
+        for (int i = 1; i < 512; i++) {
+            process_t *q = tasks[i];
+            if (!q || q->state == TASK_DEAD || q->state == TASK_ZOMBIE ||
+                q->is_kernel_process ||
+                (pid == 0 ? q->pgid != p->pgid : q->pid != pid)) continue;
+            found = true;
+            if (p->euid == q->uid || p->euid == q->euid ||
+                (p->cap_effective & BOLDON_CAP_KILL)) return 0;
+        }
+        return (uint64_t)(found ? -EPERM : -ESRCH);
+    }
 
     if (pid == p->pid || pid == 0) {
         if (sig == 9 || sig == 15) {
@@ -291,6 +306,80 @@ static inline bool user_range_ok(uint64_t ptr, uint64_t len) {
     uint64_t end;
     if (__builtin_add_overflow(ptr, len, &end)) return false;
     return end <= 0x00007FFFFFFFFFFFULL;
+}
+
+
+/* Linux capability ABI for the explicitly supported BoldonOS rights.
+   No file-cap xattrs, namespaces or per-thread credentials yet. */
+struct linux_cap_header { uint32_t version; int32_t pid; };
+struct linux_cap_data { uint32_t effective, permitted, inheritable; };
+
+uint64_t sys_capget_impl(uint64_t header_ptr, uint64_t data_ptr) {
+    if (!user_range_ok(header_ptr, sizeof(struct linux_cap_header)))
+        return (uint64_t)-EFAULT;
+    struct linux_cap_header *header = (struct linux_cap_header *)header_ptr;
+    uint32_t version = header->version;
+    if (version != 0x19980330U && version != 0x20071026U &&
+        version != 0x20080522U) {
+        header->version = 0x20080522U;
+        return (uint64_t)-EINVAL;
+    }
+    if (header->pid < 0) return (uint64_t)-EINVAL;
+    uint64_t effective, permitted, inheritable;
+    if (header->pid == 0) {
+        process_t *self = get_current_process();
+        if (!self) return (uint64_t)-ESRCH;
+        effective = self->cap_effective;
+        permitted = self->cap_permitted;
+        inheritable = self->cap_inheritable;
+    } else if (scheduler_cap_snapshot((uint32_t)header->pid,
+                                      &effective, &permitted, &inheritable) != 0)
+        return (uint64_t)-ESRCH;
+    if (!data_ptr) return 0;
+    int words = version == 0x19980330U ? 1 : 2;
+    if (!user_range_ok(data_ptr, words * sizeof(struct linux_cap_data)))
+        return (uint64_t)-EFAULT;
+    struct linux_cap_data *data = (struct linux_cap_data *)data_ptr;
+    for (int i = 0; i < words; i++) {
+        data[i].effective = (uint32_t)(effective >> (i * 32));
+        data[i].permitted = (uint32_t)(permitted >> (i * 32));
+        data[i].inheritable = (uint32_t)(inheritable >> (i * 32));
+    }
+    return 0;
+}
+
+
+uint64_t sys_capset_impl(uint64_t header_ptr, uint64_t data_ptr) {
+    if (!user_range_ok(header_ptr, sizeof(struct linux_cap_header)))
+        return (uint64_t)-EFAULT;
+    const struct linux_cap_header *h = (const struct linux_cap_header *)header_ptr;
+    if (h->version != 0x19980330U && h->version != 0x20071026U &&
+        h->version != 0x20080522U) return (uint64_t)-EINVAL;
+    process_t *p = get_current_process();
+    if (!p) return (uint64_t)-ESRCH;
+    if (h->pid < 0 || (h->pid != 0 && (uint64_t)h->pid != p->pid))
+        return (uint64_t)-EPERM;
+    int words = h->version == 0x19980330U ? 1 : 2;
+    if (!user_range_ok(data_ptr, words * sizeof(struct linux_cap_data)))
+        return (uint64_t)-EFAULT;
+    const struct linux_cap_data *d = (const struct linux_cap_data *)data_ptr;
+    uint64_t effective = d[0].effective, permitted = d[0].permitted;
+    uint64_t inheritable = d[0].inheritable;
+    if (words == 2) {
+        effective |= (uint64_t)d[1].effective << 32;
+        permitted |= (uint64_t)d[1].permitted << 32;
+        inheritable |= (uint64_t)d[1].inheritable << 32;
+    }
+    if (((effective | permitted | inheritable) & ~BOLDON_CAP_SUPPORTED) ||
+        (permitted & ~p->cap_permitted) || (effective & ~permitted) ||
+        (inheritable & ~(p->cap_inheritable |
+            ((p->cap_effective & BOLDON_CAP_SETPCAP) ? p->cap_permitted : 0))))
+        return (uint64_t)-EPERM;
+    p->cap_permitted = permitted;
+    p->cap_effective = effective;
+    p->cap_inheritable = inheritable;
+    p->cap_ambient &= p->cap_permitted & p->cap_inheritable;
+    return 0;
 }
 
 #define IA32_FS_BASE 0xC0000100
@@ -517,11 +606,19 @@ uint64_t sys_clone_impl(uint64_t flags, uint64_t child_stack,
     child->name = p->name ? kstrdup(p->name) : kstrdup("child");
 
     child->uid  = p->uid;
+    child->cap_effective = p->cap_effective;
+    child->cap_permitted = p->cap_permitted;
+    child->cap_inheritable = p->cap_inheritable;
+    child->cap_bounding = p->cap_bounding;
+    child->cap_ambient = p->cap_ambient;
+    child->no_new_privs = p->no_new_privs;
     child->euid = p->euid;
     child->suid = p->suid;
+    child->fsuid = p->fsuid;
     child->gid  = p->gid;
     child->egid = p->egid;
     child->sgid = p->sgid;
+    child->fsgid = p->fsgid;
 
     memcpy(child->cwd, p->cwd, sizeof(p->cwd));
 
@@ -676,6 +773,7 @@ uint64_t sys_wait4_impl(uint64_t pid, uint64_t wstatus, uint64_t options, uint64
         }
 
         if (zombie_child) {
+            if (!scheduler_detach_zombie(zombie_slot, zombie_child)) continue;
             uint64_t child_pid = zombie_child->pid;
             
             if (wstatus && user_range_ok(wstatus, 4)) {
@@ -684,10 +782,6 @@ uint64_t sys_wait4_impl(uint64_t pid, uint64_t wstatus, uint64_t options, uint64
                     : (uint32_t)((zombie_child->exit_code & 0xFF) << 8);
             }
 
-            if (zombie_slot >= 0) {
-                tasks[zombie_slot] = NULL;
-            }
-            
             task_free(zombie_child);
             return child_pid;
         }
@@ -747,10 +841,15 @@ uint64_t sys_setuid_impl(uint64_t uid) {
 
     uint32_t new_uid = (uint32_t)uid;
 
-    if (p->euid == 0) {
+    if (p->cap_effective & BOLDON_CAP_SETUID) {
         p->uid  = new_uid;
         p->euid = new_uid;
         p->suid = new_uid;
+        if (new_uid != 0) {
+            p->cap_effective = 0;
+            p->cap_permitted = 0;
+            p->cap_ambient = 0;
+        }
     }
     else if (new_uid == p->uid || new_uid == p->suid) {
         p->euid = new_uid;
@@ -758,7 +857,8 @@ uint64_t sys_setuid_impl(uint64_t uid) {
         return (uint64_t)-EPERM;
     }
 
-    if (p->fd_table) p->fd_table->uid = p->euid;
+    p->fsuid = p->euid;
+    if (p->fd_table) p->fd_table->uid = p->fsuid;
 
     return 0;
 }
@@ -769,7 +869,7 @@ uint64_t sys_setgid_impl(uint64_t gid) {
 
     uint32_t new_gid = (uint32_t)gid;
 
-    if (p->euid == 0) {
+    if (p->cap_effective & BOLDON_CAP_SETGID) {
         p->gid  = new_gid;
         p->egid = new_gid;
         p->sgid = new_gid;
@@ -779,7 +879,8 @@ uint64_t sys_setgid_impl(uint64_t gid) {
         return (uint64_t)-EPERM;
     }
 
-    if (p->fd_table) p->fd_table->gid = p->egid;
+    p->fsgid = p->egid;
+    if (p->fd_table) p->fd_table->gid = p->fsgid;
 
     return 0;
 }
@@ -1013,9 +1114,15 @@ uint64_t sys_getresgid(uint32_t *rgid, uint32_t *egid, uint32_t *sgid) {
 #define PR_GET_NAME       16
 #define PR_CAPBSET_READ   23
 #define PR_CAPBSET_DROP   24
+#define PR_SET_NO_NEW_PRIVS 38
+#define PR_GET_NO_NEW_PRIVS 39
+#define PR_CAP_AMBIENT 47
+#define PR_CAP_AMBIENT_IS_SET 1
+#define PR_CAP_AMBIENT_RAISE 2
+#define PR_CAP_AMBIENT_LOWER 3
+#define PR_CAP_AMBIENT_CLEAR_ALL 4
 
 uint64_t sys_prctl_impl(uint64_t option, uint64_t arg2, uint64_t arg3, uint64_t arg4, uint64_t arg5) {
-    (void)arg3; (void)arg4; (void)arg5;
     process_t *p = get_current_process();
     if (!p) return (uint64_t)-ESRCH;
 
@@ -1053,8 +1160,44 @@ uint64_t sys_prctl_impl(uint64_t option, uint64_t arg2, uint64_t arg3, uint64_t 
             return 1;
         case PR_SET_DUMPABLE:
             return 0;
+        case PR_SET_NO_NEW_PRIVS:
+            if (arg2 != 1 || arg3 || arg4 || arg5) return (uint64_t)-EINVAL;
+            p->no_new_privs = true;
+            return 0;
+        case PR_GET_NO_NEW_PRIVS:
+            if (arg2 || arg3 || arg4 || arg5) return (uint64_t)-EINVAL;
+            return p->no_new_privs ? 1 : 0;
+        case PR_CAP_AMBIENT:
+            if (arg4 || arg5) return (uint64_t)-EINVAL;
+            if (arg2 == PR_CAP_AMBIENT_CLEAR_ALL) {
+                if (arg3) return (uint64_t)-EINVAL;
+                p->cap_ambient = 0;
+                return 0;
+            }
+            if (arg3 > 63 || !(BOLDON_CAP_SUPPORTED & (1ULL << arg3)))
+                return (uint64_t)-EINVAL;
+            if (arg2 == PR_CAP_AMBIENT_IS_SET)
+                return (p->cap_ambient >> arg3) & 1U;
+            if (arg2 == PR_CAP_AMBIENT_LOWER) {
+                p->cap_ambient &= ~(1ULL << arg3);
+                return 0;
+            }
+            if (arg2 == PR_CAP_AMBIENT_RAISE) {
+                uint64_t bit = 1ULL << arg3;
+                if (!(p->cap_permitted & bit) || !(p->cap_inheritable & bit))
+                    return (uint64_t)-EPERM;
+                p->cap_ambient |= bit;
+                return 0;
+            }
+            return (uint64_t)-EINVAL;
         case PR_CAPBSET_READ:
-            return 1;
+            if (arg2 > 63) return (uint64_t)-EINVAL;
+            return (p->cap_bounding >> arg2) & 1U;
+        case PR_CAPBSET_DROP:
+            if (arg2 > 63) return (uint64_t)-EINVAL;
+            if (!(p->cap_effective & BOLDON_CAP_SETPCAP)) return (uint64_t)-EPERM;
+            p->cap_bounding &= ~(1ULL << arg2);
+            return 0;
         default:
             return (uint64_t)-EINVAL;
     }
@@ -1069,11 +1212,18 @@ uint64_t sys_setfsuid_impl(uint64_t fsuid_raw) {
     process_t *p = get_current_process();
     if (!p) return 0;
 
-    uint32_t old_fsuid = p->euid;
+    uint32_t old_fsuid = p->fsuid;
     uint32_t new_fsuid = (uint32_t)fsuid_raw;
 
-    if (new_fsuid == p->uid || new_fsuid == p->euid || p->euid == 0) {
-        p->euid = new_fsuid;
+    if (new_fsuid == p->uid || new_fsuid == p->euid ||
+        new_fsuid == p->suid || new_fsuid == p->fsuid ||
+        (p->cap_effective & BOLDON_CAP_SETUID)) {
+        p->fsuid = new_fsuid;
+        if (old_fsuid == 0 && new_fsuid != 0)
+            p->cap_effective &= ~BOLDON_CAP_DAC_OVERRIDE;
+        else if (old_fsuid != 0 && new_fsuid == 0)
+            p->cap_effective |= p->cap_permitted & BOLDON_CAP_DAC_OVERRIDE;
+        if (p->fd_table) p->fd_table->uid = new_fsuid;
     }
 
     return (uint64_t)old_fsuid;
@@ -1083,11 +1233,14 @@ uint64_t sys_setfsgid_impl(uint64_t fsgid_raw) {
     process_t *p = get_current_process();
     if (!p) return 0;
 
-    uint32_t old_fsgid = p->egid;
+    uint32_t old_fsgid = p->fsgid;
     uint32_t new_fsgid = (uint32_t)fsgid_raw;
 
-    if (new_fsgid == p->gid || new_fsgid == p->egid || p->euid == 0) {
-        p->egid = new_fsgid;
+    if (new_fsgid == p->gid || new_fsgid == p->egid ||
+        new_fsgid == p->sgid || new_fsgid == p->fsgid ||
+        (p->cap_effective & BOLDON_CAP_SETGID)) {
+        p->fsgid = new_fsgid;
+        if (p->fd_table) p->fd_table->gid = new_fsgid;
     }
 
     return (uint64_t)old_fsgid;

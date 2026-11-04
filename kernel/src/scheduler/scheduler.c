@@ -2,6 +2,7 @@
 #include "kernel.h"
 #include <scheduler/scheduler.h>
 #include <scheduler/spinlock.h>
+#include <sys/capability.h>
 #include <mm/vmm.h>
 #include <mm/malloc.h>
 #include <mm/pmm.h>
@@ -181,6 +182,12 @@ process_t* create_task_kernel_arg(void *addr, uint64_t arg, const char *name) {
     proc->pml4              = get_kernel_pml4();
     proc->is_kernel_process = true;
     proc->state             = TASK_WAITING;
+    /* Kernel-created init enters userspace through execve. Give it the
+       same initial bounding set as a root user task so the exec transition
+       does not silently strip every capability, including CAP_SETFCAP. */
+    proc->cap_bounding = BOLDON_CAP_SUPPORTED;
+    proc->cap_permitted = BOLDON_CAP_SUPPORTED;
+    proc->cap_effective = BOLDON_CAP_SUPPORTED;
     t->is_kernel            = true;
 
     if (!tasks_insert(proc)) {
@@ -246,6 +253,9 @@ process_t* create_task_user(void *addr, page_table_t *pml4,
     proc->pml4              = pml4;
     proc->is_kernel_process = false;
     proc->state             = TASK_WAITING;
+    proc->cap_bounding = BOLDON_CAP_SUPPORTED;
+    proc->cap_permitted = BOLDON_CAP_SUPPORTED;
+    proc->cap_effective = BOLDON_CAP_SUPPORTED;
 
     uint64_t flags;
     spin_lock_irqsave(&sched_lock, &flags);
@@ -269,6 +279,51 @@ void scheduler_update_pml4(page_table_t *new_pml4) {
     spin_lock_irqsave(&sched_lock, &flags);
     last_pml4[get_cpu_id()] = new_pml4;
     spin_unlock_irqrestore(&sched_lock, flags);
+}
+
+int scheduler_pid_status(uint64_t pid, uint32_t *euid) {
+    if (!pid) return -1;
+    int status = -1;
+    uint64_t flags;
+    spin_lock_irqsave(&sched_lock, &flags);
+    for (int i = 1; i < MAX_TASKS; i++) {
+        process_t *p = tasks[i];
+        if (!p || p->pid != pid || p->is_kernel_process) continue;
+        if (euid) *euid = p->euid;
+        status = (p->state == TASK_DEAD || p->state == TASK_ZOMBIE) ? 1 : 0;
+        break;
+    }
+    spin_unlock_irqrestore(&sched_lock, flags);
+    return status;
+}
+
+int scheduler_cap_snapshot(uint64_t pid, uint64_t *effective,
+                           uint64_t *permitted, uint64_t *inheritable) {
+    int found = -1;
+    uint64_t flags;
+    spin_lock_irqsave(&sched_lock, &flags);
+    for (int i = 1; i < MAX_TASKS; i++) {
+        process_t *p = tasks[i];
+        if (!p || p->pid != pid || p->is_kernel_process ||
+            p->state == TASK_DEAD || p->state == TASK_ZOMBIE) continue;
+        *effective = p->cap_effective;
+        *permitted = p->cap_permitted;
+        *inheritable = p->cap_inheritable;
+        found = 0;
+        break;
+    }
+    spin_unlock_irqrestore(&sched_lock, flags);
+    return found;
+}
+
+bool scheduler_detach_zombie(int slot, process_t *proc) {
+    if (slot <= 0 || slot >= MAX_TASKS || !proc) return false;
+    uint64_t flags;
+    spin_lock_irqsave(&sched_lock, &flags);
+    bool detached = tasks[slot] == proc && proc->state == TASK_ZOMBIE;
+    if (detached) tasks[slot] = NULL;
+    spin_unlock_irqrestore(&sched_lock, flags);
+    return detached;
 }
 
 process_t *find_process_name(const char *name) {

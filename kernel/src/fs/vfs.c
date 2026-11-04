@@ -1,4 +1,6 @@
 #include <fs/vfs.h>
+#include <fs/inotify.h>
+#include <sys/capability.h>
 #include <mm/malloc.h>
 #include <memory.h>
 #include <gconsole.h>
@@ -31,6 +33,21 @@ static char boot_drive_letter = 'C';
 
 static void normalize_path_raw(const char *path, char *norm, size_t cap);
 static bool letter_is_root(char c);
+
+/* Writable executables must not keep file-granted privileges after their
+   contents change. Treat xattr I/O failures as a reason to refuse mutation. */
+static int vfs_drop_file_caps(vfs_node_t *node) {
+    if (!node || node->type != VFS_TYPE_FILE || !node->ops ||
+        !node->ops->getxattr) return 0;
+    uint8_t value[24];
+    int len = node->ops->getxattr(node, "security.capability", value, sizeof(value));
+    if (len == -ENODATA) return 0;
+    if (len < 0) return len;
+    if (!node->ops->removexattr) return -EOPNOTSUPP;
+    int result = node->ops->removexattr(node, "security.capability");
+    if (!result) inotify_vfs_event(node, IN_ATTRIB, NULL);
+    return result == -ENODATA ? 0 : result;
+}
 
 void vfs_init(void) {
     memset(drives, 0, sizeof(drives));
@@ -98,6 +115,7 @@ int vfs_umount_fs(char drive_letter) {
     vfs_mount_t *mnt = drives[drive_letter - 'A'];
     if (!mnt) return -EINVAL;
 
+    inotify_vfs_unmount(mnt);
     if (mnt->unmount) mnt->unmount(mnt);
     mnt->dead = true;
 
@@ -323,7 +341,8 @@ char* normalize_path(const char *path) {
     return norm;
 }
 
-vfs_node_t *vfs_resolve_path_ext(const char *path, bool parent_only, char *last_component) {
+static vfs_node_t *vfs_resolve_path_options(const char *path, bool parent_only,
+                                            char *last_component, bool nofollow_last) {
     if (!path) return NULL;
     char *norm = normalize_path(path);
     if (!norm) return NULL;
@@ -357,6 +376,16 @@ vfs_node_t *vfs_resolve_path_ext(const char *path, bool parent_only, char *last_
         token[t] = '\0';
         while (*p == '/') p++;
 
+        /* A final-file DAC check is not enough: each traversed directory
+           must grant search permission, including parents of mutations. */
+        process_t *caller = get_current_process();
+        if (caller && !caller->is_kernel_process &&
+            (current->type != VFS_TYPE_DIR ||
+             vfs_check_access(current, caller->fsuid, caller->fsgid,
+                              VFS_PERM_EXEC))) {
+            current = NULL;
+            break;
+        }
         if (t == 1 && token[0] == '.') continue;
         if (t == 2 && token[0] == '.' && token[1] == '.') {
             if (parent_count) current = parents[--parent_count];
@@ -374,7 +403,7 @@ vfs_node_t *vfs_resolve_path_ext(const char *path, bool parent_only, char *last_
 
         vfs_node_t *next = current->ops->lookup(current, token);
         if (!next) { current = NULL; break; }
-        if (next->type == VFS_TYPE_SYMLINK) {
+        if (next->type == VFS_TYPE_SYMLINK && !(nofollow_last && !*p)) {
             if (++symlink_count > MAX_SYMLINK_DEPTH || !next->ops || !next->ops->readlink) {
                 current = NULL;
                 break;
@@ -434,8 +463,16 @@ vfs_node_t *vfs_resolve_path_ext(const char *path, bool parent_only, char *last_
     return current;
 }
 
+vfs_node_t *vfs_resolve_path_ext(const char *path, bool parent_only, char *last_component) {
+    return vfs_resolve_path_options(path, parent_only, last_component, false);
+}
+
 vfs_node_t *vfs_resolve_path(const char *path) {
-    return vfs_resolve_path_ext(path, false, NULL);
+    return vfs_resolve_path_options(path, false, NULL, false);
+}
+
+vfs_node_t *vfs_resolve_path_nofollow(const char *path) {
+    return vfs_resolve_path_options(path, false, NULL, true);
 }
 
 vfs_node_t *vfs_resolve_path_ext_r(const char *path, bool parent_only, char *last_component, int depth) {
@@ -444,7 +481,13 @@ vfs_node_t *vfs_resolve_path_ext_r(const char *path, bool parent_only, char *las
 }
 
 int vfs_check_access(vfs_node_t *node, uint32_t uid, uint32_t gid, int req_perms) {
-    if (uid == 0) return 0;
+    process_t *p = get_current_process();
+    if ((!p && uid == 0) ||
+        (p && p->fsuid == uid &&
+         (p->cap_effective & BOLDON_CAP_DAC_OVERRIDE))) {
+        /* CAP_DAC_OVERRIDE does not execute a file without any x bit. */
+        if (!(req_perms & VFS_PERM_EXEC) || (node->mode & 0111)) return 0;
+    }
     int perms = 0;
     if (node->uid == uid) {
         perms = (node->mode >> 6) & 7;
@@ -459,16 +502,18 @@ int vfs_check_access(vfs_node_t *node, uint32_t uid, uint32_t gid, int req_perms
 
 vfs_file_t *vfs_open(const char *path, uint32_t flags) {
     vfs_node_t *node = vfs_resolve_path(path);
-
     if (!node && (flags & VFS_O_CREAT)) {
         char filename[256];
         vfs_node_t *parent = vfs_resolve_path_ext(path, true, filename);
         if (parent && parent->ops && parent->ops->create) {
-            parent->ops->create(parent, filename, 0644, &node);
+            if (parent->ops->create(parent, filename, 0644, &node) == 0 && node) {
+                inotify_vfs_event(parent, IN_CREATE, filename);
+            }
         }
     }
 
     if (!node) return NULL;
+    if ((flags & VFS_O_TRUNC) && vfs_drop_file_caps(node)) return NULL;
 
     vfs_file_t *file = malloc_alloc(sizeof(vfs_file_t));
     if (!file) return NULL;
@@ -488,21 +533,32 @@ vfs_file_t *vfs_open(const char *path, uint32_t flags) {
 
     if ((flags & VFS_O_TRUNC) && node->size > 0 && node->file_ops && node->file_ops->write) {
         node->size = 0;
+        inotify_vfs_event(node, IN_MODIFY, NULL);
     }
-
+    inotify_vfs_event(node, IN_OPEN, NULL);
     return file;
 }
 
 int vfs_read(vfs_file_t *file, void *buf, uint64_t count) {
     if (!file || !file->node || !file->node->file_ops || !file->node->file_ops->read)
         return -1;
-    return file->node->file_ops->read(file, buf, count);
+    if (!(file->flags & VFS_O_READ)) return -EBADF;
+    int result = file->node->file_ops->read(file, buf, count);
+    if (result > 0) inotify_vfs_event(file->node, IN_ACCESS, NULL);
+    return result;
 }
 
 int vfs_write(vfs_file_t *file, const void *buf, uint64_t count) {
     if (!file || !file->node || !file->node->file_ops || !file->node->file_ops->write)
         return -1;
-    return file->node->file_ops->write(file, buf, count);
+    if (!(file->flags & VFS_O_WRITE)) return -EBADF;
+    if (count) {
+        int drop = vfs_drop_file_caps(file->node);
+        if (drop) return drop;
+    }
+    int result = file->node->file_ops->write(file, buf, count);
+    if (result > 0) inotify_vfs_event(file->node, IN_MODIFY, NULL);
+    return result;
 }
 
 int vfs_readdir(vfs_file_t *file, vfs_dirent_t *dirent) {
@@ -518,6 +574,9 @@ int vfs_close(vfs_file_t *file) {
         return 0;
     }
 
+    if (file->node && file->node->type == VFS_TYPE_FILE)
+        inotify_vfs_event(file->node,
+            (file->flags & VFS_O_WRITE) ? IN_CLOSE_WRITE : IN_CLOSE_NOWRITE, NULL);
     int res = 0;
     if (file->node && file->node->file_ops && file->node->file_ops->close) {
         res = file->node->file_ops->close(file);
@@ -565,18 +624,21 @@ int vfs_stat(const char *path, vfs_stat_t *st) {
 int vfs_chmod(const char *path, uint32_t mode) {
     vfs_node_t *node = vfs_resolve_path(path);
     if (!node) return -1;
-    if (node->ops && node->ops->chmod) return node->ops->chmod(node, mode);
-    node->mode = mode;
-    return 0;
+    int result = 0;
+    if (node->ops && node->ops->chmod) result = node->ops->chmod(node, mode);
+    else node->mode = mode;
+    if (!result) inotify_vfs_event(node, IN_ATTRIB, NULL);
+    return result;
 }
 
 int vfs_chown(const char *path, uint32_t uid, uint32_t gid) {
     vfs_node_t *node = vfs_resolve_path(path);
     if (!node) return -1;
-    if (node->ops && node->ops->chown) return node->ops->chown(node, uid, gid);
-    node->uid = uid;
-    node->gid = gid;
-    return 0;
+    int result = 0;
+    if (node->ops && node->ops->chown) result = node->ops->chown(node, uid, gid);
+    else { node->uid = uid; node->gid = gid; }
+    if (!result) inotify_vfs_event(node, IN_ATTRIB, NULL);
+    return result;
 }
 
 int vfs_copy_file(const char *src_path, const char *dst_path) {
@@ -619,7 +681,9 @@ int vfs_mkdir(const char *path, uint32_t mode) {
     if (parent->type != VFS_TYPE_DIR) return -ENOTDIR;
 
     if (parent->ops && parent->ops->mkdir) {
-        return parent->ops->mkdir(parent, dirname, mode);
+        int result = parent->ops->mkdir(parent, dirname, mode);
+        if (!result) inotify_vfs_event(parent, IN_CREATE | IN_ISDIR, dirname);
+        return result;
     }
 
     return -EROFS;
@@ -639,7 +703,12 @@ int vfs_unlink(const char *path) {
     if (parent->type != VFS_TYPE_DIR) return -ENOTDIR;
 
     if (parent->ops && parent->ops->unlink) {
-        return parent->ops->unlink(parent, filename);
+        int result = parent->ops->unlink(parent, filename);
+        if (!result) {
+            inotify_vfs_event(parent, IN_DELETE, filename);
+            inotify_vfs_event(node, IN_DELETE_SELF, NULL);
+        }
+        return result;
     }
 
     return -EROFS;
@@ -657,7 +726,12 @@ int vfs_rmdir(const char *path) {
     if (!parent) return -ENOENT;
 
     if (parent->ops && parent->ops->rmdir) {
-        return parent->ops->rmdir(parent, filename);
+        int result = parent->ops->rmdir(parent, filename);
+        if (!result) {
+            inotify_vfs_event(parent, IN_DELETE | IN_ISDIR, filename);
+            inotify_vfs_event(node, IN_DELETE_SELF, NULL);
+        }
+        return result;
     }
 
     return -EROFS;
@@ -665,14 +739,23 @@ int vfs_rmdir(const char *path) {
 
 int sys_open(process_fd_table_t *table, const char *path, uint32_t flags) {
     if (!table) return -EINVAL;
+    /* Do not truncate through a read-only descriptor or with read-only DAC. */
+    if ((flags & VFS_O_TRUNC) && !(flags & VFS_O_WRITE)) return -EACCES;
     
     int req_perms = 0;
     if (flags & VFS_O_READ) req_perms |= VFS_PERM_READ;
     if (flags & VFS_O_WRITE) req_perms |= VFS_PERM_WRITE;
 
     vfs_node_t *node = vfs_resolve_path(path);
-    if (node && vfs_check_access(node, table->uid, table->gid, req_perms) != 0) {
-        return -EACCES; 
+    if (node && vfs_check_access(node, table->uid, table->gid, req_perms) != 0)
+        return -EACCES;
+    if (!node && (flags & VFS_O_CREAT)) {
+        char name[256];
+        vfs_node_t *parent = vfs_resolve_path_ext(path, true, name);
+        if (!parent) return -ENOENT;
+        if (vfs_check_access(parent, table->uid, table->gid,
+                             VFS_PERM_WRITE | VFS_PERM_EXEC) != 0)
+            return -EACCES;
     }
 
     vfs_file_t *file = vfs_open(path, flags);
@@ -723,22 +806,78 @@ int vfs_link(const char *oldpath, const char *newpath) {
     if (parent->type != VFS_TYPE_DIR) return -ENOTDIR;
 
     if (parent->ops && parent->ops->link) {
-        return parent->ops->link(parent, old_node, filename);
+        int result = parent->ops->link(parent, old_node, filename);
+        if (!result) {
+            inotify_vfs_event(parent, IN_CREATE, filename);
+            inotify_vfs_event(old_node, IN_ATTRIB, NULL);
+        }
+        return result;
     }
 
-    return 0;
+    return -EROFS;
+}
+
+int vfs_rename(const char *oldpath, const char *newpath) {
+    if (!oldpath || !newpath) return -EINVAL;
+    vfs_node_t *moved = vfs_resolve_path_nofollow(oldpath);
+    if (strcmp(oldpath, newpath) == 0) return moved ? 0 : -ENOENT;
+    if (!moved) return -ENOENT;
+    char old_name[256] = {0}, new_name[256] = {0};
+    vfs_node_t *from = vfs_resolve_path_ext(oldpath, true, old_name);
+    vfs_node_t *to = vfs_resolve_path_ext(newpath, true, new_name);
+    if (!from || !to) return -ENOENT;
+    if (!old_name[0] || !new_name[0]) return -EINVAL;
+    if (from->mount != to->mount) return -EXDEV;
+    if (from->type != VFS_TYPE_DIR || to->type != VFS_TYPE_DIR)
+        return -ENOTDIR;
+    if (from == to && strcmp(old_name, new_name) == 0) return 0;
+    /* Renaming a hardlink over another name of the same inode is a no-op.
+       Never substitute unlink+rename for an atomic replacement. */
+    vfs_node_t *existing = vfs_resolve_path_nofollow(newpath);
+    if (existing) {
+        if (existing->mount == moved->mount && existing->inode_num &&
+            existing->inode_num == moved->inode_num) return 0;
+        if (existing->type == VFS_TYPE_DIR && moved->type != VFS_TYPE_DIR)
+            return -EISDIR;
+        if (existing->type != VFS_TYPE_DIR && moved->type == VFS_TYPE_DIR)
+            return -ENOTDIR;
+    }
+    if (!from->ops || !from->ops->rename) return -ENOSYS;
+    int result = from->ops->rename(from, old_name, to, new_name);
+    if (!result) {
+        if (existing) inotify_vfs_event(existing, IN_DELETE_SELF, NULL);
+        inotify_vfs_move(from, old_name, to, new_name, moved);
+    }
+    return result;
 }
 
 int vfs_fchmod(vfs_file_t *file, uint32_t mode) {
     if (!file || !file->node) return -EBADF;
 
-    if (file->node->ops && file->node->ops->chmod) {
-        return file->node->ops->chmod(file->node, mode);
-    }
-
-    file->node->mode = mode;
-    return 0;
+    int result = 0;
+    if (file->node->ops && file->node->ops->chmod)
+        result = file->node->ops->chmod(file->node, mode);
+    else file->node->mode = mode;
+    if (!result) inotify_vfs_event(file->node, IN_ATTRIB, NULL);
+    return result;
 }
+
+int vfs_setxattr(vfs_node_t *node, const char *name, const void *value, uint64_t size) {
+    if (!node || !node->ops || !node->ops->setxattr) return -EOPNOTSUPP;
+    if (node->mount && node->mount->read_only) return -EROFS;
+    int result = node->ops->setxattr(node, name, value, size);
+    if (!result) inotify_vfs_event(node, IN_ATTRIB, NULL);
+    return result;
+}
+
+int vfs_removexattr(vfs_node_t *node, const char *name) {
+    if (!node || !node->ops || !node->ops->removexattr) return -EOPNOTSUPP;
+    if (node->mount && node->mount->read_only) return -EROFS;
+    int result = node->ops->removexattr(node, name);
+    if (!result) inotify_vfs_event(node, IN_ATTRIB, NULL);
+    return result;
+}
+
 
 int sys_ioctl(process_fd_table_t *table, int fd, uint64_t request, void *arg) {
     if (!table || fd < 0 || fd >= VFS_MAX_FD || !table->fds[fd]) return -1;

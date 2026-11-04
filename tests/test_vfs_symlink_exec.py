@@ -5,8 +5,8 @@ import tempfile
 
 root = Path(__file__).resolve().parents[1]
 vfs = (root / 'kernel/src/fs/vfs.c').read_text()
-resolver = vfs[vfs.index('vfs_node_t *vfs_resolve_path_ext(const char *path, bool parent_only, char *last_component) {'):
-               vfs.index('int vfs_check_access(', vfs.index('vfs_node_t *vfs_resolve_path_ext('))]
+resolver = vfs[vfs.index('static vfs_node_t *vfs_resolve_path_options('):
+               vfs.index('int vfs_check_access(', vfs.index('static vfs_node_t *vfs_resolve_path_options('))]
 code = r'''
 #include <assert.h>
 #include <stdbool.h>
@@ -14,6 +14,7 @@ code = r'''
 #include <stdlib.h>
 #include <string.h>
 #define MAX_SYMLINK_DEPTH 8
+#define VFS_PERM_EXEC 1
 typedef enum { VFS_TYPE_DIR, VFS_TYPE_FILE, VFS_TYPE_SYMLINK } vfs_node_type_t;
 typedef struct vfs_node vfs_node_t;
 typedef struct {
@@ -30,6 +31,14 @@ static vfs_node_t nodes[32];
 static unsigned count;
 static vfs_mount_t cmount, dmount;
 static vfs_mount_t *drives[26];
+typedef struct { bool is_kernel_process; uint32_t fsuid, fsgid; } process_t;
+static process_t caller;
+static bool deny_usr;
+static process_t *get_current_process(void) { return &caller; }
+static int vfs_check_access(vfs_node_t *node, uint32_t uid, uint32_t gid, int perms) {
+    (void)uid; (void)gid; (void)perms;
+    return deny_usr && !strcmp(node->path, "C:/usr") ? -1 : 0;
+}
 static void malloc_free(void *p) { free(p); }
 static vfs_node_t *lookup(vfs_node_t *dir, const char *name) {
     char path[512];
@@ -72,7 +81,7 @@ int main(void) {
     add("C:/bin", VFS_TYPE_SYMLINK, "usr/bin");
     add("C:/usr", VFS_TYPE_DIR, NULL);
     add("C:/usr/bin", VFS_TYPE_DIR, NULL);
-    add("C:/usr/bin/sh", VFS_TYPE_SYMLINK, "bash");
+    vfs_node_t *shlink = add("C:/usr/bin/sh", VFS_TYPE_SYMLINK, "bash");
     vfs_node_t *bash = add("C:/usr/bin/bash", VFS_TYPE_FILE, NULL);
     add("C:/lib64", VFS_TYPE_SYMLINK, "usr/lib");
     add("C:/usr/lib", VFS_TYPE_DIR, NULL);
@@ -85,6 +94,8 @@ int main(void) {
     vfs_node_t *devnull = add("D:/null", VFS_TYPE_FILE, NULL);
     add("C:/devlink", VFS_TYPE_SYMLINK, "/dev/null");
     assert(vfs_resolve_path("/bin/sh") == bash);
+    assert(vfs_resolve_path_nofollow("/bin/sh") == shlink);
+    assert(vfs_resolve_path_nofollow("/usr/bin/bash") == bash);
     assert(vfs_resolve_path("C:/bin/sh") == bash);
     assert(vfs_resolve_path("/etc/shell") == bash);
     assert(vfs_resolve_path("/bin/../../lib64/ld-linux-x86-64.so.2") == ld);
@@ -95,6 +106,11 @@ int main(void) {
     char name[256] = {0};
     assert(vfs_resolve_path_ext("/bin/new", true, name) == &nodes[4]);
     assert(!strcmp(name, "new"));
+    deny_usr = true;
+    assert(vfs_resolve_path("/usr/bin/bash") == NULL);
+    assert(vfs_resolve_path_ext("/usr/bin/new", true, name) == NULL);
+    caller.is_kernel_process = true;
+    assert(vfs_resolve_path("/usr/bin/bash") == bash);
     return 0;
 }
 '''

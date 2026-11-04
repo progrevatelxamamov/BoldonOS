@@ -67,12 +67,19 @@ typedef struct process {
     uint32_t uid;
     uint32_t euid;
     uint32_t suid;
+    uint32_t fsuid;
 
     uint32_t gid;
     uint32_t egid;
     uint32_t sgid;
+    uint32_t fsgid;
 
     uint32_t umask;
+    /* Supported Linux capability subset; all sets are per-process until
+       thread credentials are represented separately. */
+    uint64_t cap_permitted, cap_effective, cap_inheritable;
+    uint64_t cap_bounding, cap_ambient;
+    bool no_new_privs;
 } process_t;
 
 struct cpu_local_data {
@@ -141,6 +148,13 @@ void task_wake_thread(thread_t *t);
 process_t *get_current_process(void);
 thread_t  *get_current_thread(void);
 bool tasks_insert(process_t *proc);
+/* Snapshot a PID without exporting a process pointer that can be reaped.
+   Returns -1 if absent, 0 if running, 1 if exited/zombie. */
+int scheduler_pid_status(uint64_t pid, uint32_t *euid);
+int scheduler_cap_snapshot(uint64_t pid, uint64_t *effective,
+                           uint64_t *permitted, uint64_t *inheritable);
+/* Detach a reaped zombie before freeing it; protects pidfd poll snapshots. */
+bool scheduler_detach_zombie(int slot, process_t *proc);
 /* Queue SIGINT for the controlling PTY's foreground processes. If job
    control did not set a foreground pgid, restrict delivery to shell children. */
 int scheduler_tty_sigint(void *tty, uint64_t foreground_pgid);

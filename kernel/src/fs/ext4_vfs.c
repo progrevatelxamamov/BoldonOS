@@ -231,22 +231,28 @@ static ext4_vfs_handle_t *ext4_ensure_handle(vfs_file_t *file) {
         }
     } else {
         h->is_dir = false;
-        const char *mode = "r+";
-        if (file->flags & VFS_O_CREAT) mode = "w+";
-        else if (!(file->flags & VFS_O_WRITE)) mode = "r";
-
+        /* O_CREAT is not O_TRUNC. The VFS has already created missing
+           files; opening an existing file must never discard its contents. */
+        const char *mode = (file->flags & VFS_O_TRUNC) ? "w+" :
+                           ((file->flags & (VFS_O_APPEND | VFS_O_WRITE)) ==
+                            (VFS_O_APPEND | VFS_O_WRITE)) ? "a+" :
+                           (file->flags & VFS_O_WRITE) ? "r+" : "r";
         int r = ext4_fopen(&h->file, path, mode);
         if (r != EOK) {
-            r = ext4_fopen(&h->file, path, "r");
-            if (r != EOK) {
-                malloc_free(h);
-                return NULL;
-            }
+            /* Never disguise a failed write open as a successful read open. */
+            malloc_free(h);
+            return NULL;
         }
     }
 
     file->private_data = h;
     return h;
+}
+
+static int ext4_vfs_op_open(vfs_file_t *file) {
+    /* Make truncation and open errors visible at open(2), not at the first
+       later read/write, which might never happen. */
+    return ext4_ensure_handle(file) ? 0 : -EIO;
 }
 
 static int ext4_vfs_op_read(vfs_file_t *file, void *buf, uint64_t count) {
@@ -367,6 +373,10 @@ static vfs_node_t *ext4_vfs_op_lookup(vfs_node_t *dir, const char *name) {
     node->inode_num = ino;
     node->size = size;
     node->mode = mode;
+    if (ext4_owner_get(p_path, &node->uid, &node->gid) != EOK) {
+        malloc_free(node);
+        return NULL;
+    }
     node->refcount = 1;
     node->mount = dir->mount;
     node->ops = &g_ext4_node_ops;
@@ -428,7 +438,9 @@ static int ext4_vfs_op_create(vfs_node_t *dir, const char *name, uint16_t mode, 
 
     ext4_file f;
     trace_xorg_ext4_create("bind.ext4.fopen", 0, target_path);
-    int r = ext4_fopen(&f, target_path, "w+");
+    /* A second process may create the name after VFS lookup. a+ avoids
+       truncating that file; the old w+ silently destroyed its contents. */
+    int r = ext4_fopen(&f, target_path, "a+");
     trace_xorg_ext4_create("bind.ext4.fopen.done", (uint64_t)(uint32_t)r, target_path);
     if (r != EOK) return -1;
     ext4_fclose(&f);
@@ -550,6 +562,21 @@ static int ext4_vfs_op_link(vfs_node_t *dir, vfs_node_t *old_node, const char *n
     return (r == EOK) ? 0 : -1;
 }
 
+static int ext4_vfs_op_rename(vfs_node_t *old_dir, const char *old_name,
+                              vfs_node_t *new_dir, const char *new_name) {
+    char from_parent[512], to_parent[512], from[512], to[512];
+    get_lwext4_path(old_dir, from_parent, sizeof(from_parent));
+    get_lwext4_path(new_dir, to_parent, sizeof(to_parent));
+    int a = snprintf(from, sizeof(from), "%s%s%s", from_parent,
+                     strcmp(from_parent, "/") == 0 ? "" : "/", old_name);
+    int b = snprintf(to, sizeof(to), "%s%s%s", to_parent,
+                     strcmp(to_parent, "/") == 0 ? "" : "/", new_name);
+    if (a < 0 || b < 0 || a >= (int)sizeof(from) || b >= (int)sizeof(to))
+        return -ENAMETOOLONG;
+    int r = ext4_frename(from, to);
+    return r == EOK ? 0 : -r;
+}
+
 static int ext4_vfs_op_chmod(vfs_node_t *node, uint32_t mode) {
     if (!node) return -1;
 
@@ -561,6 +588,34 @@ static int ext4_vfs_op_chmod(vfs_node_t *node, uint32_t mode) {
 
     node->mode = mode;
     return 0;
+}
+
+static int ext4_vfs_op_getxattr(vfs_node_t *node, const char *name,
+                                 void *buf, uint64_t size) {
+    if (!node || !name || !buf || size > 0x7fffffffULL) return -EINVAL;
+    char path[512];
+    get_lwext4_path(node, path, sizeof(path));
+    size_t actual = 0;
+    int r = ext4_getxattr(path, name, strlen(name), buf, (size_t)size, &actual);
+    if (r != EOK) return -r;
+    return actual <= (size_t)size ? (int)actual : -ERANGE;
+}
+
+static int ext4_vfs_op_setxattr(vfs_node_t *node, const char *name,
+                                const void *buf, uint64_t size) {
+    if (!node || !name || !buf || size > 24) return -EINVAL;
+    char path[512];
+    get_lwext4_path(node, path, sizeof(path));
+    int r = ext4_setxattr(path, name, strlen(name), buf, (size_t)size);
+    return r == EOK ? 0 : -r;
+}
+
+static int ext4_vfs_op_removexattr(vfs_node_t *node, const char *name) {
+    if (!node || !name) return -EINVAL;
+    char path[512];
+    get_lwext4_path(node, path, sizeof(path));
+    int r = ext4_removexattr(path, name, strlen(name));
+    return r == EOK ? 0 : -r;
 }
 
 static int ext4_vfs_op_chown(vfs_node_t *node, uint32_t uid, uint32_t gid) {
@@ -698,6 +753,16 @@ vfs_mount_t *ext4_vfs_mount(const char *device, void *data) {
         return NULL;
     }
     (void)ext4_mount_setup_locks(dev->mount_path, &ext4_os_locks);
+    /* Enable the on-disk journal so multi-metadata operations such as
+       replace-rename can commit as one transaction. */
+    r = ext4_journal_start(dev->mount_path);
+    if (r != EOK) {
+        ext4_umount(dev->mount_path);
+        ext4_device_unregister(dev->mp_name);
+        dev->used = false;
+        g_ext4_count--;
+        return NULL;
+    }
 
     vfs_mount_t *mnt = malloc_alloc(sizeof(vfs_mount_t));
     if (!mnt) return NULL;
@@ -712,6 +777,14 @@ vfs_mount_t *ext4_vfs_mount(const char *device, void *data) {
     strncpy(root->name, "", 255);
     root->inode_num = 2;
     root->type = VFS_TYPE_DIR;
+    /* Path traversal checks search permission on the mount root before
+       looking up its first component. Populate its on-disk credentials. */
+    if (ext4_mode_get("/", &root->mode) != EOK ||
+        ext4_owner_get("/", &root->uid, &root->gid) != EOK) {
+        malloc_free(root);
+        malloc_free(mnt);
+        return NULL;
+    }
     root->refcount = 1;
     root->mount = mnt;
     root->ops = &g_ext4_node_ops;
@@ -724,6 +797,7 @@ vfs_mount_t *ext4_vfs_mount(const char *device, void *data) {
 }
 
 void ext4_vfs_init(void) {
+    g_ext4_file_ops.open = ext4_vfs_op_open;
     g_ext4_file_ops.read = ext4_vfs_op_read;
     g_ext4_file_ops.write = ext4_vfs_op_write;
     g_ext4_file_ops.close = ext4_vfs_op_close;
@@ -739,10 +813,14 @@ void ext4_vfs_init(void) {
     g_ext4_node_ops.rmdir = ext4_vfs_op_rmdir;
     g_ext4_node_ops.symlink = ext4_vfs_op_symlink;
     g_ext4_node_ops.link = ext4_vfs_op_link;
+    g_ext4_node_ops.rename = ext4_vfs_op_rename;
     g_ext4_node_ops.readlink = ext4_vfs_op_readlink;
     g_ext4_node_ops.stat = ext4_vfs_op_stat;
     g_ext4_node_ops.chmod = ext4_vfs_op_chmod;
     g_ext4_node_ops.chown = ext4_vfs_op_chown;
+    g_ext4_node_ops.getxattr = ext4_vfs_op_getxattr;
+    g_ext4_node_ops.setxattr = ext4_vfs_op_setxattr;
+    g_ext4_node_ops.removexattr = ext4_vfs_op_removexattr;
 
     g_ext4_fs_type.mount = ext4_vfs_mount;
     g_ext4_fs_type.unmount = ext4_vfs_unmount;
@@ -757,6 +835,7 @@ int ext4_vfs_unmount(vfs_mount_t *mnt) {
     if (!dev->used) return 0;
 
     ext4_cache_flush(dev->mount_path);
+    ext4_journal_stop(dev->mount_path);
     ext4_umount(dev->mount_path);
     ext4_device_unregister(dev->mp_name);
 

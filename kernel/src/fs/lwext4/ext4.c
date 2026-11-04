@@ -1328,72 +1328,185 @@ Finish:
 
 }
 
+/* Do not move a directory below itself. Compare actual inode ancestry rather
+ * than path prefixes: paths may contain '..' or symlinks. Mount lock held. */
+static int ext4_rename_check_ancestor(struct ext4_mountpoint *mp,
+                                      const char *new_path, uint32_t source)
+{
+    const char *slash = NULL;
+    for (const char *p = new_path; *p; p++) if (*p == '/') slash = p;
+    if (!slash) return EINVAL;
+    size_t n = (size_t)(slash - new_path);
+    if (n >= 511) return ENAMETOOLONG;
+    char parent_path[512];
+    if (!n) { parent_path[0] = '/'; parent_path[1] = 0; }
+    else { memcpy(parent_path, new_path, n); parent_path[n] = 0; }
+
+    ext4_file f;
+    int r = ext4_generic_open2(&f, parent_path, O_RDONLY,
+                               EXT4_DE_UNKNOWN, NULL, NULL);
+    if (r != EOK) return r;
+    uint32_t current = f.inode;
+    ext4_fclose(&f);
+    for (unsigned depth = 0; depth < 256; depth++) {
+        if (current == source) return EINVAL;
+        if (current == EXT4_INODE_ROOT_INDEX) return EOK;
+        struct ext4_inode_ref ref;
+        r = ext4_fs_get_inode_ref(&mp->fs, current, &ref);
+        if (r != EOK) return r;
+        /* The HTree lookup hashes names in leaf blocks; '.' and '..' live
+         * in block zero (the index root), not in a leaf. Read that block
+         * directly for both indexed and linear directories. */
+        ext4_fsblk_t block_id;
+        r = ext4_fs_get_inode_dblk_idx(&ref, 0, &block_id, false);
+        if (r != EOK) { ext4_fs_put_inode_ref(&ref); return r; }
+        struct ext4_block block;
+        r = ext4_trans_block_get(mp->fs.bdev, &block, block_id);
+        if (r != EOK) { ext4_fs_put_inode_ref(&ref); return r; }
+        uint32_t block_size = ext4_sb_get_block_size(&mp->fs.sb);
+        struct ext4_dir_en *dot = (void *)block.data;
+        uint16_t dot_len = ext4_dir_en_get_entry_len(dot);
+        uint32_t parent = 0;
+        if (dot_len >= 8 && dot_len <= block_size - 12 &&
+            ext4_dir_en_get_name_len(&mp->fs.sb, dot) == 1 &&
+            dot->name[0] == '.') {
+            struct ext4_dir_en *dotdot = (void *)(block.data + dot_len);
+            uint16_t parent_len = ext4_dir_en_get_entry_len(dotdot);
+            if (parent_len >= 12 && parent_len <= block_size - dot_len &&
+                ext4_dir_en_get_name_len(&mp->fs.sb, dotdot) == 2 &&
+                dotdot->name[0] == '.' && dotdot->name[1] == '.')
+                parent = ext4_dir_en_get_inode(dotdot);
+        }
+        int release = ext4_block_set(mp->fs.bdev, &block);
+        int put = ext4_fs_put_inode_ref(&ref);
+        if (release != EOK) return release;
+        if (put != EOK) return put;
+        if (!parent || parent == current) return EINVAL;
+        current = parent;
+    }
+    return ELOOP;
+}
+
 int ext4_frename(const char *path, const char *new_path)
 {
 	int r;
 	ext4_file f;
-	uint32_t name_off;
+	uint32_t name_off, parent_inode, child_inode;
+	uint32_t target_parent_inode = 0, target_name_off = 0, target_inode = 0;
 	bool parent_loaded = false, child_loaded = false;
-	uint32_t parent_inode, child_inode;
+	bool target_parent_loaded = false, target_loaded = false, target_exists = false;
 	struct ext4_mountpoint *mp = ext4_get_mount(path);
-	struct ext4_inode_ref child_ref, parent_ref;
+	struct ext4_mountpoint *target_mp = ext4_get_mount(new_path);
+	struct ext4_inode_ref child_ref, parent_ref, target_ref, target_parent_ref;
 
-	if (!mp)
-		return ENOENT;
-
-	if (mp->fs.read_only)
-		return EROFS;
+	if (!mp) return ENOENT;
+	if (target_mp != mp) return EXDEV;
+	if (mp->fs.read_only) return EROFS;
 
 	EXT4_MP_LOCK(mp);
-
 	r = ext4_generic_open2(&f, path, O_RDONLY, EXT4_DE_UNKNOWN,
 				&parent_inode, &name_off);
-	if (r != EOK) {
-		EXT4_MP_UNLOCK(mp);
-		return r;
-	}
-
+	if (r != EOK) goto Unlock;
 	child_inode = f.inode;
 	ext4_fclose(&f);
-	ext4_trans_start(mp);
 
-	/*Load parent*/
+	/* Resolve the target before modifying either directory. All names are
+	 * serialized by the mount lock, including other filesystem operations. */
+	r = ext4_generic_open2(&f, new_path, O_RDONLY, EXT4_DE_UNKNOWN,
+				&target_parent_inode, &target_name_off);
+	if (r == EOK) {
+		target_exists = true;
+		target_inode = f.inode;
+		ext4_fclose(&f);
+		if (target_inode == child_inode) { r = EOK; goto Unlock; }
+	} else if (r != ENOENT) {
+		goto Unlock;
+	}
+
+	/* Replacing a name needs a real journal. A lock by itself only provides
+	 * runtime exclusion; it cannot make a multi-block rename crash-atomic. */
+	if (target_exists && !mp->fs.jbd_journal) { r = EOPNOTSUPP; goto Unlock; }
+    struct ext4_inode_ref source_ref;
+    r = ext4_fs_get_inode_ref(&mp->fs, child_inode, &source_ref);
+    if (r != EOK) goto Unlock;
+    bool source_dir = ext4_inode_is_type(&mp->fs.sb, source_ref.inode,
+                                         EXT4_INODE_MODE_DIRECTORY);
+    int put = ext4_fs_put_inode_ref(&source_ref);
+    if (put != EOK) { r = put; goto Unlock; }
+    if (source_dir) {
+        r = ext4_rename_check_ancestor(mp, new_path, child_inode);
+        if (r != EOK) goto Unlock;
+    }
+	r = ext4_trans_start(mp);
+	if (r != EOK) goto Unlock;
+
 	r = ext4_fs_get_inode_ref(&mp->fs, parent_inode, &parent_ref);
-	if (r != EOK)
-		goto Finish;
-
+	if (r != EOK) goto Finish;
 	parent_loaded = true;
-
-	/*We have file to unlink. Load it.*/
 	r = ext4_fs_get_inode_ref(&mp->fs, child_inode, &child_ref);
-	if (r != EOK)
-		goto Finish;
-
+	if (r != EOK) goto Finish;
 	child_loaded = true;
 
-	r = ext4_create_hardlink(new_path, &child_ref, true);
-	if (r != EOK)
-		goto Finish;
+	if (target_exists) {
+		r = ext4_fs_get_inode_ref(&mp->fs, target_parent_inode,
+				       &target_parent_ref);
+		if (r != EOK) goto Finish;
+		target_parent_loaded = true;
+		r = ext4_fs_get_inode_ref(&mp->fs, target_inode, &target_ref);
+		if (r != EOK) goto Finish;
+		target_loaded = true;
+		bool source_dir = ext4_inode_is_type(&mp->fs.sb, child_ref.inode,
+						    EXT4_INODE_MODE_DIRECTORY);
+		bool target_dir = ext4_inode_is_type(&mp->fs.sb, target_ref.inode,
+						    EXT4_INODE_MODE_DIRECTORY);
+		if (source_dir != target_dir) {
+			r = source_dir ? ENOTDIR : EISDIR;
+			goto Finish;
+		}
+		/* ext4_unlink checks that a directory is empty. The destination
+		 * name, parent link counts and the moved '..' entry are changed in
+		 * the same journal transaction before the old inode is retired. */
+		bool is_goal;
+		const char *name = new_path + target_name_off;
+		int len = ext4_path_check(name, &is_goal);
+		if (!is_goal || !len) { r = EINVAL; goto Finish; }
+		r = ext4_unlink(mp, &target_parent_ref, &target_ref, name, len);
+		if (r != EOK) goto Finish;
+	}
 
+	r = ext4_create_hardlink(new_path, &child_ref, true);
+	if (r != EOK) goto Finish;
 	r = ext4_remove_orig_reference(path, name_off, &parent_ref, &child_ref);
-	if (r != EOK)
-		goto Finish;
+	if (r != EOK) goto Finish;
+
+	if (target_exists) {
+		bool target_dir = ext4_inode_is_type(&mp->fs.sb, target_ref.inode,
+						    EXT4_INODE_MODE_DIRECTORY);
+		if (target_dir) {
+			/* ext4_unlink removed the parent name; '.' and '..' remain. */
+			ext4_inode_set_links_cnt(target_ref.inode, 0);
+			target_ref.dirty = true;
+			r = ext4_trunc_dir(mp, &target_parent_ref, &target_ref);
+		} else if (!ext4_inode_get_links_cnt(target_ref.inode)) {
+			r = ext4_trunc_inode(mp, target_ref.index, 0);
+		}
+		if (r != EOK) goto Finish;
+		if (target_dir || !ext4_inode_get_links_cnt(target_ref.inode)) {
+			ext4_inode_set_del_time(target_ref.inode, -1L);
+			r = ext4_fs_free_inode(&target_ref);
+		}
+	}
 
 Finish:
-	if (parent_loaded)
-		ext4_fs_put_inode_ref(&parent_ref);
-
-	if (child_loaded)
-		ext4_fs_put_inode_ref(&child_ref);
-
-	if (r != EOK)
-		ext4_trans_abort(mp);
-	else
-		ext4_trans_stop(mp);
-
+	if (target_loaded) ext4_fs_put_inode_ref(&target_ref);
+	if (target_parent_loaded) ext4_fs_put_inode_ref(&target_parent_ref);
+	if (parent_loaded) ext4_fs_put_inode_ref(&parent_ref);
+	if (child_loaded) ext4_fs_put_inode_ref(&child_ref);
+	if (r != EOK) ext4_trans_abort(mp);
+	else r = ext4_trans_stop(mp);
+Unlock:
 	EXT4_MP_UNLOCK(mp);
 	return r;
-
 }
 
 /****************************************************************************/
@@ -2856,7 +2969,7 @@ int ext4_removexattr(const char *path, const char *name, size_t name_len)
 	EXT4_MP_LOCK(mp);
 	r = ext4_generic_open2(&f, path, O_RDONLY, EXT4_DE_UNKNOWN, NULL, NULL);
 	if (r != EOK) {
-		EXT4_MP_LOCK(mp);
+		EXT4_MP_UNLOCK(mp);
 		return r;
 	}
 

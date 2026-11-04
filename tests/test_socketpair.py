@@ -30,6 +30,16 @@ code = r'''
 #define VFS_O_CLOEXEC 64
 #define VFS_O_RDWR 3
 #define VFS_MAX_FD 256
+#define VFS_PERM_WRITE 2
+#define VFS_PERM_EXEC 1
+typedef struct vfs_node { int unused; } vfs_node_t;
+static vfs_node_t parent_node;
+static vfs_node_t *vfs_resolve_path_ext(const char *path, bool parent_only, char *leaf) {
+    (void)path; (void)parent_only; strcpy(leaf, "socket"); return &parent_node;
+}
+static int vfs_check_access(vfs_node_t *node, uint32_t uid, uint32_t gid, int permission) {
+    (void)node; (void)uid; (void)gid; (void)permission; return 0;
+}
 typedef struct socket socket_t;
 typedef struct { int (*close)(socket_t *); } socket_ops_t;
 struct socket { int domain, type, protocol; socket_ops_t *ops; void *private_data; };
@@ -53,7 +63,7 @@ static socket_ops_t unix_ops = {.close=un_close};
 socket_t *unix_socket_create(int type, int protocol);
 typedef struct { socket_t *sock; int flags; } vfs_file_t;
 typedef struct { vfs_file_t *fds[VFS_MAX_FD]; } fd_table_t;
-typedef struct { fd_table_t *fd_table; } process_t;
+typedef struct { fd_table_t *fd_table; uint32_t fsuid, fsgid; } process_t;
 static fd_table_t fd_table;
 static process_t proc = {.fd_table=&fd_table};
 static process_t *get_current_process(void) { return &proc; }

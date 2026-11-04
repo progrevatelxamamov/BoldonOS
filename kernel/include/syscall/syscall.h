@@ -105,6 +105,8 @@
 #define SYS_SETSID      112
 #define SYS_GETPGID     121
 #define SYS_GETSID      124
+#define SYS_CAPGET      125
+#define SYS_CAPSET      126
 #define SYS_ARCH_PRCTL  158
 #define SYS_GETTID      186
 #define SYS_TKILL       200
@@ -127,6 +129,10 @@
 #define SYS_PSELECT6    270
 #define SYS_PPOLL       271
 #define SYS_CLOSE_RANGE 436
+#define SYS_INOTIFY_INIT  253
+#define SYS_INOTIFY_ADD_WATCH 254
+#define SYS_INOTIFY_RM_WATCH 255
+#define SYS_INOTIFY_INIT1 294
 #define SYS_SET_ROBUST_LIST 273
 #define SYS_UTIMENSAT   280
 #define SYS_SIGNALFD    282
@@ -141,12 +147,14 @@
 #define SYS_SPLICE      275
 #define SYS_EVENTFD2    290
 #define SYS_PRLIMIT64   302
+#define SYS_RENAMEAT2   316
 #define SYS_MEMFD_CREATE 319
 #define SYS_STATX       332
 #define SYS_MOUNT       165
 #define SYS_UMOUNT2     166
 /* Linux's new mount API; legacy mount(2) remains the supported path. */
 #define SYS_FSOPEN      430
+#define SYS_PIDFD_OPEN  434
 
 void syscall_init(void);
 uint64_t syscall_handler(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6);

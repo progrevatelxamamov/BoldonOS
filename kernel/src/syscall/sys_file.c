@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <fs/vfs.h>
+#include <sys/capability.h>
 #include <fs/mount.h>
 #include <disk/block.h>
 #include <disk/bcache.h>
@@ -145,16 +146,17 @@ static inline bool user_range_ok(uint64_t ptr, uint64_t len) {
 
 static int copy_str_from_user(char *dst, uint64_t src_user_ptr, size_t max_len) {
     if (!src_user_ptr || !user_range_ok(src_user_ptr, 1)) return -EFAULT;
+    if (!max_len) return -ENAMETOOLONG;
 
-    size_t i = 0;
-    for (; i < max_len - 1; i++) {
+    for (size_t i = 0; i < max_len; i++) {
         if (!user_range_ok(src_user_ptr + i, 1)) return -EFAULT;
         char c = *(const char *)(src_user_ptr + i);
         dst[i] = c;
         if (c == '\0') return 0;
     }
-    dst[i] = '\0';
-    return 0;
+    dst[max_len - 1] = '\0';
+    /* Never execute a mutation against a silently truncated pathname. */
+    return -ENAMETOOLONG;
 }
 
 uint64_t sys_memfd_create_w(uint64_t name, uint64_t flags) {
@@ -191,6 +193,7 @@ uint64_t sys_munmap_impl(uint64_t addr, uint64_t len) {
 
 uint64_t sys_access_impl(uint64_t path, uint64_t mode) {
     if (!path || !user_range_ok(path, 1)) return (uint64_t)-EFAULT;
+    if (mode & ~7ULL) return (uint64_t)-EINVAL;
 
     vfs_node_t *node = vfs_resolve_path((const char *)path);
     if (!node) return (uint64_t)-ENOENT;
@@ -379,9 +382,13 @@ uint64_t sys_stat_impl(uint64_t path, uint64_t statbuf) {
 
 uint64_t sys_newfstatat_impl(uint64_t dirfd, uint64_t path,
                              uint64_t statbuf, uint64_t flags) {
-    (void)dirfd; (void)flags;
-    if (!path || !statbuf) return (uint64_t)-EFAULT;
-    vfs_node_t *node = vfs_resolve_path((const char *)path);
+    char kpath[512];
+    if (!statbuf || !user_range_ok(statbuf, sizeof(struct linux_stat)) ||
+        copy_str_from_user(kpath, path, sizeof(kpath))) return (uint64_t)-EFAULT;
+    if ((int64_t)dirfd != -100 && kpath[0] != '/') return (uint64_t)-ENOSYS;
+    if (flags & ~0x100ULL) return (uint64_t)-ENOSYS;
+    vfs_node_t *node = flags & 0x100 /* AT_SYMLINK_NOFOLLOW */ ?
+        vfs_resolve_path_nofollow(kpath) : vfs_resolve_path(kpath);
     if (!node) return (uint64_t)-ENOENT;
     fill_linux_stat(node, (struct linux_stat *)statbuf);
     return 0;
@@ -520,12 +527,21 @@ static inline uint32_t translate_linux_open_flags(uint64_t linux_flags) {
     return vfs_flags;
 }
 
-uint64_t sys_open_impl(uint64_t a1, uint64_t a2, uint64_t a3) {
-    (void)a3;
+uint64_t sys_openat_impl(uint64_t dirfd, uint64_t path, uint64_t flags) {
     process_t *p = get_current_process();
     if (!p || !p->fd_table) return (uint64_t)-EBADF;
-    if (!a1) return (uint64_t)-EFAULT;
-    return (uint64_t)(int64_t)sys_open(p->fd_table, (const char *)a1, translate_linux_open_flags((uint32_t)a2));
+    char kpath[512];
+    if (copy_str_from_user(kpath, path, sizeof(kpath))) return (uint64_t)-EFAULT;
+    /* Absolute paths ignore dirfd; relative dirfd resolution is not yet
+       implemented and must never silently use the process cwd instead. */
+    if ((int64_t)dirfd != -100 && kpath[0] != '/') return (uint64_t)-ENOSYS;
+    return (uint64_t)(int64_t)sys_open(p->fd_table, kpath,
+                                      translate_linux_open_flags(flags));
+}
+
+uint64_t sys_open_impl(uint64_t path, uint64_t flags, uint64_t mode) {
+    (void)mode;
+    return sys_openat_impl((uint64_t)-100, path, flags);
 }
 
 uint64_t sys_close_impl(uint64_t a1) {
@@ -609,6 +625,11 @@ uint64_t sys_mmap_impl(uint64_t addr, uint64_t len, uint64_t prot,
     return virt_addr;
 }
 
+static bool console_mode_allowed(process_t *p) {
+    return p && (p->is_kernel_process ||
+                 (p->cap_effective & BOLDON_CAP_SYS_ADMIN));
+}
+
 uint64_t sys_ioctl_impl(uint64_t a1, uint64_t a2, uint64_t a3) {
     process_t *p = get_current_process();
     if (!p || !p->fd_table) return (uint64_t)-EBADF;
@@ -620,6 +641,8 @@ uint64_t sys_ioctl_impl(uint64_t a1, uint64_t a2, uint64_t a3) {
     vfs_file_t *file = p->fd_table->fds[fd];
 
     if (file && file->node && file->node->type == VFS_TYPE_CHAR_DEV && a2 == 0x4B3A) {
+        /* This ioctl actually changes the shared framebuffer owner. */
+        if (!console_mode_allowed(p)) return (uint64_t)-EPERM;
         if (a3 == 2) {
             gconsole_acquire_framebuffer();
             return 0;
@@ -643,7 +666,8 @@ uint64_t sys_ioctl_impl(uint64_t a1, uint64_t a2, uint64_t a3) {
     }
 
     switch (a2) {
-        case 0x4B3A: /* KDSETMODE */
+        case 0x4B3A: /* KDSETMODE is only valid for the handled console char device */
+            return (uint64_t)-ENOTTY;
         case 0x4B3B: /* KDGETMODE */
         case 0x4B4B: /* KDGKBMODE */
         case 0x4B45: /* KDSKBMODE */
@@ -1031,14 +1055,36 @@ uint64_t sys_splice_impl(uint64_t fd_in, uint64_t off_in, uint64_t fd_out,
     return done ? done : (uint64_t)error;
 }
 
-uint64_t sys_mkdirat_impl(uint64_t dirfd, uint64_t path_ptr, uint64_t mode) {
-    (void)dirfd;
+/* Apply the same filesystem credentials to mutations as sys_open uses.
+   Direct in-kernel VFS operations are deliberately outside this user check. */
+static int mutation_parent_access(const char *path) {
+    process_t *p = get_current_process();
+    if (!p || !p->fd_table) return -EBADF;
+    char name[256] = {0};
+    vfs_node_t *parent = vfs_resolve_path_ext(path, true, name);
+    if (!parent) return -ENOENT;
+    if (parent->type != VFS_TYPE_DIR) return -ENOTDIR;
+    return vfs_check_access(parent, p->fsuid, p->fsgid,
+                            VFS_PERM_WRITE | VFS_PERM_EXEC) ? -EACCES : 0;
+}
 
+static int mutation_owner_access(vfs_node_t *node) {
+    process_t *p = get_current_process();
+    if (!node) return -ENOENT;
+    if (!p) return -EBADF;
+    return p->fsuid == node->uid ||
+           (p->cap_effective & BOLDON_CAP_FOWNER) ? 0 : -EPERM;
+}
+
+uint64_t sys_mkdirat_impl(uint64_t dirfd, uint64_t path_ptr, uint64_t mode) {
     char kpath[256];
     if (copy_str_from_user(kpath, path_ptr, sizeof(kpath)) != 0) {
         return (uint64_t)-EFAULT;
     }
 
+    if ((int64_t)dirfd != -100 && kpath[0] != '/') return (uint64_t)-ENOSYS;
+    int access = mutation_parent_access(kpath);
+    if (access) return (uint64_t)(int64_t)access;
     int res = vfs_mkdir(kpath, (uint32_t)mode);
     if (res < 0) {
         return (uint64_t)res;
@@ -1051,14 +1097,31 @@ uint64_t sys_mkdir_impl(uint64_t path_ptr, uint64_t mode) {
     return sys_mkdirat_impl(-100 /* AT_FDCWD */, path_ptr, mode);
 }
 
-uint64_t sys_unlinkat_impl(uint64_t dirfd, uint64_t path_ptr, uint64_t flags) {
-    (void)dirfd;
+uint64_t sys_renameat_impl(uint64_t oldfd, uint64_t old_ptr,
+                           uint64_t newfd, uint64_t new_ptr) {
+    char oldpath[512], newpath[512];
+    if (copy_str_from_user(oldpath, old_ptr, sizeof(oldpath)) != 0 ||
+        copy_str_from_user(newpath, new_ptr, sizeof(newpath)) != 0)
+        return (uint64_t)-EFAULT;
+    if (((int64_t)oldfd != -100 && oldpath[0] != '/') ||
+        ((int64_t)newfd != -100 && newpath[0] != '/'))
+        return (uint64_t)-ENOSYS;
+    int access = mutation_parent_access(oldpath);
+    if (!access) access = mutation_parent_access(newpath);
+    if (access) return (uint64_t)(int64_t)access;
+    return (uint64_t)(int64_t)vfs_rename(oldpath, newpath);
+}
 
+uint64_t sys_unlinkat_impl(uint64_t dirfd, uint64_t path_ptr, uint64_t flags) {
     char kpath[256];
     if (copy_str_from_user(kpath, path_ptr, sizeof(kpath)) != 0) {
         return (uint64_t)-EFAULT;
     }
 
+    if ((int64_t)dirfd != -100 && kpath[0] != '/') return (uint64_t)-ENOSYS;
+    if (flags & ~0x200ULL) return (uint64_t)-EINVAL;
+    int access = mutation_parent_access(kpath);
+    if (access) return (uint64_t)(int64_t)access;
     int res;
     if (flags & 0x200 /* AT_REMOVEDIR */) {
         res = vfs_rmdir(kpath);
@@ -1079,13 +1142,15 @@ uint64_t sys_rmdir_impl(uint64_t path_ptr) {
 }
 
 uint64_t sys_fchmodat_impl(uint64_t dirfd, uint64_t path_ptr, uint64_t mode, uint64_t flags) {
-    (void)dirfd; (void)flags;
-    
     char kpath[256];
     if (copy_str_from_user(kpath, path_ptr, sizeof(kpath)) != 0) {
         return (uint64_t)-EFAULT;
     }
 
+    if ((int64_t)dirfd != -100 && kpath[0] != '/') return (uint64_t)-ENOSYS;
+    if (flags) return (uint64_t)-ENOSYS;
+    int access = mutation_owner_access(vfs_resolve_path(kpath));
+    if (access) return (uint64_t)(int64_t)access;
     int res = vfs_chmod(kpath, (uint32_t)mode);
     if (res < 0) return (uint64_t)-ENOENT;
     
@@ -1105,6 +1170,8 @@ uint64_t sys_link_impl(uint64_t oldpath_ptr, uint64_t newpath_ptr) {
     if (copy_str_from_user(knew, newpath_ptr, sizeof(knew)) != 0)
         return (uint64_t)-EFAULT;
 
+    int access = mutation_parent_access(knew);
+    if (access) return (uint64_t)(int64_t)access;
     int res = vfs_link(kold, knew);
     if (res < 0) return (uint64_t)res;
 
@@ -1117,6 +1184,8 @@ uint64_t sys_fchmod_impl(uint64_t fd, uint64_t mode) {
         return (uint64_t)-EBADF;
 
     vfs_file_t *file = p->fd_table->fds[fd];
+    int access = mutation_owner_access(file->node);
+    if (access) return (uint64_t)(int64_t)access;
     int res = vfs_fchmod(file, (uint32_t)mode);
     if (res < 0) return (uint64_t)res;
 
@@ -1124,8 +1193,13 @@ uint64_t sys_fchmod_impl(uint64_t fd, uint64_t mode) {
 }
 
 uint64_t sys_faccessat2_impl(uint64_t dfd, uint64_t filename, uint64_t mode, uint64_t flags) {
-    (void)dfd; (void)flags;
-    return sys_access_impl(filename, mode);
+    char path[512];
+    if (copy_str_from_user(path, filename, sizeof(path))) return (uint64_t)-EFAULT;
+    if ((int64_t)dfd != -100 && path[0] != '/') return (uint64_t)-ENOSYS;
+    /* access(2) uses real credentials; AT_EACCESS and nofollow need distinct
+       handling, not a silent alias to the existing access approximation. */
+    if (flags) return (uint64_t)-ENOSYS;
+    return sys_access_impl((uint64_t)path, mode);
 }
 
 uint64_t sys_fstatfs_impl(uint64_t fd, uint64_t buf) {
@@ -1142,11 +1216,17 @@ uint64_t sys_fstatfs_impl(uint64_t fd, uint64_t buf) {
 
 uint64_t sys_reboot_impl(uint64_t magic, uint64_t magic2, uint64_t cmd, uint64_t arg) {
     (void)magic; (void)magic2; (void)cmd; (void)arg;
+    process_t *p = get_current_process();
+    if (!p || (!p->is_kernel_process && !(p->cap_effective & BOLDON_CAP_SYS_BOOT)))
+        return (uint64_t)-EPERM;
     outb(0x64, 0xFE);
     return 0;
 }
 uint64_t sys_mount_impl(uint64_t source, uint64_t target, uint64_t fstype,
                         uint64_t flags, uint64_t data) {
+    process_t *p = get_current_process();
+    if (!p || (!p->is_kernel_process && !(p->cap_effective & BOLDON_CAP_SYS_ADMIN)))
+        return (uint64_t)-EPERM;
     char ksource[256], ktarget[256], kfstype[64];
     memset(ksource, 0, sizeof(ksource));
     memset(ktarget, 0, sizeof(ktarget));
@@ -1163,6 +1243,9 @@ uint64_t sys_mount_impl(uint64_t source, uint64_t target, uint64_t fstype,
 }
 
 uint64_t sys_umount2_impl(uint64_t target, uint64_t flags) {
+    process_t *p = get_current_process();
+    if (!p || (!p->is_kernel_process && !(p->cap_effective & BOLDON_CAP_SYS_ADMIN)))
+        return (uint64_t)-EPERM;
     char ktarget[256];
     memset(ktarget, 0, sizeof(ktarget));
     if (!target) return (uint64_t)-EFAULT;
@@ -1176,8 +1259,9 @@ uint64_t sys_fsync_impl(uint64_t fd) {
     if (!p || !p->fd_table || fd >= VFS_MAX_FD || !p->fd_table->fds[fd])
         return (uint64_t)-EBADF;
     for (int i = 0; i < MAX_BLOCK_DEVICES; i++) {
-        if (block_devices[i].sector_count > 0 && block_devices[i].name[0])
-            bcache_flush(block_devices[i].name);
+        if (block_devices[i].sector_count > 0 && block_devices[i].name[0] &&
+            bcache_flush(block_devices[i].name) != 0)
+            return (uint64_t)-EIO;
     }
     return 0;
 }
@@ -1198,10 +1282,80 @@ uint64_t sys_pwrite64_impl(uint64_t fd, uint64_t buf, uint64_t count, uint64_t o
     process_t *p = get_current_process();
     if (!p || !p->fd_table || fd >= VFS_MAX_FD || !p->fd_table->fds[fd])
         return (uint64_t)-EBADF;
+    if (!user_range_ok(buf, count)) return (uint64_t)-EFAULT;
     vfs_file_t *file = p->fd_table->fds[fd];
     uint64_t saved = file->offset;
     file->offset = offset;
     int res = vfs_write(file, (const void *)buf, count);
     file->offset = saved;
     return (uint64_t)(int64_t)res;
+}
+
+/* Linux xattr syscalls 188..199.  Only security.capability is exposed:
+   unsupported namespaces must not be advertised as successful writes. */
+uint64_t sys_xattr_impl(uint64_t nr, uint64_t a1, uint64_t a2,
+                        uint64_t a3, uint64_t a4, uint64_t a5) {
+    if (nr < 188 || nr > 199) return (uint64_t)-ENOSYS;
+    unsigned op = (unsigned)(nr - 188) / 3;
+    unsigned variant = (unsigned)(nr - 188) % 3; /* path, lpath, fd */
+    process_t *p = get_current_process();
+    if (!p || !p->fd_table) return (uint64_t)-EBADF;
+    vfs_node_t *node;
+    if (variant == 2) {
+        if (a1 >= VFS_MAX_FD || !p->fd_table->fds[a1]) return (uint64_t)-EBADF;
+        node = p->fd_table->fds[a1]->node;
+    } else {
+        char path[512];
+        if (copy_str_from_user(path, a1, sizeof(path))) return (uint64_t)-EFAULT;
+        node = variant == 1 ? vfs_resolve_path_nofollow(path) : vfs_resolve_path(path);
+        if (!node) return (uint64_t)-ENOENT;
+    }
+    if (!node || !node->ops || !node->ops->getxattr) return (uint64_t)-EOPNOTSUPP;
+    if (vfs_check_access(node, p->fsuid, p->fsgid, VFS_PERM_READ))
+        return (uint64_t)-EACCES;
+    const char *cap_name = "security.capability";
+    char name[64];
+    if (op != 2) {
+        if (copy_str_from_user(name, a2, sizeof(name))) return (uint64_t)-EFAULT;
+        if (strcmp(name, cap_name)) return (uint64_t)-EOPNOTSUPP;
+    }
+    if (op == 0) {
+        if (vfs_check_access(node, p->fsuid, p->fsgid, VFS_PERM_WRITE))
+            return (uint64_t)-EACCES;
+        if (a4 > 24) return (uint64_t)-E2BIG;
+        if (a5) return (uint64_t)-EOPNOTSUPP; /* CREATE/REPLACE not atomic here */
+        if (node->type != VFS_TYPE_FILE || !(p->cap_effective & BOLDON_CAP_SETFCAP))
+            return (uint64_t)-EPERM;
+        if (!a4 || !user_range_ok(a3, a4)) return (uint64_t)-EFAULT;
+        uint8_t value[24];
+        memcpy(value, (const void *)a3, (size_t)a4);
+        boldon_file_caps_t decoded;
+        int rc = capability_parse_file(value, (int)a4, &decoded);
+        if (rc) return (uint64_t)(int64_t)rc;
+        return (uint64_t)(int64_t)vfs_setxattr(node, cap_name, value, a4);
+    }
+    if (op == 3) {
+        if (vfs_check_access(node, p->fsuid, p->fsgid, VFS_PERM_WRITE))
+            return (uint64_t)-EACCES;
+        if (!(p->cap_effective & BOLDON_CAP_SETFCAP)) return (uint64_t)-EPERM;
+        return (uint64_t)(int64_t)vfs_removexattr(node, cap_name);
+    }
+    uint8_t value[24];
+    int len = node->ops->getxattr(node, cap_name, value, sizeof(value));
+    if (op == 2) {
+        if (len == -ENODATA) return 0;
+        if (len < 0) return (uint64_t)(int64_t)len;
+        size_t required = strlen(cap_name) + 1;
+        if (!a3) return required;
+        if (a3 < required) return (uint64_t)-ERANGE;
+        if (!user_range_ok(a2, required)) return (uint64_t)-EFAULT;
+        memcpy((void *)a2, cap_name, required);
+        return required;
+    }
+    if (len < 0) return (uint64_t)(int64_t)len;
+    if (!a4) return (uint64_t)len;
+    if (a4 < (uint64_t)len) return (uint64_t)-ERANGE;
+    if (!user_range_ok(a3, (uint64_t)len)) return (uint64_t)-EFAULT;
+    memcpy((void *)a3, value, (size_t)len);
+    return (uint64_t)len;
 }

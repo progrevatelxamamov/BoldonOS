@@ -19,32 +19,12 @@
 #define EFER_SCE             (1ULL << 0)
 #define EFER_NXE (1ULL << 11)
 
-static inline uint32_t translate_linux_open_flags(uint64_t linux_flags) {
-    uint32_t vfs_flags = 0;
-    uint64_t acc = linux_flags & 3; // O_ACCMODE (0 = O_RDONLY, 1 = O_WRONLY, 2 = O_RDWR)
-
-    if (acc == 1) {
-        vfs_flags |= VFS_O_WRITE;
-    } else if (acc == 2) {
-        vfs_flags |= (VFS_O_READ | VFS_O_WRITE);
-    } else {
-        vfs_flags |= VFS_O_READ; 
-    }
-
-    if (linux_flags & 0100)     vfs_flags |= VFS_O_CREAT;
-    if (linux_flags & 01000)    vfs_flags |= VFS_O_TRUNC;
-    if (linux_flags & 02000)    vfs_flags |= VFS_O_APPEND;
-    if (linux_flags & 04000)    vfs_flags |= VFS_O_NONBLOCK;
-    if (linux_flags & 02000000) vfs_flags |= VFS_O_CLOEXEC;
-
-    return vfs_flags;
-}
-
 extern void syscall_entry_stub(void);
 
 extern uint64_t sys_read_impl(uint64_t, uint64_t, uint64_t);
 extern uint64_t sys_write_impl(uint64_t, uint64_t, uint64_t);
 extern uint64_t sys_open_impl(uint64_t, uint64_t, uint64_t);
+extern uint64_t sys_openat_impl(uint64_t, uint64_t, uint64_t);
 extern uint64_t sys_close_impl(uint64_t);
 extern uint64_t sys_ioctl_impl(uint64_t, uint64_t, uint64_t);
 extern uint64_t sys_mount_impl(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
@@ -60,6 +40,14 @@ extern uint64_t sys_newfstatat_impl(uint64_t, uint64_t, uint64_t, uint64_t);
 extern uint64_t sys_statx_impl(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
 extern uint64_t sys_poll_impl(uint64_t, uint64_t, uint64_t);
 extern uint64_t sys_close_range_impl(uint64_t, uint64_t, uint64_t);
+extern uint64_t sys_renameat_impl(uint64_t, uint64_t, uint64_t, uint64_t);
+extern uint64_t sys_capget_impl(uint64_t, uint64_t);
+extern uint64_t sys_xattr_impl(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+extern uint64_t sys_capset_impl(uint64_t, uint64_t);
+extern uint64_t sys_pidfd_open_impl(uint64_t, uint64_t);
+extern uint64_t sys_inotify_init1_impl(uint64_t);
+extern uint64_t sys_inotify_add_watch_impl(uint64_t, uint64_t, uint64_t);
+extern uint64_t sys_inotify_rm_watch_impl(uint64_t, uint64_t);
 extern uint64_t sys_ppoll_impl(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
 extern uint64_t sys_madvise_impl(uint64_t, uint64_t, uint64_t);
 extern uint64_t sys_sched_getaffinity_impl(uint64_t, uint64_t, uint64_t);
@@ -235,6 +223,17 @@ uint64_t osdev_syscall_handler(uint64_t num,
                                 (int32_t)a3 < 0 ? UINT64_MAX : (uint32_t)a3);
     case SYS_PPOLL:       return sys_ppoll_impl(a1, a2, a3, a4, a5);
     case SYS_CLOSE_RANGE: return sys_close_range_impl(a1, a2, a3);
+    case SYS_RENAME: return sys_renameat_impl((uint64_t)-100, a1, (uint64_t)-100, a2);
+    case SYS_RENAMEAT: return sys_renameat_impl(a1, a2, a3, a4);
+    case SYS_RENAMEAT2: return a5 ? (uint64_t)-ENOSYS :
+                               sys_renameat_impl(a1, a2, a3, a4);
+    case SYS_PIDFD_OPEN: return sys_pidfd_open_impl(a1, a2);
+    case SYS_CAPGET: return sys_capget_impl(a1, a2);
+    case SYS_CAPSET: return sys_capset_impl(a1, a2);
+    case SYS_INOTIFY_INIT: return sys_inotify_init1_impl(0);
+    case SYS_INOTIFY_INIT1: return sys_inotify_init1_impl(a1);
+    case SYS_INOTIFY_ADD_WATCH: return sys_inotify_add_watch_impl(a1, a2, a3);
+    case SYS_INOTIFY_RM_WATCH: return sys_inotify_rm_watch_impl(a1, a2);
     case SYS_MADVISE:     return sys_madvise_impl(a1, a2, a3);
     case SYS_SCHED_GETAFFINITY: return sys_sched_getaffinity_impl(a1, a2, a3);
     case SYS_LSEEK:       return sys_lseek_impl(a1, a2, a3);
@@ -253,15 +252,10 @@ uint64_t osdev_syscall_handler(uint64_t num,
     case SYS_FCNTL:       return sys_fcntl_impl(a1, a2, a3);
     case SYS_FTRUNCATE:   return sys_ftruncate_w(a1, a2);
     case SYS_MEMFD_CREATE: return sys_memfd_create_w(a1, a2);
-    case SYS_OPENAT: {
-        process_t *p = get_current_process();
-        if (!p || !a2) return (uint64_t)-EFAULT;
-        uint32_t flags = translate_linux_open_flags((uint32_t)a3);
-        return sys_open(p->fd_table, (const char *)a2, (uint32_t)flags);
-    }
+    case SYS_OPENAT: return sys_openat_impl(a1, a2, a3);
     case SYS_NEWFSTATAT:  return sys_newfstatat_impl(a1, a2, a3, a4);
     case SYS_STATX:       return sys_statx_impl(a1, a2, a3, a4, a5);
-    case SYS_FACCESSAT:   return sys_access_impl(a2, a3);
+    case SYS_FACCESSAT:   return sys_faccessat2_impl(a1, a2, a3, 0);
     case SYS_GETCWD:      return sys_getcwd_impl(a1, a2);
     case SYS_CHDIR:       return sys_chdir_impl(a1);
 
@@ -349,6 +343,7 @@ uint64_t osdev_syscall_handler(uint64_t num,
     case 83:  return sys_mkdir_impl(a1, a2);
     case 87:  return sys_unlink_impl(a1);
     case 90:  return sys_chmod_impl(a1, a2);
+    case 188 ... 199: return sys_xattr_impl(num, a1, a2, a3, a4, a5);
     case 98:  return sys_getrusage_impl(a1, a2);
     case 99:  return sys_sysinfo_impl(a1);
     case 258: return sys_mkdirat_impl(a1, a2, a3);
@@ -380,7 +375,7 @@ uint64_t osdev_syscall_handler(uint64_t num,
     case 439: return sys_faccessat2_impl(a1, a2, a3, a4);
     case 221: return sys_fstatfs_impl(a1, a2);
     case 138: return sys_reboot_impl(a1, a2, a3, a4);
-    case 92:  return 0; // sys_truncate
+    case 92:  return (uint64_t)-ENOSYS; /* no path truncate implementation */
 
     default:
         console_print_string("[SYSCALL] ENOSYS num=");

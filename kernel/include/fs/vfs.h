@@ -74,10 +74,18 @@ typedef struct {
     int (*rmdir)(struct vfs_node *dir, const char *name);
     int (*symlink)(struct vfs_node *dir, const char *name, const char *target);
     int (*link)(struct vfs_node *dir, struct vfs_node *old_node, const char *name);
+    int (*rename)(struct vfs_node *old_dir, const char *old_name,
+                  struct vfs_node *new_dir, const char *new_name);
     int (*readlink)(struct vfs_node *node, char *buf, uint64_t size);
     int (*stat)(struct vfs_node *node, vfs_stat_t *st);
     int (*chmod)(struct vfs_node *node, uint32_t mode);
     int (*chown)(struct vfs_node *node, uint32_t uid, uint32_t gid);
+    /* Returns attribute size or negative errno; no value is synthesized. */
+    int (*getxattr)(struct vfs_node *node, const char *name,
+                    void *buf, uint64_t size);
+    int (*setxattr)(struct vfs_node *node, const char *name,
+                    const void *buf, uint64_t size);
+    int (*removexattr)(struct vfs_node *node, const char *name);
 } vfs_node_ops_t;
 
 typedef struct vfs_node {
@@ -142,6 +150,7 @@ void vfs_set_boot_drive(char drive_letter);
 
 char *normalize_path(const char *path);
 vfs_node_t *vfs_resolve_path(const char *path);
+vfs_node_t *vfs_resolve_path_nofollow(const char *path);
 vfs_node_t *vfs_resolve_path_ext(const char *path, bool parent_only, char *last_component);
 
 vfs_file_t *vfs_open(const char *path, uint32_t flags);
@@ -158,7 +167,10 @@ int vfs_mkdir(const char *path, uint32_t mode);
 int vfs_unlink(const char *path);
 int vfs_rmdir(const char *path);
 int vfs_link(const char *oldpath, const char *newpath);
+int vfs_rename(const char *oldpath, const char *newpath);
 int vfs_fchmod(vfs_file_t *file, uint32_t mode);
+int vfs_setxattr(vfs_node_t *node, const char *name, const void *value, uint64_t size);
+int vfs_removexattr(vfs_node_t *node, const char *name);
 
 int vfs_copy_file(const char *src_path, const char *dst_path);
 
