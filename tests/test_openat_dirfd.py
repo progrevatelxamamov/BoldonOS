@@ -36,6 +36,7 @@ int main(void) {
     assert((int64_t)sys_openat_impl(4,(uint64_t)"relative",0)==-ENOSYS && opens==0);
     assert(sys_openat_impl((uint64_t)-100,(uint64_t)"relative",1)==3);
     assert(!strcmp(last,"relative") && lastflags==VFS_O_WRITE);
+    assert(sys_openat_impl((uint32_t)-100,(uint64_t)"relative",0)==3);
     assert(sys_openat_impl(4,(uint64_t)"/absolute",0)==3);
     assert(!strcmp(last,"/absolute") && lastflags==VFS_O_READ);
     assert((int64_t)sys_openat_impl(4,0,0)==-EFAULT);
