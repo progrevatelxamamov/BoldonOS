@@ -9,6 +9,7 @@ import argparse
 import os
 import struct
 import subprocess
+import shutil
 import sys
 import tempfile
 import uuid
@@ -23,9 +24,9 @@ GPT_DATA = uuid.UUID("EBD0A0A2-B9E5-4433-87C0-68B6B72699C7")
 
 
 def guid_bytes(u: uuid.UUID) -> bytes:
-    """GPT stores the first three fields little endian."""
+    """GPT stores the first three UUID fields little endian (mixed endian)."""
     b = u.bytes
-    return (b[3::-1]) + (b[5:3:-1]) + (b[7:5:-1]) + b[8:]
+    return (b[0:4][::-1]) + (b[4:6][::-1]) + (b[6:8][::-1]) + b[8:]
 
 
 def chs(lba: int) -> bytes:
@@ -123,6 +124,11 @@ def build_gpt(img_path: str, entries):
         f.write(bytes(backup_header))
 
 
+def read_file(path):
+    with open(path, "rb") as handle:
+        return handle.read()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="main.img")
@@ -131,11 +137,13 @@ def main():
     ap.add_argument("--licenses", default="kernel/third_party/libpayload/LICENSES.md")
     ap.add_argument("--root", default="osdata", help="directory copied into the ext4 root")
     ap.add_argument("--size-mib", type=int, default=512)
-    ap.add_argument("--ufei", default="limine-binary/BOOTX64.EFI")
+    ap.add_argument("--uefi", default="limine-binary/BOOTX64.EFI")
     ap.add_argument("--esp-mib", type=int, default=128)
     ap.add_argument("--mkfs", default="/sbin/mke2fs")
     ap.add_argument("--debugfs", default="/sbin/debugfs")
+    ap.add_argument("--e2fsck", default="/sbin/e2fsck")
     ap.add_argument("--limine", default="limine-binary/limine")
+    ap.add_argument("--limine-conf", default="limine.conf")
     args = ap.parse_args()
 
     size_bytes = args.size_mib * MIB
@@ -156,43 +164,42 @@ def main():
         (GPT_LINUX_FS, root_first, root_last, "BOLDON_ROOT"),
     ])
 
-    # FAT32 ESP
-    esp_offset = esp_first * SECTOR
-    esp_size_kib = (esp_last - esp_first + 1) * SECTOR // 1024
-    subprocess.run(["/tmp/work/busybox.bin", "mkfs.vfat", "-F", "32", "-n", "BOOT",
-                    "-i", "42424242", "-C", "/tmp/work/esp.img", str(esp_size_kib)],
-                   check=True, stdout=subprocess.DEVNULL)
-    # populate the ESP with the kernel, splash and bootloader
-    script = []
-    script.append("mmd -i /tmp/work/esp.img ::/EFI ::/EFI/BOOT ::/boot ::/boot/limine")
-    script.append(f"mcopy -i /tmp/work/esp.img {args.kernel} ::/boot/kernel")
-    script.append(f"mcopy -i /tmp/work/esp.img {args.splash} ::/boot/boldonsplash.bmp")
-    if os.path.exists(args.licenses):
-        script.append(f"mcopy -i /tmp/work/esp.img {args.licenses} ::/boot/libpayload-LICENSES.md")
-    script.append(f"mcopy -i /tmp/work/esp.img limine.conf ::/boot/limine/limine.conf")
-    for f in ("limine-binary/limine-bios.sys", args.ufei):
-        script.append(f"mcopy -i /tmp/work/esp.img {f} ::/EFI/BOOT/")
-    with open("/tmp/work/esp.mtools", "w") as f:
-        f.write("\n".join(script) + "\n")
-    subprocess.run(["/tmp/work/busybox.bin", "sh", "/tmp/work/esp.mtools"], check=True,
-                   stdout=subprocess.DEVNULL)
+    # FAT32 ESP, written by the dependency-free writer in scripts/fat32.py so
+    # the image can be produced without mtools/dosfstools/sgdisk.
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import fat32
 
-    # copy the ESP image into the GPT partition
-    with open("/tmp/work/esp.img", "rb") as src, open(args.out, "r+b") as dst:
+    esp_offset = esp_first * SECTOR
+    esp_bytes = (esp_last - esp_first + 1) * SECTOR
+    esp = bytearray(esp_bytes)
+    esp_files = {"/boot/kernel": read_file(args.kernel)}
+    if os.path.exists(args.splash):
+        esp_files["/boot/boldonsplash.bmp"] = read_file(args.splash)
+    if os.path.exists(args.licenses):
+        esp_files["/boot/libpayload-LICENSES.md"] = read_file(args.licenses)
+    if os.path.exists(args.limine_conf):
+        esp_files["/boot/limine/limine.conf"] = read_file(args.limine_conf)
+    # Limine's BIOS stage 1 only looks for stage 3 in /, /boot, /limine and
+    # /boot/limine -- /EFI/BOOT is a UEFI convention it does not search.
+    for name in ("limine-bios.sys",):
+        path = os.path.join("limine-binary", name)
+        if os.path.exists(path):
+            esp_files[f"/boot/limine/{name}"] = read_file(path)
+    if os.path.exists(args.uefi):
+        esp_files["/EFI/BOOT/BOOTX64.EFI"] = read_file(args.uefi)
+    fat32.build_fat32(esp, esp_files, volume_label="BOOT")
+    with open(args.out, "r+b") as dst:
         dst.seek(esp_offset)
-        while True:
-            chunk = src.read(MIB)
-            if not chunk:
-                break
-            dst.write(chunk)
+        dst.write(esp)
 
     # ext4 root filesystem
-    root_img = "/tmp/work/root.img"
+    root_img = os.path.join(tempfile.mkdtemp(prefix="boldon-root-"), "root.img")
     root_kib = (root_last - root_first + 1) * SECTOR // 1024
     subprocess.run([args.mkfs, "-q", "-F", "-t", "ext4", "-L", "BOLDON_ROOT",
                     "-U", "00000000-0000-4000-8000-00000000B01D",
                     root_img, str(root_kib)], check=True)
     copy_tree(args.debugfs, root_img, args.root)
+    verify_root_image(args.e2fsck, root_img)
     with open(root_img, "rb") as src, open(args.out, "r+b") as dst:
         dst.seek(root_first * SECTOR)
         while True:
@@ -200,11 +207,30 @@ def main():
             if not chunk:
                 break
             dst.write(chunk)
+    shutil.rmtree(os.path.dirname(root_img), ignore_errors=True)
 
     # BIOS boot: limine's first stage lives in the BIOSBOOT partition
-    subprocess.run([args.limine, "bios-install", args.out], check=True,
-                   stdout=subprocess.STDOUT)
+    # Limine's installers exec helper tools from its own datadir, and it may
+    # not inherit a closed descriptor; run it with a plain environment.
+    env = dict(os.environ)
+    env.setdefault("PATH", "/usr/bin:/bin")
+    subprocess.run([os.path.abspath(args.limine), "bios-install",
+                    os.path.abspath(args.out)], check=True, env=env)
     print(f"wrote {args.out}: {args.size_mib} MiB, root {root_kib // 1024} MiB")
+
+
+def verify_root_image(e2fsck: str, image: str):
+    """Fail the build if the root filesystem we just populated is unsound.
+
+    A silently corrupt root is the worst failure mode for this image: the
+    bootloader and the kernel both come up clean, and only the shell is
+    missing, which looks like an unrelated driver problem.
+    """
+    result = subprocess.run([e2fsck, "-fn", image], capture_output=True,
+                            text=True)
+    if result.returncode != 0:
+        raise SystemExit(f"root filesystem check failed for {image}:\n"
+                         f"{result.stdout}{result.stderr}")
 
 
 def copy_tree(debugfs: str, image: str, root_dir: str):
@@ -251,8 +277,11 @@ def copy_tree(debugfs: str, image: str, root_dir: str):
         kind = 0o40000 if os.path.isdir(path) else 0o100000
         return f"{kind | (st.st_mode & 0o7777):o}"
 
+    # debugfs parses set_inode_field values as decimal (or 0x-prefixed hex),
+    # never as bare octal: "40755" silently became 0o117463 and left every
+    # inode with an unknown file type. Emit a 0x prefix instead.
     for src, target in pending_modes:
-        run(f"set_inode_field {target} mode {mode_spec(src)}")
+        run(f"set_inode_field {target} mode 0x{int(mode_spec(src), 8):x}")
         uid = os.lstat(src).st_uid
         gid = os.lstat(src).st_gid
         if uid != 0:

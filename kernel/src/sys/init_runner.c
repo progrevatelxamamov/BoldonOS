@@ -141,7 +141,7 @@ void launch_init_process(void) {
     create_task_kernel((void *)pty_input_task, "pty-input");
 
     /* Переменные окружения для старта init-скрипта */
-    char *argv[] = { "/bin/sh", NULL };
+    char *argv[] = { "/bin/sh", "/etc/init.sh", NULL };
     char *envp[] = {
         "PATH=/bin:/usr/bin:/sbin:/usr/sbin",
         "HOME=/root",
@@ -150,9 +150,25 @@ void launch_init_process(void) {
         NULL
     };
 
-    if (!vfs_get_mount('C')) {
-        init_no_root_hint();
-        while (!vfs_get_mount('C')) schedule_yield();
+    /* The root is mounted asynchronously (hotplug thread) when the boot disk
+       is a USB mass-storage device, as is normal for the real hardware this
+       kernel targets. Waiting for the mount point alone is not enough: C:
+       starts resolving before the ext4 mount is fully usable, so execve ran
+       against a half-initialised filesystem (observed: errno=EPIPE, then
+       ENOENT from the fallback, and no shell at all). Wait for /bin/sh itself
+       to resolve, which is the thing we are about to execute. */
+    bool hinted = false;
+    for (;;) {
+        if (!vfs_get_mount('C')) {
+            if (!hinted) {
+                init_no_root_hint();
+                hinted = true;
+            }
+        } else {
+            vfs_stat_t sh_st;
+            if (vfs_stat("C:/bin/sh", &sh_st) == 0) break;
+        }
+        schedule_yield();
     }
 
     /* Keep the real root layout usable for programs that inspect /proc,

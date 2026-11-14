@@ -1,3 +1,5 @@
 main.img
 edk2-ovmf-bins/
 osdata
+__pycache__/
+*.pyc
