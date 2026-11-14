@@ -42,10 +42,6 @@ uint64_t sys_pidfd_open_impl(uint64_t pid, uint64_t flags) {
     if (!self || !self->fd_table) return (uint64_t)-EBADF;
     if (scheduler_pid_status(pid, NULL) < 0) return (uint64_t)-ESRCH;
 
-    int fd = 0;
-    while (fd < VFS_MAX_FD && self->fd_table->fds[fd]) fd++;
-    if (fd == VFS_MAX_FD) return (uint64_t)-EMFILE;
-
     pidfd_identity_t *id = malloc_alloc(sizeof(*id));
     vfs_node_t *node = malloc_alloc(sizeof(*node));
     vfs_file_t *file = malloc_alloc(sizeof(*file));
@@ -65,6 +61,14 @@ uint64_t sys_pidfd_open_impl(uint64_t pid, uint64_t flags) {
                   ((flags & 04000) ? VFS_O_NONBLOCK : 0);
     /* An exited task may have been reaped during allocation. PID numbers
        are not reused, so the descriptor still unambiguously signals exit. */
-    self->fd_table->fds[fd] = file;
+    int fd = vfs_fd_install(self->fd_table, file, 0,
+                            (flags & 02000000) ? VFS_FD_CLOEXEC : 0);
+    if (fd < 0) {
+        file->refcount = 0;
+        malloc_free(file);
+        malloc_free(node);
+        malloc_free(id);
+        return (uint64_t)fd;
+    }
     return (uint64_t)fd;
 }

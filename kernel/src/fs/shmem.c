@@ -30,14 +30,40 @@ static int shmem_close(vfs_file_t *file);
 static uint64_t shmem_lseek(vfs_file_t *file, int64_t offset, int whence);
 static void *shmem_mmap_ops(vfs_file_t *file, void *addr, uint64_t length,
                             int prot, int flags, uint64_t offset);
+static int shmem_truncate_op(vfs_node_t *node, uint64_t length);
 
 static vfs_file_ops_t shmem_fops = {
-    .read   = shmem_read,
-    .write  = shmem_write,
-    .close  = shmem_close,
-    .lseek  = shmem_lseek,
-    .mmap   = shmem_mmap_ops,
+    .read     = shmem_read,
+    .write    = shmem_write,
+    .close    = shmem_close,
+    .lseek    = shmem_lseek,
+    .mmap     = shmem_mmap_ops,
+    .truncate = shmem_truncate_op,
 };
+
+/* Generic truncate used by both ftruncate(2) and truncate(2). */
+static int shmem_apply_truncate(vfs_node_t *node, uint64_t new_size) {
+    if (!node || node->file_ops != &shmem_fops) return -EINVAL;
+    shmem_object_t *obj = (shmem_object_t *)node->fs_data;
+    if (!obj) return -EINVAL;
+    if (obj->sealed) return -EPERM;
+    if (new_size > (uint64_t)SHMEM_MAX_PAGES * SHMEM_PAGE_SIZE) return -EFBIG;
+
+    /* Free pages beyond the new end so memory is really returned. */
+    uint64_t first_free = (new_size + SHMEM_PAGE_SIZE - 1) / SHMEM_PAGE_SIZE;
+    for (uint64_t i = first_free; i < SHMEM_MAX_PAGES; i++) {
+        if (!obj->pages[i]) continue;
+        pmm_free_page(obj->pages[i]);
+        obj->pages[i] = NULL;
+    }
+    obj->size = new_size;
+    node->size = new_size;
+    return 0;
+}
+
+static int shmem_truncate_op(vfs_node_t *node, uint64_t length) {
+    return shmem_apply_truncate(node, length);
+}
 
 static void *shmem_ensure_page(shmem_object_t *obj, uint64_t idx) {
     if (idx >= SHMEM_MAX_PAGES) return NULL;
@@ -221,16 +247,15 @@ int sys_memfd_create_impl(const char *name, uint32_t flags) {
     f->flags = VFS_O_RDWR;
     f->refcount = 1;
 
-    for (int fd = 0; fd < VFS_MAX_FD; fd++) {
-        if (!p->fd_table->fds[fd]) {
-            p->fd_table->fds[fd] = f;
-            return fd;
-        }
+    int fd = vfs_fd_install(p->fd_table, f, 0,
+                            (flags & 02000000 /* MFD_CLOEXEC */) ? VFS_FD_CLOEXEC : 0);
+    if (fd < 0) {
+        f->refcount = 0;
+        malloc_free(f);
+        malloc_free(n);
+        return fd;
     }
-
-    malloc_free(f);
-    malloc_free(n);
-    return -EMFILE;
+    return fd;
 }
 
 int sys_ftruncate_impl(int fd, int64_t length) {
@@ -240,18 +265,9 @@ int sys_ftruncate_impl(int fd, int64_t length) {
     if (length < 0) return -EINVAL;
 
     vfs_file_t *file = p->fd_table->fds[fd];
-    if (!file->node || !(file->flags & VFS_O_WRITE)) return -EBADF;
-
-    /* Changing the cached VFS size alone does not truncate the backing file. */
-    if (file->node->file_ops != &shmem_fops) return -ENOSYS;
-
-    shmem_object_t *obj = (shmem_object_t *)file->node->fs_data;
-    if (!obj) return -EBADF;
-
-    uint64_t new_size = (uint64_t)length;
-    if (new_size > (uint64_t)SHMEM_MAX_PAGES * SHMEM_PAGE_SIZE) return -EFBIG;
-
-    obj->size = new_size;
-    file->node->size = new_size;
-    return 0;
+    if (!file->node) return -EBADF;
+    /* ftruncate(2) requires a writable descriptor; truncate(2) is the
+       path-based variant and checks DAC instead. */
+    if (!(file->flags & VFS_O_WRITE)) return -EINVAL;
+    return vfs_truncate_node(file->node, (uint64_t)length);
 }

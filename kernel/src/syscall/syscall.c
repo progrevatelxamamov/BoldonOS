@@ -108,7 +108,14 @@ extern uint64_t sys_getresgid_impl(uint64_t, uint64_t, uint64_t);
 extern uint64_t sys_pselect6_impl(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
 
 extern uint64_t sys_dup2_impl(uint64_t, uint64_t);
+extern uint64_t sys_dup3_impl(uint64_t, uint64_t, uint64_t);
 extern uint64_t sys_dup_impl(uint64_t);
+extern uint64_t sys_truncate_impl(uint64_t, uint64_t);
+extern uint64_t sys_symlink_impl(uint64_t, uint64_t);
+extern uint64_t sys_symlinkat_impl(uint64_t, uint64_t, uint64_t);
+extern uint64_t sys_readlinkat_impl(uint64_t, uint64_t, uint64_t, uint64_t);
+extern uint64_t sys_lstat_impl(uint64_t, uint64_t);
+extern uint64_t sys_linkat_impl(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
 extern uint64_t sys_readlink_impl(uint64_t, uint64_t, uint64_t);
 extern uint64_t sys_getdents64_impl(uint64_t, uint64_t, uint64_t);
 extern uint64_t sys_wait4_impl(uint64_t, uint64_t, uint64_t, uint64_t);
@@ -219,7 +226,7 @@ uint64_t osdev_syscall_handler(uint64_t num,
     case SYS_CLOSE:       return sys_close_impl(a1);
     case SYS_STAT:        return sys_stat_impl(a1, a2);
     case SYS_FSTAT:       return sys_fstat_impl(a1, a2);
-    case SYS_LSTAT:       return sys_stat_impl(a1, a2);
+    case SYS_LSTAT:       return sys_lstat_impl(a1, a2);
     case SYS_POLL:        return sys_poll_impl(a1, a2,
                                 (int32_t)a3 < 0 ? UINT64_MAX : (uint32_t)a3);
     case SYS_PPOLL:       return sys_ppoll_impl(a1, a2, a3, a4, a5);
@@ -376,7 +383,12 @@ uint64_t osdev_syscall_handler(uint64_t num,
     case 439: return sys_faccessat2_impl(a1, a2, a3, a4);
     case 221: return sys_fstatfs_impl(a1, a2);
     case 138: return sys_reboot_impl(a1, a2, a3, a4);
-    case 92:  return (uint64_t)-ENOSYS; /* no path truncate implementation */
+    case 92:  return sys_truncate_impl(a1, a2);        /* SYS_TRUNCATE */
+    case 88:  return sys_symlink_impl(a1, a2);         /* SYS_SYMLINK */
+    case 266: return sys_symlinkat_impl(a1, a2, a3);   /* SYS_SYMLINKAT */
+    case 267: return sys_readlinkat_impl(a1, a2, a3, a4); /* SYS_READLINKAT */
+    case 265: return sys_linkat_impl(a1, a2, a3, a4, a5); /* SYS_LINKAT */
+    case 292: return sys_dup3_impl(a1, a2, a3);        /* SYS_DUP3 */
 
     default:
         console_print_string("[SYSCALL] ENOSYS num=");

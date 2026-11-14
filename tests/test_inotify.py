@@ -57,7 +57,15 @@ typedef struct vfs_file vfs_file_t;
 typedef struct { int (*read)(vfs_file_t *, void *, uint64_t); uint32_t (*poll)(vfs_file_t *, uint32_t); int (*ioctl)(vfs_file_t *, uint64_t, void *); int (*close)(vfs_file_t *); } vfs_file_ops_t;
 struct vfs_node { int type; uint64_t inode_num; vfs_mount_t *mount; vfs_file_ops_t *file_ops; };
 struct vfs_file { vfs_node_t *node; void *private_data; uint32_t flags, refcount; };
-typedef struct { vfs_file_t *fds[VFS_MAX_FD]; } process_fd_table_t;
+#define VFS_FD_CLOEXEC 0x1
+typedef struct { vfs_file_t *fds[VFS_MAX_FD]; uint8_t fd_flags[VFS_MAX_FD]; } process_fd_table_t;
+static int vfs_fd_install(process_fd_table_t *t, vfs_file_t *f, int min, uint8_t flags) {
+    for (int fd = min; fd < VFS_MAX_FD; fd++) {
+        if (t->fds[fd]) continue;
+        t->fds[fd] = f; t->fd_flags[fd] = flags; return fd;
+    }
+    return -EMFILE;
+}
 typedef struct { process_fd_table_t *fd_table; void *pml4; uint64_t sigpending, sigmask; } process_t;
 typedef struct { int unused; } spinlock_t;
 #define SPINLOCK_INIT {0}

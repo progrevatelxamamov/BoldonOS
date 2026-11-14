@@ -607,14 +607,11 @@ int pty_alloc(int *master_fd, int *slave_fd, process_fd_table_t *table) {
     mf->refcount = 1;
     sf->refcount = 1;
 
-    int mfd = -1, sfd = -1;
-    for (int i = 0; i < VFS_MAX_FD; i++) {
-        if (!table->fds[i]) {
-            if (mfd < 0)      { table->fds[i] = mf; mfd = i; }
-            else if (sfd < 0) { table->fds[i] = sf; sfd = i; break; }
-        }
-    }
-
+    /* Reserve both slots through the shared helper so refcounts and the
+       per-descriptor close-on-exec bits stay in sync with the rest of the
+       kernel. A half-open pair is rolled back, never leaked. */
+    int mfd = vfs_fd_install(table, mf, 0, 0);
+    int sfd = (mfd >= 0) ? vfs_fd_install(table, sf, 0, 0) : -EMFILE;
     if (mfd < 0 || sfd < 0) {
         spin_lock(&pty_lock);
         p->used = false;
@@ -624,8 +621,8 @@ int pty_alloc(int *master_fd, int *slave_fd, process_fd_table_t *table) {
         p->master_refs = 0;
         p->slave_refs = 0;
         spin_unlock(&pty_lock);
-        if (mfd >= 0) table->fds[mfd] = NULL;
-        if (sfd >= 0) table->fds[sfd] = NULL;
+        if (mfd >= 0) vfs_fd_release(table, mfd);
+        if (sfd >= 0) vfs_fd_release(table, sfd);
         malloc_free(mf);
         malloc_free(sf);
         errno = EMFILE;

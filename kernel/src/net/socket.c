@@ -54,15 +54,14 @@ static int allocate_socket_fd(socket_t *sock) {
     file->flags = VFS_O_RDWR;
     file->refcount = 1;
 
-    for (int fd = 0; fd < VFS_MAX_FD; fd++) {
-        if (!p->fd_table->fds[fd]) {
-            p->fd_table->fds[fd] = file;
-            return fd;
-        }
+    int fd = vfs_fd_install(p->fd_table, file, 0, 0);
+    if (fd < 0) {
+        file->refcount = 0;
+        malloc_free(file);
+        malloc_free(node);
+        return -EMFILE;
     }
-    malloc_free(file);
-    malloc_free(node);
-    return -EMFILE;
+    return fd;
 }
 
 socket_t* get_socket_from_fd(int sockfd) {
@@ -115,10 +114,16 @@ int sys_socketpair(int domain, int type, int protocol, int fds[2]) {
         b->ops->close(b); malloc_free(b);
         return second;
     }
-    uint32_t flags = ((type & nonblock) ? VFS_O_NONBLOCK : 0) |
-                     ((type & cloexec) ? VFS_O_CLOEXEC : 0);
-    p->fd_table->fds[first]->flags |= flags;
-    p->fd_table->fds[second]->flags |= flags;
+    /* SOCK_NONBLOCK lives in the open file description; SOCK_CLOEXEC is a
+       descriptor property and must never leak through the shared file. */
+    if (type & nonblock) {
+        p->fd_table->fds[first]->flags |= VFS_O_NONBLOCK;
+        p->fd_table->fds[second]->flags |= VFS_O_NONBLOCK;
+    }
+    if (type & cloexec) {
+        p->fd_table->fd_flags[first] |= VFS_FD_CLOEXEC;
+        p->fd_table->fd_flags[second] |= VFS_FD_CLOEXEC;
+    }
     fds[0] = first;
     fds[1] = second;
     return 0;

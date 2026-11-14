@@ -519,9 +519,12 @@ static int sys_execve_depth(const char *pathname, char *const argv[],
     /* Close-on-exec after loading succeeds, while disk/TTY interrupts are
        still enabled: socket close can itself touch the filesystem. */
     if (p->fd_table) {
+        /* close-on-exec is a descriptor property, not a property of the
+           shared open file description: dup(2) and fork(2) must not make an
+           unrelated descriptor inherit the bit. */
         for (int fd = 0; fd < VFS_MAX_FD; fd++) {
-            vfs_file_t *open_file = p->fd_table->fds[fd];
-            if (open_file && (open_file->flags & VFS_O_CLOEXEC))
+            if (p->fd_table->fds[fd] &&
+                (p->fd_table->fd_flags[fd] & VFS_FD_CLOEXEC))
                 sys_close(p->fd_table, fd);
         }
     }

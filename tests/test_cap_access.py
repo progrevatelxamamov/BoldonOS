@@ -4,7 +4,10 @@ import subprocess
 import tempfile
 root = Path(__file__).resolve().parents[1]
 src = (root / 'kernel/src/fs/vfs.c').read_text()
-func = src[src.index('int vfs_check_access('):src.index('vfs_file_t *vfs_open(', src.index('int vfs_check_access('))]
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import kernel_snip as k
+func = k.function(src, 'vfs_check_access')
 code = r'''
 #include <stdint.h>
 #include <stdlib.h>

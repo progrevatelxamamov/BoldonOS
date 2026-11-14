@@ -78,18 +78,10 @@ static epoll_instance_t *get_epoll(int epfd) {
 }
 
 uint64_t sys_epoll_create1_impl(int flags) {
-    (void)flags;
+    /* Linux only accepts EPOLL_CLOEXEC == O_CLOEXEC here. */
+    if ((uint32_t)flags & ~(uint32_t)02000000) return (uint64_t)-EINVAL;
     process_t *curr = get_current_process();
     if (!curr || !curr->fd_table) return (uint64_t)-EINVAL;
-
-    int fd = -1;
-    for (int i = 3; i < MAX_FDS; i++) {
-        if (curr->fd_table->fds[i] == NULL) {
-            fd = i;
-            break;
-        }
-    }
-    if (fd == -1) return (uint64_t)-ENOMEM;
 
     epoll_instance_t *ep = (epoll_instance_t *)malloc_alloc(sizeof(epoll_instance_t));
     if (!ep) return (uint64_t)-ENOMEM;
@@ -114,7 +106,15 @@ uint64_t sys_epoll_create1_impl(int flags) {
     file->private_data = ep;
     file->refcount = 1;
 
-    curr->fd_table->fds[fd] = file;
+    int fd = vfs_fd_install(curr->fd_table, file, 0,
+                            (flags & 02000000) ? VFS_FD_CLOEXEC : 0);
+    if (fd < 0) {
+        file->refcount = 0;
+        malloc_free(file);
+        malloc_free(node);
+        malloc_free(ep);
+        return (uint64_t)fd;
+    }
 
     return (uint64_t)fd;
 }

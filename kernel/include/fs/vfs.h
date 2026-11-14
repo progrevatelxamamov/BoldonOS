@@ -12,12 +12,22 @@
 #define VFS_O_APPEND    (1 << 4)
 #define VFS_O_NONBLOCK  (1 << 5)
 #define VFS_O_CLOEXEC   (1 << 6)
+/* Creation and type-check flags only affect open(2); they never persist in
+   the open file description. */
+#define VFS_O_EXCL      (1 << 7)
+#define VFS_O_DIRECTORY (1 << 8)
+#define VFS_O_NOFOLLOW  (1 << 9)
 
 #define VFS_SEEK_SET    0
 #define VFS_SEEK_CUR    1
 #define VFS_SEEK_END    2
 
 #define VFS_MAX_FD      256
+
+/* Per-descriptor flags live next to the descriptor entry, never in the shared
+   vfs_file: dup(2) and fork(2) share the open file description but each
+   descriptor has its own close-on-exec bit. */
+#define VFS_FD_CLOEXEC  0x1
 
 #define VFS_PERM_READ   4
 #define VFS_PERM_WRITE  2
@@ -64,6 +74,8 @@ typedef struct {
     int (*readdir)(struct vfs_file *file, vfs_dirent_t *dirent);
     void* (*mmap)(struct vfs_file *file, void *addr, uint64_t length, int prot, int flags, uint64_t offset);
     uint32_t (*poll)(struct vfs_file *file, uint32_t mask);
+    /* Change the cached file length without an open file description. */
+    int (*truncate)(struct vfs_node *node, uint64_t length);
 } vfs_file_ops_t;
 
 typedef struct {
@@ -109,6 +121,11 @@ typedef struct vfs_file {
     uint32_t flags;
     uint32_t refcount;
     void *private_data;
+    /* One-entry pushback for directory streams: getdents64() must be able to
+       return 0 without losing the record it just read. Backends advance their
+       own iterator inside readdir, so rewinding ->offset alone is not enough. */
+    vfs_dirent_t pending_dirent;
+    bool has_pending_dirent;
 } vfs_file_t;
 
 typedef struct vfs_mount {
@@ -131,6 +148,8 @@ typedef struct {
 
 typedef struct {
     vfs_file_t *fds[VFS_MAX_FD];
+    /* Bitmask of VFS_FD_* flags, one bit per descriptor slot. */
+    uint8_t fd_flags[VFS_MAX_FD];
     uint32_t uid;
     uint32_t gid;
 } process_fd_table_t;
@@ -154,11 +173,13 @@ vfs_node_t *vfs_resolve_path_nofollow(const char *path);
 vfs_node_t *vfs_resolve_path_ext(const char *path, bool parent_only, char *last_component);
 
 vfs_file_t *vfs_open(const char *path, uint32_t flags);
+vfs_file_t *vfs_open_node(vfs_node_t *node, uint32_t flags);
 int vfs_read(vfs_file_t *file, void *buf, uint64_t count);
 int vfs_write(vfs_file_t *file, const void *buf, uint64_t count);
 int vfs_close(vfs_file_t *file);
 int64_t vfs_lseek(vfs_file_t *file, int64_t offset, int whence);
 int vfs_readdir(vfs_file_t *file, vfs_dirent_t *dirent);
+void vfs_readdir_pushback(vfs_file_t *file, const vfs_dirent_t *dirent);
 int vfs_stat(const char *path, vfs_stat_t *st);
 int vfs_chmod(const char *path, uint32_t mode);
 int vfs_chown(const char *path, uint32_t uid, uint32_t gid);
@@ -167,10 +188,13 @@ int vfs_mkdir(const char *path, uint32_t mode);
 int vfs_unlink(const char *path);
 int vfs_rmdir(const char *path);
 int vfs_link(const char *oldpath, const char *newpath);
+int vfs_symlink(const char *target, const char *linkpath);
+int vfs_readlink(const char *path, char *buf, uint64_t size);
 int vfs_rename(const char *oldpath, const char *newpath);
 int vfs_fchmod(vfs_file_t *file, uint32_t mode);
 int vfs_setxattr(vfs_node_t *node, const char *name, const void *value, uint64_t size);
 int vfs_removexattr(vfs_node_t *node, const char *name);
+int vfs_truncate_node(vfs_node_t *node, uint64_t length);
 
 int vfs_copy_file(const char *src_path, const char *dst_path);
 
@@ -180,5 +204,13 @@ int sys_write(process_fd_table_t *table, int fd, const void *buf, uint64_t count
 int sys_close(process_fd_table_t *table, int fd);
 int sys_ioctl(process_fd_table_t *table, int fd, uint64_t request, void *arg);
 void *sys_mmap(process_fd_table_t *table, void *addr, uint64_t length, int prot, int flags, int fd, uint64_t offset);
+
+/* Descriptor-slot helpers shared by every subsystem that installs a file into
+   a process descriptor table. They keep refcounts and fd_flags consistent. */
+int vfs_fd_install(process_fd_table_t *table, vfs_file_t *file, int min_fd,
+                   uint8_t flags);
+int vfs_fd_install_at(process_fd_table_t *table, int fd, vfs_file_t *file,
+                      uint8_t flags);
+int vfs_fd_release(process_fd_table_t *table, int fd);
 
 #endif

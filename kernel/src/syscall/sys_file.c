@@ -212,9 +212,11 @@ uint64_t sys_access_impl(uint64_t path, uint64_t mode) {
 
 uint64_t sys_lseek_impl(uint64_t fd, uint64_t offset, uint64_t whence) {
     process_t *p = get_current_process();
-    if (!p || fd >= VFS_MAX_FD || !p->fd_table || !p->fd_table->fds[fd])
+    int ifd = (int32_t)fd;
+    if (!p || !p->fd_table || ifd < 0 || ifd >= VFS_MAX_FD ||
+        !p->fd_table->fds[ifd])
         return (uint64_t)-EBADF;
-    return (uint64_t)vfs_lseek(p->fd_table->fds[fd], (int64_t)offset, (int)whence);
+    return (uint64_t)vfs_lseek(p->fd_table->fds[ifd], (int64_t)offset, (int)whence);
 }
 
 uint64_t sys_poll_impl(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout) {
@@ -302,46 +304,67 @@ uint64_t sys_ppoll_impl(uint64_t fds_ptr, uint64_t nfds, uint64_t ts_ptr,
     return result;
 }
 
+/* Linux F_* command numbers. */
+#define LINUX_F_DUPFD          0
+#define LINUX_F_GETFD          1
+#define LINUX_F_SETFD          2
+#define LINUX_F_GETFL          3
+#define LINUX_F_SETFL          4
+#define LINUX_F_DUPFD_CLOEXEC  1030
+#define LINUX_FD_CLOEXEC       1
+
 uint64_t sys_fcntl_impl(uint64_t fd, uint64_t cmd, uint64_t arg) {
     process_t *p = get_current_process();
-    if (!p || !p->fd_table || fd >= VFS_MAX_FD || !p->fd_table->fds[fd])
+    int ifd = (int32_t)fd;
+    if (!p || !p->fd_table || ifd < 0 || ifd >= VFS_MAX_FD ||
+        !p->fd_table->fds[ifd])
         return (uint64_t)-EBADF;
 
-    if (cmd == 0 || cmd == 1030) {
+    vfs_file_t *file = p->fd_table->fds[ifd];
+
+    if (cmd == LINUX_F_DUPFD || cmd == LINUX_F_DUPFD_CLOEXEC) {
         int min_fd = (int)arg;
         if (min_fd < 0 || min_fd >= VFS_MAX_FD) return (uint64_t)-EINVAL;
-        for (int n = min_fd; n < VFS_MAX_FD; n++) {
-            if (!p->fd_table->fds[n]) {
-                p->fd_table->fds[n] = p->fd_table->fds[fd];
-                p->fd_table->fds[n]->refcount++;
-                return (uint64_t)n;
-            }
-        }
-        return (uint64_t)-EMFILE;
+        uint8_t flags = (cmd == LINUX_F_DUPFD_CLOEXEC) ? VFS_FD_CLOEXEC : 0;
+        int newfd = vfs_fd_install(p->fd_table, file, min_fd, flags);
+        return newfd < 0 ? (uint64_t)newfd : (uint64_t)newfd;
     }
 
-    if (cmd == 1 /* F_GETFD */) return 0;
-    if (cmd == 2 /* F_SETFD */) return 0;
-    if (cmd == 3 /* F_GETFL */) {
-        uint32_t f = p->fd_table->fds[fd]->flags;
+    if (cmd == LINUX_F_GETFD) {
+        return (p->fd_table->fd_flags[ifd] & VFS_FD_CLOEXEC) ?
+               LINUX_FD_CLOEXEC : 0;
+    }
+    if (cmd == LINUX_F_SETFD) {
+        p->fd_table->fd_flags[ifd] =
+            (arg & LINUX_FD_CLOEXEC) ? VFS_FD_CLOEXEC : 0;
+        return 0;
+    }
+    if (cmd == LINUX_F_GETFL) {
+        uint32_t f = file->flags;
         uint64_t linux_fl = (f & VFS_O_RDWR) == VFS_O_RDWR ? 2 :
                             (f & VFS_O_WRITE) ? 1 : 0;
         if (f & VFS_O_APPEND) linux_fl |= 02000;
         if (f & VFS_O_NONBLOCK) linux_fl |= 04000;
-        return linux_fl;
+        /* O_LARGEFILE is always set on x86-64. */
+        return linux_fl | 0100000;
     }
-    if (cmd == 4 /* F_SETFL */) {
+    if (cmd == LINUX_F_SETFL) {
         uint32_t linux_fl = (uint32_t)arg;
-        uint32_t vfs_fl = p->fd_table->fds[fd]->flags & ~(VFS_O_NONBLOCK | VFS_O_APPEND);
+        /* F_SETFL may change O_APPEND/O_NONBLOCK only; access mode stays. */
+        uint32_t vfs_fl = file->flags & ~(VFS_O_NONBLOCK | VFS_O_APPEND);
         if (linux_fl & 04000) vfs_fl |= VFS_O_NONBLOCK;
         if (linux_fl & 02000) vfs_fl |= VFS_O_APPEND;
-        p->fd_table->fds[fd]->flags = vfs_fl;
+        file->flags = vfs_fl;
         return 0;
     }
 
-    return 0;
+    /* Unknown commands must not report success for an operation that did
+       not happen. Many commands take pointer arguments we do not model yet. */
+    return (uint64_t)-EINVAL;
 }
 
+/* AT_FDCWD is passed as a 32-bit signed int; userspace may clear the upper
+   bits of the register, so compare the sign-extended low 32 bits only. */
 static void fill_linux_stat(vfs_node_t *node, struct linux_stat *st) {
     memset(st, 0, sizeof(*st));
     st->st_ino   = node->inode_num ? node->inode_num : 1;
@@ -367,6 +390,74 @@ static void fill_linux_stat(vfs_node_t *node, struct linux_stat *st) {
     st->st_mode = mode;
 }
 
+#define LINUX_AT_FDCWD (-100)
+
+/* AT_* flags accepted by the *at() family. */
+#define LINUX_AT_SYMLINK_NOFOLLOW 0x100
+#define LINUX_AT_REMOVEDIR        0x200
+#define LINUX_AT_SYMLINK_FOLLOW   0x400
+#define LINUX_AT_NO_AUTOMOUNT     0x800
+#define LINUX_AT_EMPTY_PATH       0x1000
+#define LINUX_AT_EACCESS          0x200
+
+static vfs_file_t *fdt_file(process_fd_table_t *table, uint64_t fd_arg) {
+    int fd = (int32_t)fd_arg;
+    if (!table || fd < 0 || fd >= VFS_MAX_FD || !table->fds[fd]) return NULL;
+    return table->fds[fd];
+}
+
+/* Build the absolute kernel path for a *at() syscall. Absolute names ignore
+   the descriptor; relative names are prefixed with the directory the
+   descriptor refers to. Returns 0, a negative errno, or the length of the
+   prefix written into out (callers append the relative name). */
+static int resolve_dirfd_prefix(uint64_t dirfd_arg, const char *path,
+                                char *out, size_t cap, size_t *prefix_len) {
+    if (!path) return -EFAULT;
+    if (path[0] == '/' || path[0] == '\0') {
+        *prefix_len = 0;
+        return 0;
+    }
+    if ((int32_t)dirfd_arg == LINUX_AT_FDCWD) {
+        *prefix_len = 0; /* the cwd is applied by normalize_path() */
+        return 0;
+    }
+
+    process_t *p = get_current_process();
+    vfs_file_t *file = fdt_file(p ? p->fd_table : NULL, dirfd_arg);
+    if (!file) return -EBADF;
+    if (!file->node) return -EBADF;
+    if (file->node->type != VFS_TYPE_DIR) return -ENOTDIR;
+    if (!file->node->name[0]) return -ENOENT;
+
+    const char *base = file->node->name;
+    size_t len = strlen(base);
+    if (len + 2 >= cap) return -ENAMETOOLONG;
+    memcpy(out, base, len);
+    if (len == 0 || base[len - 1] != '/') out[len++] = '/';
+    out[len] = '\0';
+    *prefix_len = len;
+    return 0;
+}
+
+/* Resolve a *at() pathname into the caller-provided buffer. Absolute names
+   and AT_FDCWD keep the original spelling so the VFS applies its logical
+   cwd/mountpoint mapping. */
+static int resolve_at_path(uint64_t dirfd_arg, uint64_t path_ptr,
+                           char *out, size_t cap, size_t *prefix_len) {
+    char raw[512];
+    int rc = copy_str_from_user(raw, path_ptr, sizeof(raw));
+    if (rc) return rc;
+    rc = resolve_dirfd_prefix(dirfd_arg, raw, out, cap, prefix_len);
+    if (rc) return rc;
+    size_t base = *prefix_len;
+    size_t raw_len = strlen(raw);
+    if (base + raw_len + 1 > cap) return -ENAMETOOLONG;
+    memcpy(out + base, raw, raw_len + 1);
+    return 0;
+}
+
+
+
 uint64_t sys_fstat_impl(uint64_t fd, uint64_t statbuf) {
     process_t *p = get_current_process();
     if (!p || fd >= VFS_MAX_FD || !p->fd_table || !p->fd_table->fds[fd])
@@ -382,7 +473,19 @@ uint64_t sys_fstat_impl(uint64_t fd, uint64_t statbuf) {
 
 uint64_t sys_stat_impl(uint64_t path, uint64_t statbuf) {
     if (!path || !statbuf) return (uint64_t)-EFAULT;
+    if (!user_range_ok(statbuf, sizeof(struct linux_stat)))
+        return (uint64_t)-EFAULT;
     vfs_node_t *node = vfs_resolve_path((const char *)path);
+    if (!node) return (uint64_t)-ENOENT;
+    fill_linux_stat(node, (struct linux_stat *)statbuf);
+    return 0;
+}
+
+uint64_t sys_lstat_impl(uint64_t path, uint64_t statbuf) {
+    if (!path || !statbuf) return (uint64_t)-EFAULT;
+    if (!user_range_ok(statbuf, sizeof(struct linux_stat)))
+        return (uint64_t)-EFAULT;
+    vfs_node_t *node = vfs_resolve_path_nofollow((const char *)path);
     if (!node) return (uint64_t)-ENOENT;
     fill_linux_stat(node, (struct linux_stat *)statbuf);
     return 0;
@@ -391,27 +494,32 @@ uint64_t sys_stat_impl(uint64_t path, uint64_t statbuf) {
 uint64_t sys_newfstatat_impl(uint64_t dirfd, uint64_t path,
                              uint64_t statbuf, uint64_t flags) {
     char kpath[512];
-    if (!statbuf || !user_range_ok(statbuf, sizeof(struct linux_stat)) ||
-        copy_str_from_user(kpath, path, sizeof(kpath))) return (uint64_t)-EFAULT;
+    if (!statbuf || !user_range_ok(statbuf, sizeof(struct linux_stat)))
+        return (uint64_t)-EFAULT;
     /* Linux accepts AT_NO_AUTOMOUNT (a no-op on modern kernels), and libc
        uses AT_EMPTY_PATH to implement fstat on an existing descriptor. */
-    if (flags & ~(0x100ULL | 0x800ULL | 0x1000ULL)) return (uint64_t)-EINVAL;
+    if (flags & ~(uint64_t)(LINUX_AT_SYMLINK_NOFOLLOW | LINUX_AT_NO_AUTOMOUNT |
+                            LINUX_AT_EMPTY_PATH)) return (uint64_t)-EINVAL;
+    if (!path) return (uint64_t)-EFAULT;
+
     vfs_node_t *node;
-    if (!kpath[0]) {
-        if (!(flags & 0x1000)) return (uint64_t)-ENOENT;
-        if ((int32_t)dirfd == -100) {
+    size_t prefix = 0;
+    int rc = resolve_at_path(dirfd, path, kpath, sizeof(kpath), &prefix);
+    if (rc) return (uint64_t)rc;
+    (void)prefix;
+
+    if (kpath[0] == '\0') {
+        if (!(flags & LINUX_AT_EMPTY_PATH)) return (uint64_t)-ENOENT;
+        if ((int32_t)dirfd == LINUX_AT_FDCWD) {
             node = vfs_resolve_path(".");
         } else {
             process_t *p = get_current_process();
-            int fd = (int32_t)dirfd;
-            if (!p || !p->fd_table || fd < 0 || fd >= VFS_MAX_FD ||
-                !p->fd_table->fds[fd] || !p->fd_table->fds[fd]->node)
-                return (uint64_t)-EBADF;
-            node = p->fd_table->fds[fd]->node;
+            vfs_file_t *file = fdt_file(p ? p->fd_table : NULL, dirfd);
+            if (!file || !file->node) return (uint64_t)-EBADF;
+            node = file->node;
         }
     } else {
-        if ((int32_t)dirfd != -100 && kpath[0] != '/') return (uint64_t)-ENOSYS;
-        node = flags & 0x100 /* AT_SYMLINK_NOFOLLOW */ ?
+        node = flags & LINUX_AT_SYMLINK_NOFOLLOW ?
             vfs_resolve_path_nofollow(kpath) : vfs_resolve_path(kpath);
     }
     if (!node) return (uint64_t)-ENOENT;
@@ -425,20 +533,26 @@ uint64_t sys_statx_impl(uint64_t dirfd, uint64_t path, uint64_t flags,
     if (!p || !p->fd_table) return (uint64_t)-EBADF;
     if (!statxbuf || !user_range_ok(statxbuf, sizeof(struct linux_statx)))
         return (uint64_t)-EFAULT;
-    if (flags & ~0x7900ULL) return (uint64_t)-EINVAL;
+    if (flags & ~(uint64_t)(LINUX_AT_SYMLINK_NOFOLLOW | LINUX_AT_NO_AUTOMOUNT |
+                            LINUX_AT_EMPTY_PATH | 0x4000 /* AT_STATX_DONT_SYNC */))
+        return (uint64_t)-EINVAL;
     (void)mask;
 
     vfs_node_t *node = NULL;
-    const char *pathstr = (const char *)path;
-    if ((flags & 0x1000) && (!pathstr || pathstr[0] == 0)) {
-        int fd = (int)dirfd;
-        if (fd < 0 || fd >= VFS_MAX_FD || !p->fd_table->fds[fd])
-            return (uint64_t)-EBADF;
-        node = p->fd_table->fds[fd]->node;
-        if (!node) return (uint64_t)-EBADF;
+    char kpath[512];
+    size_t prefix = 0;
+    int rc = resolve_at_path(dirfd, path, kpath, sizeof(kpath), &prefix);
+    if (rc == -ENAMETOOLONG && (flags & LINUX_AT_EMPTY_PATH)) rc = 0;
+    if (rc) return (uint64_t)rc;
+    (void)prefix;
+
+    if ((flags & LINUX_AT_EMPTY_PATH) && kpath[0] == '\0') {
+        vfs_file_t *file = fdt_file(p->fd_table, dirfd);
+        if (!file || !file->node) return (uint64_t)-EBADF;
+        node = file->node;
     } else {
-        if (!path) return (uint64_t)-EFAULT;
-        node = vfs_resolve_path(pathstr);
+        node = flags & LINUX_AT_SYMLINK_NOFOLLOW ?
+            vfs_resolve_path_nofollow(kpath) : vfs_resolve_path(kpath);
         if (!node) return (uint64_t)-ENOENT;
     }
 
@@ -558,9 +672,12 @@ static inline uint32_t translate_linux_open_flags(uint64_t linux_flags) {
     }
 
     if (linux_flags & 0100)     vfs_flags |= VFS_O_CREAT;
+    if (linux_flags & 0200)     vfs_flags |= VFS_O_EXCL;
     if (linux_flags & 01000)    vfs_flags |= VFS_O_TRUNC;
     if (linux_flags & 02000)    vfs_flags |= VFS_O_APPEND;
     if (linux_flags & 04000)    vfs_flags |= VFS_O_NONBLOCK;
+    if (linux_flags & 0200000)  vfs_flags |= VFS_O_DIRECTORY;
+    if (linux_flags & 0400000)  vfs_flags |= VFS_O_NOFOLLOW;
     if (linux_flags & 02000000) vfs_flags |= VFS_O_CLOEXEC;
 
     return vfs_flags;
@@ -570,10 +687,17 @@ uint64_t sys_openat_impl(uint64_t dirfd, uint64_t path, uint64_t flags) {
     process_t *p = get_current_process();
     if (!p || !p->fd_table) return (uint64_t)-EBADF;
     char kpath[512];
-    if (copy_str_from_user(kpath, path, sizeof(kpath))) return (uint64_t)-EFAULT;
-    /* Absolute paths ignore dirfd; relative dirfd resolution is not yet
-       implemented and must never silently use the process cwd instead. */
-    if ((int32_t)dirfd != -100 && kpath[0] != '/') return (uint64_t)-ENOSYS;
+    size_t prefix = 0;
+    int rc = resolve_at_path(dirfd, path, kpath, sizeof(kpath), &prefix);
+    if (rc) return (uint64_t)rc;
+    /* O_NOFOLLOW must not expand a final symlink: plain open(2) reports
+       ELOOP instead of silently opening the target (O_PATH is unsupported). */
+    if (flags & 0400000 /* O_NOFOLLOW */) {
+        vfs_node_t *existing = vfs_resolve_path_nofollow(kpath);
+        if (existing && existing->type == VFS_TYPE_SYMLINK)
+            return (uint64_t)-ELOOP;
+    }
+    (void)prefix;
     return (uint64_t)(int64_t)sys_open(p->fd_table, kpath,
                                       translate_linux_open_flags(flags));
 }
@@ -583,24 +707,54 @@ uint64_t sys_open_impl(uint64_t path, uint64_t flags, uint64_t mode) {
     return sys_openat_impl((uint64_t)-100, path, flags);
 }
 
+/* truncate(2): path based variant of ftruncate(2). Unlike ftruncate it takes
+   no descriptor, so DAC is checked against the resolved inode instead. */
+uint64_t sys_truncate_impl(uint64_t path, uint64_t length) {
+    if (!path) return (uint64_t)-EFAULT;
+    if ((int64_t)length < 0) return (uint64_t)-EINVAL;
+
+    vfs_node_t *node = vfs_resolve_path((const char *)path);
+    if (!node) return (uint64_t)-ENOENT;
+    if (node->type == VFS_TYPE_DIR) return (uint64_t)-EISDIR;
+    if (node->type != VFS_TYPE_FILE) return (uint64_t)-EINVAL;
+
+    process_t *p = get_current_process();
+    if (!p || !p->fd_table) return (uint64_t)-EBADF;
+    if (vfs_check_access(node, p->fsuid, p->fsgid, VFS_PERM_WRITE) != 0)
+        return (uint64_t)-EACCES;
+
+    int res = vfs_truncate_node(node, length);
+    return (uint64_t)(int64_t)res;
+}
+
 uint64_t sys_close_impl(uint64_t a1) {
     process_t *p = get_current_process();
     if (!p || !p->fd_table) return (uint64_t)-EBADF;
     return (uint64_t)(int64_t)sys_close(p->fd_table, (int)a1);
 }
 
+#define LINUX_CLOSE_RANGE_CLOEXEC (1 << 2)
+#define LINUX_CLOSE_RANGE_UNSHARE (1 << 1)
+
 uint64_t sys_close_range_impl(uint64_t first_arg, uint64_t last_arg, uint64_t flags) {
     uint32_t first = (uint32_t)first_arg, last = (uint32_t)last_arg;
     if (first > last) return (uint64_t)-EINVAL;
-    /* CLOSE_RANGE_UNSHARE and CLOEXEC require per-descriptor state; do not
-       silently advertise those semantics with a process-wide file flag. */
-    if (flags != 0) return (uint64_t)-ENOSYS;
+    if (flags & ~(uint64_t)(LINUX_CLOSE_RANGE_CLOEXEC | LINUX_CLOSE_RANGE_UNSHARE))
+        return (uint64_t)-EINVAL;
     process_t *p = get_current_process();
     if (!p || !p->fd_table) return (uint64_t)-EBADF;
     if (first >= VFS_MAX_FD) return 0;
     if (last >= VFS_MAX_FD) last = VFS_MAX_FD - 1;
-    for (uint32_t fd = first; fd <= last; fd++)
-        if (p->fd_table->fds[fd]) sys_close(p->fd_table, (int)fd);
+    /* The descriptor table is already private to each process, so the
+       UNSHARE bit only changes how failures are reported in Linux; here it
+       is a no-op and never changes close/close-on-exec semantics. */
+    for (uint32_t fd = first; fd <= last; fd++) {
+        if (!p->fd_table->fds[fd]) continue;
+        if (flags & LINUX_CLOSE_RANGE_CLOEXEC)
+            p->fd_table->fd_flags[fd] |= VFS_FD_CLOEXEC;
+        else
+            sys_close(p->fd_table, (int)fd);
+    }
     return 0;
 }
 
@@ -805,28 +959,42 @@ uint64_t exceptfds_ptr, uint64_t timeout_ptr, uint64_t sigmask_ptr) {
 }
 
 uint64_t sys_dup_impl(uint64_t oldfd) {
-    return sys_fcntl_impl(oldfd, 0 /* F_DUPFD */, 0);
+    return sys_fcntl_impl(oldfd, LINUX_F_DUPFD, 0);
 }
 
 uint64_t sys_dup2_impl(uint64_t oldfd, uint64_t newfd) {
     process_t *p = get_current_process();
     if (!p || !p->fd_table) return (uint64_t)-EBADF;
 
-    if (oldfd >= VFS_MAX_FD || !p->fd_table->fds[oldfd])
+    int iold = (int32_t)oldfd;
+    int inew = (int32_t)newfd;
+    if (iold < 0 || iold >= VFS_MAX_FD || !p->fd_table->fds[iold])
         return (uint64_t)-EBADF;
-
-    if (newfd >= VFS_MAX_FD)
+    if (inew < 0 || inew >= VFS_MAX_FD)
         return (uint64_t)-EBADF;
+    if (iold == inew) return newfd;
 
-    if (oldfd == newfd) return newfd;
+    /* dup2 always copies to a descriptor without close-on-exec. */
+    vfs_fd_install_at(p->fd_table, inew, p->fd_table->fds[iold], 0);
+    return newfd;
+}
 
-    if (p->fd_table->fds[newfd]) {
-        sys_close(p->fd_table, (int)newfd);
-    }
+/* dup3 adds flags and rejects newfd == oldfd (Linux returns EINVAL there). */
+uint64_t sys_dup3_impl(uint64_t oldfd, uint64_t newfd, uint64_t flags) {
+    process_t *p = get_current_process();
+    if (!p || !p->fd_table) return (uint64_t)-EBADF;
+    if (flags & ~(uint64_t)02000000 /* O_CLOEXEC */) return (uint64_t)-EINVAL;
 
-    p->fd_table->fds[newfd] = p->fd_table->fds[oldfd];
-    p->fd_table->fds[newfd]->refcount++;
+    int iold = (int32_t)oldfd;
+    int inew = (int32_t)newfd;
+    if (iold < 0 || iold >= VFS_MAX_FD || !p->fd_table->fds[iold])
+        return (uint64_t)-EBADF;
+    if (inew < 0 || inew >= VFS_MAX_FD)
+        return (uint64_t)-EBADF;
+    if (iold == inew) return (uint64_t)-EINVAL;
 
+    vfs_fd_install_at(p->fd_table, inew, p->fd_table->fds[iold],
+                      (flags & 02000000) ? VFS_FD_CLOEXEC : 0);
     return newfd;
 }
 
@@ -834,22 +1002,47 @@ uint64_t sys_readlink_impl(uint64_t path, uint64_t buf, uint64_t bufsiz) {
     if (!path || !buf || bufsiz == 0) return (uint64_t)-EFAULT;
     if (!user_range_ok(path, 1) || !user_range_ok(buf, bufsiz)) return (uint64_t)-EFAULT;
 
-    /* Resolve the parent, not the final component: ordinary VFS resolution
-       follows symlinks, which made readlink() unable to see the link itself. */
-    char name[256];
-    vfs_node_t *parent = vfs_resolve_path_ext((const char *)path, true, name);
-    if (!parent || !parent->ops || !parent->ops->lookup) return (uint64_t)-ENOENT;
-    vfs_node_t *node = parent->ops->lookup(parent, name);
-    if (!node) return (uint64_t)-ENOENT;
-    if (node->type != VFS_TYPE_SYMLINK) return (uint64_t)-EINVAL;
+    /* readlink() must not follow the final symlink; vfs_readlink resolves
+       the parent only and reads the link body without expanding it. */
+    int res = vfs_readlink((const char *)path, (char *)buf, bufsiz);
+    if (res < 0) return (uint64_t)res;
+    return (uint64_t)res;
+}
 
-    if (node->ops && node->ops->readlink) {
-        int res = node->ops->readlink(node, (char *)buf, bufsiz);
-        if (res < 0) return (uint64_t)-EINVAL;
-        return (uint64_t)res;
+uint64_t sys_readlinkat_impl(uint64_t dirfd, uint64_t path, uint64_t buf,
+                             uint64_t bufsiz) {
+    if (!path || !buf || bufsiz == 0) return (uint64_t)-EFAULT;
+    if (!user_range_ok(buf, bufsiz)) return (uint64_t)-EFAULT;
+    char kpath[512];
+    size_t prefix = 0;
+    int rc = resolve_at_path(dirfd, path, kpath, sizeof(kpath), &prefix);
+    if (rc) return (uint64_t)rc;
+    (void)prefix;
+    int res = vfs_readlink(kpath, (char *)buf, bufsiz);
+    return res < 0 ? (uint64_t)res : (uint64_t)res;
+}
+
+/* Linux d_type values. */
+#define LINUX_DT_UNKNOWN  0
+#define LINUX_DT_FIFO     1
+#define LINUX_DT_CHR      2
+#define LINUX_DT_DIR      4
+#define LINUX_DT_BLK      6
+#define LINUX_DT_REG      8
+#define LINUX_DT_LNK      10
+#define LINUX_DT_SOCK     12
+
+static uint8_t linux_dtype(vfs_node_type_t type) {
+    switch (type) {
+        case VFS_TYPE_FILE:      return LINUX_DT_REG;
+        case VFS_TYPE_DIR:       return LINUX_DT_DIR;
+        case VFS_TYPE_SYMLINK:   return LINUX_DT_LNK;
+        case VFS_TYPE_BLOCK_DEV: return LINUX_DT_BLK;
+        case VFS_TYPE_CHAR_DEV:  return LINUX_DT_CHR;
+        case VFS_TYPE_FIFO:      return LINUX_DT_FIFO;
+        case VFS_TYPE_SOCKET:    return LINUX_DT_SOCK;
+        default:                 return LINUX_DT_UNKNOWN;
     }
-
-    return (uint64_t)-EINVAL;
 }
 
 uint64_t sys_getdents64_impl(uint64_t fd_raw, uint64_t dirp_raw, uint64_t count_raw) {
@@ -857,7 +1050,7 @@ uint64_t sys_getdents64_impl(uint64_t fd_raw, uint64_t dirp_raw, uint64_t count_
     uint8_t *buf = (uint8_t *)dirp_raw;
     size_t count = (size_t)count_raw;
 
-    if (!buf || count < sizeof(struct linux_dirent64)) return (uint64_t)-EINVAL;
+    if (!buf || count == 0) return (uint64_t)-EINVAL;
 
     process_t *curr = get_current_process();
     if (!curr || !curr->fd_table || fd < 0 || fd >= VFS_MAX_FD ||
@@ -868,37 +1061,38 @@ uint64_t sys_getdents64_impl(uint64_t fd_raw, uint64_t dirp_raw, uint64_t count_
 
     size_t total_bytes = 0;
 
-    while (total_bytes < count) {
+    for (;;) {
         vfs_dirent_t dent;
         memset(&dent, 0, sizeof(dent));
 
+        /* readdir advances file->offset; a short buffer must simply stop
+           writing while leaving the offset on the next unconsumed entry. */
         int res = vfs_readdir(file, &dent);
-        
-        if (res < 0) break; 
+        if (res < 0) break;
 
         size_t name_len = strlen(dent.name);
         if (name_len == 0) continue;
 
-        size_t reclen = (19 + name_len + 1 + 7) & ~7;
-
+        size_t reclen = (19 + name_len + 1 + 7) & ~(size_t)7;
         if (total_bytes + reclen > count) {
+            /* Push the record back: the backend iterator already moved, so
+               the next getdents64() must return this same entry instead of
+               silently skipping it. */
+            vfs_readdir_pushback(file, &dent);
+            /* Nothing fit at all: report EINVAL like Linux filldir() does
+               instead of returning 0 forever for an undersized buffer. */
+            if (total_bytes == 0) return (uint64_t)-EINVAL;
             break;
         }
 
         struct linux_dirent64 *d = (struct linux_dirent64 *)(buf + total_bytes);
         d->d_ino = dent.inode_num;
-        d->d_off = (int64_t)file->offset;
+        d->d_off = (int64_t)(file->offset);
         d->d_reclen = (uint16_t)reclen;
+        d->d_type = linux_dtype(dent.type);
 
-        uint8_t dt = DT_UNKNOWN;
-        if (dent.type == VFS_TYPE_DIR) dt = DT_DIR;
-        else if (dent.type == VFS_TYPE_FILE) dt = DT_REG;
-        else if (dent.type == VFS_TYPE_CHAR_DEV) dt = DT_CHR;
-
-        d->d_type = dt;
-        
-        memset(d->d_name, 0, reclen - 19); 
-        strncpy(d->d_name, dent.name, name_len);
+        memset(d->d_name, 0, reclen - 19);
+        memcpy(d->d_name, dent.name, name_len);
         d->d_name[name_len] = '\0';
 
         total_bytes += reclen;
@@ -906,6 +1100,7 @@ uint64_t sys_getdents64_impl(uint64_t fd_raw, uint64_t dirp_raw, uint64_t count_
 
     return (uint64_t)total_bytes;
 }
+
 
 uint64_t sys_readv_impl(uint64_t a1, uint64_t a2, uint64_t a3) {
     process_t *p = get_current_process();
@@ -1122,16 +1317,22 @@ static int mutation_owner_access(vfs_node_t *node) {
            (p->cap_effective & BOLDON_CAP_FOWNER) ? 0 : -EPERM;
 }
 
-uint64_t sys_mkdirat_impl(uint64_t dirfd, uint64_t path_ptr, uint64_t mode) {
-    char kpath[256];
-    if (copy_str_from_user(kpath, path_ptr, sizeof(kpath)) != 0) {
-        return (uint64_t)-EFAULT;
-    }
+/* New entries honour the process umask, like Linux does for open/mkdir. */
+static uint32_t apply_umask(uint32_t mode) {
+    process_t *p = get_current_process();
+    uint32_t mask = (p && p->umask) ? p->umask : 0;
+    return mode & ~mask & 07777;
+}
 
-    if ((int32_t)dirfd != -100 && kpath[0] != '/') return (uint64_t)-ENOSYS;
+uint64_t sys_mkdirat_impl(uint64_t dirfd, uint64_t path_ptr, uint64_t mode) {
+    char kpath[512];
+    size_t prefix = 0;
+    int rc = resolve_at_path(dirfd, path_ptr, kpath, sizeof(kpath), &prefix);
+    if (rc) return (uint64_t)rc;
+    (void)prefix;
     int access = mutation_parent_access(kpath);
     if (access) return (uint64_t)(int64_t)access;
-    int res = vfs_mkdir(kpath, (uint32_t)mode);
+    int res = vfs_mkdir(kpath, apply_umask((uint32_t)mode));
     if (res < 0) {
         return (uint64_t)res;
     }
@@ -1140,18 +1341,17 @@ uint64_t sys_mkdirat_impl(uint64_t dirfd, uint64_t path_ptr, uint64_t mode) {
 }
 
 uint64_t sys_mkdir_impl(uint64_t path_ptr, uint64_t mode) {
-    return sys_mkdirat_impl(-100 /* AT_FDCWD */, path_ptr, mode);
+    return sys_mkdirat_impl((uint64_t)(int64_t)LINUX_AT_FDCWD, path_ptr, mode);
 }
 
 uint64_t sys_renameat_impl(uint64_t oldfd, uint64_t old_ptr,
                            uint64_t newfd, uint64_t new_ptr) {
     char oldpath[512], newpath[512];
-    if (copy_str_from_user(oldpath, old_ptr, sizeof(oldpath)) != 0 ||
-        copy_str_from_user(newpath, new_ptr, sizeof(newpath)) != 0)
-        return (uint64_t)-EFAULT;
-    if (((int32_t)oldfd != -100 && oldpath[0] != '/') ||
-        ((int32_t)newfd != -100 && newpath[0] != '/'))
-        return (uint64_t)-ENOSYS;
+    size_t prefix = 0;
+    int rc = resolve_at_path(oldfd, old_ptr, oldpath, sizeof(oldpath), &prefix);
+    if (rc) return (uint64_t)rc;
+    rc = resolve_at_path(newfd, new_ptr, newpath, sizeof(newpath), &prefix);
+    if (rc) return (uint64_t)rc;
     int access = mutation_parent_access(oldpath);
     if (!access) access = mutation_parent_access(newpath);
     if (access) return (uint64_t)(int64_t)access;
@@ -1159,12 +1359,11 @@ uint64_t sys_renameat_impl(uint64_t oldfd, uint64_t old_ptr,
 }
 
 uint64_t sys_unlinkat_impl(uint64_t dirfd, uint64_t path_ptr, uint64_t flags) {
-    char kpath[256];
-    if (copy_str_from_user(kpath, path_ptr, sizeof(kpath)) != 0) {
-        return (uint64_t)-EFAULT;
-    }
-
-    if ((int32_t)dirfd != -100 && kpath[0] != '/') return (uint64_t)-ENOSYS;
+    char kpath[512];
+    size_t prefix = 0;
+    int rc = resolve_at_path(dirfd, path_ptr, kpath, sizeof(kpath), &prefix);
+    if (rc) return (uint64_t)rc;
+    (void)prefix;
     if (flags & ~0x200ULL) return (uint64_t)-EINVAL;
     int access = mutation_parent_access(kpath);
     if (access) return (uint64_t)(int64_t)access;
@@ -1180,21 +1379,24 @@ uint64_t sys_unlinkat_impl(uint64_t dirfd, uint64_t path_ptr, uint64_t flags) {
 }
 
 uint64_t sys_unlink_impl(uint64_t path_ptr) {
-    return sys_unlinkat_impl(-100 /* AT_FDCWD */, path_ptr, 0);
+    return sys_unlinkat_impl((uint64_t)(int64_t)LINUX_AT_FDCWD, path_ptr, 0);
 }
 
 uint64_t sys_rmdir_impl(uint64_t path_ptr) {
-    return sys_unlinkat_impl(-100 /* AT_FDCWD */, path_ptr, 0x200 /* AT_REMOVEDIR */);
+    return sys_unlinkat_impl((uint64_t)(int64_t)LINUX_AT_FDCWD, path_ptr,
+                             0x200 /* AT_REMOVEDIR */);
 }
 
 uint64_t sys_fchmodat_impl(uint64_t dirfd, uint64_t path_ptr, uint64_t mode, uint64_t flags) {
-    char kpath[256];
-    if (copy_str_from_user(kpath, path_ptr, sizeof(kpath)) != 0) {
-        return (uint64_t)-EFAULT;
-    }
-
-    if ((int32_t)dirfd != -100 && kpath[0] != '/') return (uint64_t)-ENOSYS;
-    if (flags) return (uint64_t)-ENOSYS;
+    char kpath[512];
+    size_t prefix = 0;
+    int rc = resolve_at_path(dirfd, path_ptr, kpath, sizeof(kpath), &prefix);
+    if (rc) return (uint64_t)rc;
+    (void)prefix;
+    /* AT_SYMLINK_NOFOLLOW is the only documented flag here; chmod(2) on the
+       link itself is not supported by this VFS, so reject it explicitly. */
+    if (flags & ~0x100ULL) return (uint64_t)-EINVAL;
+    if (flags & 0x100ULL) return (uint64_t)-ENOTSUP;
     int access = mutation_owner_access(vfs_resolve_path(kpath));
     if (access) return (uint64_t)(int64_t)access;
     int res = vfs_chmod(kpath, (uint32_t)mode);
@@ -1204,25 +1406,60 @@ uint64_t sys_fchmodat_impl(uint64_t dirfd, uint64_t path_ptr, uint64_t mode, uin
 }
 
 uint64_t sys_chmod_impl(uint64_t path_ptr, uint64_t mode) {
-    return sys_fchmodat_impl(-100, path_ptr, mode, 0);
+    return sys_fchmodat_impl((uint64_t)(int64_t)LINUX_AT_FDCWD, path_ptr, mode, 0);
 }
 
-uint64_t sys_link_impl(uint64_t oldpath_ptr, uint64_t newpath_ptr) {
-    char kold[256], knew[256];
-
-    if (copy_str_from_user(kold, oldpath_ptr, sizeof(kold)) != 0)
-        return (uint64_t)-EFAULT;
-
-    if (copy_str_from_user(knew, newpath_ptr, sizeof(knew)) != 0)
-        return (uint64_t)-EFAULT;
-
+uint64_t sys_linkat_impl(uint64_t olddirfd, uint64_t oldpath_ptr,
+                         uint64_t newdirfd, uint64_t newpath_ptr,
+                         uint64_t flags) {
+    char kold[512], knew[512];
+    size_t prefix = 0;
+    /* AT_SYMLINK_FOLLOW may be ignored: the VFS resolves symlinks here. */
+    if (flags & ~0x400ULL) return (uint64_t)-EINVAL;
+    int rc = resolve_at_path(olddirfd, oldpath_ptr, kold, sizeof(kold), &prefix);
+    if (rc) return (uint64_t)rc;
+    rc = resolve_at_path(newdirfd, newpath_ptr, knew, sizeof(knew), &prefix);
+    if (rc) return (uint64_t)rc;
     int access = mutation_parent_access(knew);
     if (access) return (uint64_t)(int64_t)access;
     int res = vfs_link(kold, knew);
     if (res < 0) return (uint64_t)res;
-
     return 0;
 }
+
+uint64_t sys_link_impl(uint64_t oldpath_ptr, uint64_t newpath_ptr) {
+    return sys_linkat_impl((uint64_t)(int64_t)LINUX_AT_FDCWD, oldpath_ptr,
+                           (uint64_t)(int64_t)LINUX_AT_FDCWD, newpath_ptr, 0);
+}
+
+/* Shared body for symlink(2) and symlinkat(2). The target string is stored
+   verbatim, the link name is resolved against the descriptor. */
+static uint64_t symlink_common(uint64_t target_ptr, uint64_t dirfd,
+                               uint64_t linkpath_ptr) {
+    char target[512], linkpath[512];
+    size_t prefix = 0;
+    int rc = copy_str_from_user(target, target_ptr, sizeof(target));
+    if (rc) return (uint64_t)rc;
+    /* Linux reports ENOENT for an empty target: a link to "" is useless. */
+    if (target[0] == '\0') return (uint64_t)-ENOENT;
+    rc = resolve_at_path(dirfd, linkpath_ptr, linkpath, sizeof(linkpath), &prefix);
+    if (rc) return (uint64_t)rc;
+    (void)prefix;
+    int access = mutation_parent_access(linkpath);
+    if (access) return (uint64_t)(int64_t)access;
+    return (uint64_t)(int64_t)vfs_symlink(target, linkpath);
+}
+
+uint64_t sys_symlink_impl(uint64_t target_ptr, uint64_t linkpath_ptr) {
+    return symlink_common(target_ptr, (uint64_t)(int64_t)LINUX_AT_FDCWD,
+                          linkpath_ptr);
+}
+
+uint64_t sys_symlinkat_impl(uint64_t target_ptr, uint64_t newdirfd,
+                            uint64_t linkpath_ptr) {
+    return symlink_common(target_ptr, newdirfd, linkpath_ptr);
+}
+
 
 uint64_t sys_fchmod_impl(uint64_t fd, uint64_t mode) {
     process_t *p = get_current_process();
@@ -1240,12 +1477,27 @@ uint64_t sys_fchmod_impl(uint64_t fd, uint64_t mode) {
 
 uint64_t sys_faccessat2_impl(uint64_t dfd, uint64_t filename, uint64_t mode, uint64_t flags) {
     char path[512];
-    if (copy_str_from_user(path, filename, sizeof(path))) return (uint64_t)-EFAULT;
-    if ((int32_t)dfd != -100 && path[0] != '/') return (uint64_t)-ENOSYS;
-    /* access(2) uses real credentials; AT_EACCESS and nofollow need distinct
-       handling, not a silent alias to the existing access approximation. */
-    if (flags) return (uint64_t)-ENOSYS;
-    return sys_access_impl((uint64_t)path, mode);
+    size_t prefix = 0;
+    if (mode & ~7ULL) return (uint64_t)-EINVAL;
+    if (flags & ~(uint64_t)(LINUX_AT_EACCESS | LINUX_AT_SYMLINK_NOFOLLOW))
+        return (uint64_t)-EINVAL;
+    int rc = resolve_at_path(dfd, filename, path, sizeof(path), &prefix);
+    if (rc) return (uint64_t)rc;
+    (void)prefix;
+
+    vfs_node_t *node = (flags & LINUX_AT_SYMLINK_NOFOLLOW) ?
+        vfs_resolve_path_nofollow(path) : vfs_resolve_path(path);
+    if (!node) return (uint64_t)-ENOENT;
+    if (mode == 0) return 0;
+
+    process_t *p = get_current_process();
+    if (!p) return (uint64_t)-ESRCH;
+    /* access(2) defaults to the real IDs; AT_EACCESS switches to the
+       effective ones, which is what faccessat2() callers expect. */
+    uint32_t uid = (flags & LINUX_AT_EACCESS) ? p->euid : p->fsuid;
+    uint32_t gid = (flags & LINUX_AT_EACCESS) ? p->egid : p->fsgid;
+    int res = vfs_check_access(node, uid, gid, (int)mode);
+    return res != 0 ? (uint64_t)-EACCES : 0;
 }
 
 uint64_t sys_fstatfs_impl(uint64_t fd, uint64_t buf) {

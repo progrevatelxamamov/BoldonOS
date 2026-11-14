@@ -105,12 +105,14 @@ int sys_signalfd4_impl(int fd, const void *mask, uint64_t sizemask, int flags) {
     f->flags = VFS_O_RDWR | (uint32_t)flags;
     f->refcount = 1;
 
-    for (int i = 0; i < VFS_MAX_FD; i++) {
-        if (!p->fd_table->fds[i]) {
-            p->fd_table->fds[i] = f;
-            return i;
-        }
+    int i = vfs_fd_install(p->fd_table, f, 0,
+                           (flags & 02000000 /* SFD_CLOEXEC */) ? VFS_FD_CLOEXEC : 0);
+    if (i < 0) {
+        s->used = false;
+        f->refcount = 0;
+        malloc_free(f);
+        malloc_free(n);
+        return i;
     }
-    malloc_free(f); malloc_free(n);
-    return -EMFILE;
+    return i;
 }

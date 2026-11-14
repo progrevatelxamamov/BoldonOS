@@ -62,7 +62,10 @@ static int un_close(socket_t *sock);
 static socket_ops_t unix_ops = {.close=un_close};
 socket_t *unix_socket_create(int type, int protocol);
 typedef struct { socket_t *sock; int flags; } vfs_file_t;
-typedef struct { vfs_file_t *fds[VFS_MAX_FD]; } fd_table_t;
+#define VFS_FD_CLOEXEC 0x1
+#define LINUX_CLOSE_RANGE_CLOEXEC (1 << 2)
+#define LINUX_CLOSE_RANGE_UNSHARE (1 << 1)
+typedef struct { vfs_file_t *fds[VFS_MAX_FD]; uint8_t fd_flags[VFS_MAX_FD]; } fd_table_t;
 typedef struct { fd_table_t *fd_table; uint32_t fsuid, fsgid; } process_t;
 static fd_table_t fd_table;
 static process_t proc = {.fd_table=&fd_table};
@@ -88,8 +91,11 @@ int main(void) {
     int fds[2] = {-1, -1};
     assert(sys_socketpair(AF_UNIX, SOCK_STREAM|00004000|02000000, 0, fds) == 0);
     assert(fds[0] == 0 && fds[1] == 1);
-    assert((fd_table.fds[0]->flags & (VFS_O_NONBLOCK|VFS_O_CLOEXEC)) ==
-           (VFS_O_NONBLOCK|VFS_O_CLOEXEC));
+    /* O_NONBLOCK belongs to the open file description, close-on-exec to
+       the descriptor slot - the two must not be conflated. */
+    assert((fd_table.fds[0]->flags & VFS_O_NONBLOCK) == VFS_O_NONBLOCK);
+    assert(fd_table.fd_flags[0] & VFS_FD_CLOEXEC);
+    assert(!(fd_table.fds[0]->flags & VFS_O_CLOEXEC));
     assert(sys_socketpair(AF_UNIX, 2, 0, fds) == -ESOCKTNOSUPPORT);
     assert(sys_socketpair(2, SOCK_STREAM, 0, fds) == -EAFNOSUPPORT);
     socket_t *a = fd_table.fds[0]->sock, *b = fd_table.fds[1]->sock;
@@ -108,8 +114,13 @@ int main(void) {
     assert(un_send(b, "z", 1, 0x4000) == -EPIPE);
     sys_close(&fd_table, 1);
     assert(sys_socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
-    assert(sys_close_range_impl(0, 1, 4) == (uint64_t)-ENOSYS);
+    /* CLOSE_RANGE_CLOEXEC marks the range instead of closing it. */
+    assert(sys_close_range_impl(0, 1, 4) == 0);
     assert(fd_table.fds[0] && fd_table.fds[1]);
+    assert(fd_table.fd_flags[0] == VFS_FD_CLOEXEC);
+    assert(fd_table.fd_flags[1] == VFS_FD_CLOEXEC);
+    /* Undocumented flag bits are rejected. */
+    assert(sys_close_range_impl(0, 1, 8) == (uint64_t)-EINVAL);
     assert(sys_close_range_impl(1, 0, 0) == (uint64_t)-EINVAL);
     assert(sys_close_range_impl(0, UINT32_MAX, 0) == 0);
     assert(!fd_table.fds[0] && !fd_table.fds[1]);
