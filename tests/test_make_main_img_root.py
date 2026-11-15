@@ -88,6 +88,23 @@ try:
     else:
         raise AssertionError('verify_root_image accepted a corrupt filesystem')
 
+    # An empty root directory must be refused with an actionable message, not
+    # silently produce an image that boots into nothing.
+    empty = work / 'empty-root'
+    empty.mkdir()
+    try:
+        make_main_img.verify_root_payload(str(empty))
+    except SystemExit as exc:
+        message = str(exc)
+        assert 'refusing to build' in message, message
+        for word in ('bin/sh', 'etc/init.sh', 'osdata'):
+            assert word in message, (word, message)
+    else:
+        raise AssertionError('an empty root directory was accepted')
+
+    # ...and a root with the shell in it must be accepted.
+    make_main_img.verify_root_payload(str(tree))
+
     print('make-main-img root filesystem checks PASS')
 finally:
     shutil.rmtree(work, ignore_errors=True)

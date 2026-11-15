@@ -142,9 +142,14 @@ def main():
     ap.add_argument("--mkfs", default="/sbin/mke2fs")
     ap.add_argument("--debugfs", default="/sbin/debugfs")
     ap.add_argument("--e2fsck", default="/sbin/e2fsck")
+    ap.add_argument("--allow-empty-root", action="store_true",
+                    help="build even if the root directory has no shell")
     ap.add_argument("--limine", default="limine-binary/limine")
     ap.add_argument("--limine-conf", default="limine.conf")
     args = ap.parse_args()
+
+    if not args.allow_empty_root:
+        verify_root_payload(args.root)
 
     size_bytes = args.size_mib * MIB
     with open(args.out, "wb") as f:
@@ -231,6 +236,33 @@ def verify_root_image(e2fsck: str, image: str):
     if result.returncode != 0:
         raise SystemExit(f"root filesystem check failed for {image}:\n"
                          f"{result.stdout}{result.stderr}")
+
+
+def verify_root_payload(root_dir: str):
+    """Refuse to build an image whose root cannot start a shell.
+
+    osdata/ is intentionally not tracked by git, so a fresh clone has an empty
+    or missing root directory. The resulting image boots all the way through
+    the bootloader and the kernel and then sits there with no shell, which
+    looks exactly like a storage-driver failure. Say what is actually wrong
+    while the build is still running instead.
+    """
+    missing = []
+    for required in ("bin/sh", "etc/init.sh", "bin/busybox"):
+        path = os.path.join(root_dir, required)
+        if not os.path.exists(path):
+            missing.append(required)
+    if not missing:
+        return
+    raise SystemExit(
+        "refusing to build: the root directory "
+        f"{root_dir!r} is missing {', '.join(missing)}.\n"
+        "osdata/ is not part of the git checkout; populate it first, e.g.\n"
+        "  mkdir -p osdata/bin osdata/etc\n"
+        "  cp /path/to/busybox osdata/bin/busybox && ln -sf busybox osdata/bin/sh\n"
+        "  printf '#!/bin/sh\\nexec /bin/sh\\n' > osdata/etc/init.sh\n"
+        "then run make main.img again. Pass --allow-empty-root to build a\n"
+        "rootless image on purpose (it will boot to the kernel and stop).")
 
 
 def copy_tree(debugfs: str, image: str, root_dir: str):

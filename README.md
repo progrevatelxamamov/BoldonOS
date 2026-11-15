@@ -9,16 +9,31 @@ sh kernel/get-deps
 make clean
 make -j"$(nproc)"       # template.iso — только ядро, без корневой ФС
 make check-image         # убедиться, что ISO содержит свежее ядро
-make usb-image           # main.img — полный диск с корнем ext4 (для реального ПК)
+make osdata              # подготовить корневую ФС в osdata/ (busybox + init.sh)
+make main.img            # main.img — полный диск с корнем ext4 (для реального ПК)
 sudo dd if=main.img of=/dev/sdX bs=4M status=progress conv=fsync
 ```
+
+`make main.img` не требует root, `sgdisk`, `mkfs.fat` или `losetup`: GPT и
+FAT32 пишутся на чистом Python (`scripts/make-main-img.py`,
+`scripts/fat32.py`), а ext4 создаётся через `mke2fs`+`debugfs`. Нужны только
+`python3` и `e2fsprogs`. Перед сборкой скрипт проверяет корень через `e2fsck`
+и отказывается собирать образ, если в `osdata/` нет `bin/sh` или
+`etc/init.sh` — иначе образ грузится до ядра и молча останавливается без
+шелли, что легко принять за баг драйвера.
+
+В QEMU ядро видит диск только как **USB mass storage** (драйверов AHCI или
+virtio-blk в ядре нет), поэтому `-drive file=main.img,if=virtio` не подойдёт;
+`make run-main` уже передаёт `qemu-xhci` + `usb-storage`.
 
 `template.iso`, лежащий в git — это старый бинарный снимок. `git pull` его не
 пересобирает: после любого изменения исходников нужен `make`. Проверить образ
 можно командой `make check-image` (ищет маркер `[BOOT] PCI scan`).
 
 `main.img` наполняется из каталога `osdata/` (он в `.gitignore`, поэтому в
-репозитории его нет). Минимально там должны быть `bin/sh` и `etc/init.sh`,
+репозитории его нет — `make osdata` создаёт его из статического busybox,
+скачивая его при необходимости, либо возьмите свой: `scripts/make-osdata.py
+--busybox PATH`). Минимально там должны быть `bin/sh` и `etc/init.sh`,
 иначе даже при смонтированном `C:` shell не запустится. `C:` выбирается только
 из ext4-раздела GPT с именем `BOLDON_ROOT`; FAT32-раздел EFI на NVMe не может
 стать корнем вместо флешки.

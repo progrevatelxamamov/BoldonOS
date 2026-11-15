@@ -162,8 +162,12 @@ check-osdata:
 		echo "WARNING: osdata/bin/sh is missing - init will fail"; \
 	fi
 
+.PHONY: osdata
+osdata:
+	@python3 scripts/make-osdata.py --out osdata
+
 .PHONY: usb-image
-usb-image:
+usb-image: osdata
 	@$(MAKE) check-osdata
 	@$(MAKE) main.img
 	@$(MAKE) check-image
@@ -215,48 +219,22 @@ distclean: clean
 	rm -rf limine-binary limine-binary.tar.gz edk2-ovmf-bins edk2-ovmf-bins.tar.gz
 
 MAIN_SIZE_MIB := 1024
+MAIN_ESP_MIB  := 128
 
+# The image is assembled by scripts/make-main-img.py: a pure-Python GPT writer,
+# the FAT32 writer in scripts/fat32.py and mke2fs/debugfs for the ext4 root.
+# The previous recipe needed root, sgdisk, losetup, mkfs.fat and mkfs.ext4,
+# so `make main.img` failed on any machine without all of them. Limine's own
+# `bios-install` is still what writes the MBR and the BIOSBOOT partition.
 main.img: limine-binary/limine kernel
 	@if [ ! -d osdata ]; then echo "WARNING: osdata/ is missing - the ext4 root will be empty and /etc/init.sh will not exist"; fi
-	@echo "==> Создаём пустой GPT образ $(MAIN_SIZE_MIB) МиБ"
-	rm -f main.img
-	dd if=/dev/zero bs=1M count=$(MAIN_SIZE_MIB) of=main.img status=none
-
-	@echo "==> Разметка GPT (p1: BIOS Boot, p2: EFI System, p3: BOLDON_ROOT)"
-	# 1. Создаем пустую таблицу GPT
-	sgdisk -o main.img
-	# 2. Раздел 1: BIOS Boot Partition (тип ef02, 1Мб) - нужен для limine bios-install
-	sgdisk -n 1:2048:+1M -t 1:ef02 -c 1:"BIOSBOOT" main.img
-	# 3. Раздел 2: EFI System Partition (тип ef00, 128Мб) - для UEFI загрузки и ядра
-	sgdisk -n 2:0:+128M -t 2:ef00 -c 2:"BOOT" main.img
-	# 4. Раздел 3: Системный раздел Ext4 (тип 8300, все оставшееся место)
-	sgdisk -n 3:0:0 -t 3:8300 -c 3:"BOLDON_ROOT" main.img
-
-	@echo "==> Форматируем разделы p2 (FAT32) и p3 (Ext4)"
-	@LOOP_DEV=$$(sudo losetup -f --show -P main.img); \
-	echo "    Loop device: $$LOOP_DEV"; \
-	sudo mkfs.fat -F 32 -n "BOOT" $${LOOP_DEV}p2; \
-	sudo mkfs.ext4 -F -L BOLDON_ROOT -b 4096 $${LOOP_DEV}p3; \
-	mkdir -p .mnt_boot .mnt_root; \
-	sudo mount $${LOOP_DEV}p2 .mnt_boot; \
-	sudo mount $${LOOP_DEV}p3 .mnt_root; \
-	sudo mkdir -p .mnt_boot/boot/limine .mnt_boot/EFI/BOOT; \
-	sudo cp -v boldonsplash.bmp .mnt_boot/boot/ 2>/dev/null || true; \
-	sudo cp -v kernel/bin/kernel .mnt_boot/boot/; \
-	sudo cp -v kernel/third_party/libpayload/LICENSES.md .mnt_boot/boot/libpayload-LICENSES.md; \
-	sudo cp -v limine.conf limine-binary/limine-bios.sys .mnt_boot/boot/limine/; \
-	sudo cp -v limine-binary/BOOTX64.EFI .mnt_boot/EFI/BOOT/; \
-	sudo cp -v limine-binary/BOOTIA32.EFI .mnt_boot/EFI/BOOT/ 2>/dev/null || true; \
-	if [ -d osdata ] && [ "$$(ls -A osdata 2>/dev/null)" ]; then \
-		sudo cp -a osdata/. .mnt_root/; \
-	fi; \
-	sync; \
-	sudo umount .mnt_boot .mnt_root; \
-	rmdir .mnt_boot .mnt_root; \
-	sudo losetup -d $$LOOP_DEV
-
-	@echo "==> Устанавливаем BIOS Limine в BIOS Boot Partition"
-	./limine-binary/limine bios-install main.img
+	@echo "==> Создаём GPT образ $(MAIN_SIZE_MIB) МиБ (p1 BIOSBOOT, p2 EFI System, p3 BOLDON_ROOT)"
+	python3 scripts/make-main-img.py \
+		--out main.img \
+		--size-mib $(MAIN_SIZE_MIB) \
+		--esp-mib $(MAIN_ESP_MIB) \
+		--root osdata \
+		--limine limine-binary/limine
 
 .PHONY: run-main
 run-main: main.img
