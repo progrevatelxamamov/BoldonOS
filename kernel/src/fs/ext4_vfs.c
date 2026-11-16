@@ -390,6 +390,36 @@ static vfs_node_t *ext4_vfs_op_lookup(vfs_node_t *dir, const char *name) {
     return node;
 }
 
+/* truncate(2)/ftruncate(2) backend. lwext4 has no path based truncate, so
+   open the target, resize the inode and refresh the cached VFS length. */
+static int ext4_vfs_op_truncate(vfs_node_t *node, uint64_t length) {
+    if (!node) return -EINVAL;
+    if (node->type == VFS_TYPE_DIR) return -EISDIR;
+    if (node->type != VFS_TYPE_FILE) return -EINVAL;
+
+    char path[512];
+    get_lwext4_path(node, path, sizeof(path));
+    if (!path[0]) return -ENOENT;
+
+    ext4_file f;
+    int r = ext4_fopen(&f, path, "r+");
+    if (r != EOK) return -EIO;
+
+    r = ext4_ftruncate(&f, length);
+    if (r != EOK) {
+        ext4_fclose(&f);
+        return -EIO;
+    }
+
+    /* ftruncate moves the current position to the new length when it was
+       past EOF; report the on-disk size instead of guessing. */
+    ext4_fclose(&f);
+
+    node->size = length;
+    ext4_cache_flush("/");
+    return 0;
+}
+
 static int ext4_vfs_op_readlink(vfs_node_t *node, char *buf, uint64_t size) {
     if (!node || !buf) return -1;
     char path[512];
@@ -805,6 +835,7 @@ void ext4_vfs_init(void) {
     g_ext4_file_ops.ioctl = ext4_vfs_op_ioctl;
     g_ext4_file_ops.readdir = ext4_vfs_op_readdir;
     g_ext4_file_ops.mmap = ext4_vfs_op_mmap;
+    g_ext4_file_ops.truncate = ext4_vfs_op_truncate;
 
     g_ext4_node_ops.lookup = ext4_vfs_op_lookup;
     g_ext4_node_ops.create = ext4_vfs_op_create;

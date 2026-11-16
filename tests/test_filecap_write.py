@@ -6,7 +6,10 @@ root=Path(__file__).resolve().parents[1]
 src=(root/'kernel/src/fs/vfs.c').read_text()
 drop=src[src.index('static int vfs_drop_file_caps('):src.index('void vfs_init(',src.index('static int vfs_drop_file_caps('))]
 write=src[src.index('int vfs_write('):src.index('int vfs_readdir(',src.index('int vfs_write('))]
-opening=src[src.index('vfs_file_t *vfs_open('):src.index('int vfs_read(',src.index('vfs_file_t *vfs_open('))]
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import kernel_snip as k
+opening = k.function(src, 'vfs_open_node')
 assert opening.index('vfs_drop_file_caps(node)') < opening.index('file_ops->open(file)')
 code=r'''
 #include <assert.h>

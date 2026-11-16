@@ -245,9 +245,6 @@ uint64_t sys_inotify_init1_impl(uint64_t flags) {
     if (flags & ~(04000ULL | 02000000ULL)) return (uint64_t)-EINVAL;
     process_t *p = get_current_process();
     if (!p || !p->fd_table) return (uint64_t)-EBADF;
-    int fd = 0;
-    while (fd < VFS_MAX_FD && p->fd_table->fds[fd]) fd++;
-    if (fd == VFS_MAX_FD) return (uint64_t)-EMFILE;
     in_instance_t *in = malloc_alloc(sizeof(*in));
     vfs_node_t *node = malloc_alloc(sizeof(*node));
     vfs_file_t *file = malloc_alloc(sizeof(*file));
@@ -266,11 +263,19 @@ uint64_t sys_inotify_init1_impl(uint64_t flags) {
     file->flags = VFS_O_READ |
         ((flags & 04000) ? VFS_O_NONBLOCK : 0) |
         ((flags & 02000000) ? VFS_O_CLOEXEC : 0);
+    int fd = vfs_fd_install(p->fd_table, file, 0,
+                            (flags & 02000000) ? VFS_FD_CLOEXEC : 0);
+    if (fd < 0) {
+        file->refcount = 0;
+        malloc_free(file);
+        malloc_free(node);
+        malloc_free(in);
+        return (uint64_t)fd;
+    }
     uint64_t irq;
     spin_lock_irqsave(&in_lock, &irq);
     in->next = instances;
     instances = in;
-    p->fd_table->fds[fd] = file;
     spin_unlock_irqrestore(&in_lock, irq);
     return (uint64_t)fd;
 }

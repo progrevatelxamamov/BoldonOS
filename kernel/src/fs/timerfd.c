@@ -119,14 +119,14 @@ int sys_timerfd_create_impl(int clockid, int flags) {
     f->flags = VFS_O_RDWR | (uint32_t)flags;
     f->refcount = 1;
 
-    for (int fd = 0; fd < VFS_MAX_FD; fd++) {
-        if (!p->fd_table->fds[fd]) {
-            p->fd_table->fds[fd] = f;
-            return fd;
-        }
+    int fd = vfs_fd_install(p->fd_table, f, 0,
+                            (flags & 02000000 /* TFD_CLOEXEC */) ? VFS_FD_CLOEXEC : 0);
+    if (fd < 0) {
+        f->refcount = 0;
+        malloc_free(f);
+        malloc_free(n);
     }
-    malloc_free(f); malloc_free(n);
-    return -EMFILE;
+    return fd;
 }
 
 static uint64_t ts_to_ns(const struct timespec_k *ts) {

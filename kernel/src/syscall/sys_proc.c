@@ -637,6 +637,9 @@ uint64_t sys_clone_impl(uint64_t flags, uint64_t child_stack,
                 if (p->fd_table->fds[fd]) {
                     child->fd_table->fds[fd] = p->fd_table->fds[fd];
                     child->fd_table->fds[fd]->refcount++;
+                    /* fork(2) shares the open file description but not the
+                       descriptor flags: each side keeps its own FD_CLOEXEC. */
+                    child->fd_table->fd_flags[fd] = p->fd_table->fd_flags[fd];
                 }
             }
         }

@@ -500,24 +500,13 @@ int vfs_check_access(vfs_node_t *node, uint32_t uid, uint32_t gid, int req_perms
     return -1;
 }
 
-vfs_file_t *vfs_open(const char *path, uint32_t flags) {
-    vfs_node_t *node = vfs_resolve_path(path);
-    if (!node && (flags & VFS_O_CREAT)) {
-        char filename[256];
-        vfs_node_t *parent = vfs_resolve_path_ext(path, true, filename);
-        if (parent && parent->ops && parent->ops->create) {
-            if (parent->ops->create(parent, filename, 0644, &node) == 0 && node) {
-                inotify_vfs_event(parent, IN_CREATE, filename);
-            }
-        }
-    }
-
+vfs_file_t *vfs_open_node(vfs_node_t *node, uint32_t flags) {
     if (!node) return NULL;
     if ((flags & VFS_O_TRUNC) && vfs_drop_file_caps(node)) return NULL;
 
     vfs_file_t *file = malloc_alloc(sizeof(vfs_file_t));
     if (!file) return NULL;
-    
+
     memset(file, 0, sizeof(vfs_file_t));
     file->node = node;
     file->flags = flags;
@@ -537,6 +526,60 @@ vfs_file_t *vfs_open(const char *path, uint32_t flags) {
     }
     inotify_vfs_event(node, IN_OPEN, NULL);
     return file;
+}
+
+vfs_file_t *vfs_open(const char *path, uint32_t flags) {
+    vfs_node_t *node = vfs_resolve_path(path);
+    if (!node && (flags & VFS_O_CREAT)) {
+        char filename[256];
+        process_t *p = get_current_process();
+        uint32_t mode = 0644 & ~((p && p->umask) ? p->umask : 0u);
+        vfs_node_t *parent = vfs_resolve_path_ext(path, true, filename);
+        if (parent && parent->ops && parent->ops->create) {
+            if (parent->ops->create(parent, filename, (uint16_t)mode, &node) == 0 && node) {
+                inotify_vfs_event(parent, IN_CREATE, filename);
+            }
+        }
+    }
+
+    return vfs_open_node(node, flags);
+}
+
+int vfs_fd_install(process_fd_table_t *table, vfs_file_t *file, int min_fd,
+                   uint8_t flags) {
+    if (!table || !file) return -EINVAL;
+    if (min_fd < 0) min_fd = 0;
+    if (min_fd >= VFS_MAX_FD) return -EMFILE;
+    for (int fd = min_fd; fd < VFS_MAX_FD; fd++) {
+        if (table->fds[fd]) continue;
+        table->fds[fd] = file;
+        table->fd_flags[fd] = (uint8_t)(flags & VFS_FD_CLOEXEC);
+        file->refcount++;
+        return fd;
+    }
+    return -EMFILE;
+}
+
+int vfs_fd_install_at(process_fd_table_t *table, int fd, vfs_file_t *file,
+                      uint8_t flags) {
+    if (!table || !file) return -EINVAL;
+    if (fd < 0 || fd >= VFS_MAX_FD) return -EBADF;
+    /* Replacing a slot drops the previous open file description. */
+    if (table->fds[fd]) vfs_fd_release(table, fd);
+    table->fds[fd] = file;
+    table->fd_flags[fd] = (uint8_t)(flags & VFS_FD_CLOEXEC);
+    file->refcount++;
+    return fd;
+}
+
+int vfs_fd_release(process_fd_table_t *table, int fd) {
+    if (!table) return -EINVAL;
+    if (fd < 0 || fd >= VFS_MAX_FD) return -EBADF;
+    vfs_file_t *file = table->fds[fd];
+    if (!file) return -EBADF;
+    table->fds[fd] = NULL;
+    table->fd_flags[fd] = 0;
+    return vfs_close(file);
 }
 
 int vfs_read(vfs_file_t *file, void *buf, uint64_t count) {
@@ -569,8 +612,22 @@ int vfs_write(vfs_file_t *file, const void *buf, uint64_t count) {
 }
 
 int vfs_readdir(vfs_file_t *file, vfs_dirent_t *dirent) {
-    if (!file || !file->node || !file->node->file_ops || !file->node->file_ops->readdir) return -1;
+    if (!file || !file->node || !dirent) return -1;
+    if (file->has_pending_dirent) {
+        *dirent = file->pending_dirent;
+        file->has_pending_dirent = false;
+        return 0;
+    }
+    if (!file->node->file_ops || !file->node->file_ops->readdir) return -1;
     return file->node->file_ops->readdir(file, dirent);
+}
+
+/* Put a record back so the next readdir() returns it again. Only one entry
+   can be pending: callers push back at most the record they just consumed. */
+void vfs_readdir_pushback(vfs_file_t *file, const vfs_dirent_t *dirent) {
+    if (!file || !dirent) return;
+    file->pending_dirent = *dirent;
+    file->has_pending_dirent = true;
 }
 
 int vfs_close(vfs_file_t *file) {
@@ -593,19 +650,49 @@ int vfs_close(vfs_file_t *file) {
     return res;
 }
 
+/* Linux SEEK_* values; SEEK_DATA/SEEK_HOLE only exist from 3.1 on. */
+#ifndef SEEK_DATA
+#define SEEK_DATA 3
+#endif
+#ifndef SEEK_HOLE
+#define SEEK_HOLE 4
+#endif
+
 int64_t vfs_lseek(vfs_file_t *file, int64_t offset, int whence) {
-    if (!file || !file->node) return -1;
+    if (!file || !file->node) return -EBADF;
+
+    /* Pipes, sockets and terminals have no seek offset. The Linux ABI
+       reports ESPIPE instead of silently moving a byte counter. */
+    if (file->node->type == VFS_TYPE_FIFO ||
+        file->node->type == VFS_TYPE_SOCKET || file->node->type == VFS_TYPE_CHAR_DEV)
+        return -ESPIPE;
+
+    /* SEEK_DATA / SEEK_HOLE: this VFS allocates files densely, so every
+       byte of an existing file is data and the only hole starts at EOF. */
+    if (whence == 3 /* SEEK_DATA */) {
+        if (offset < 0) return -ENXIO;
+        if ((uint64_t)offset >= file->node->size) return -ENXIO;
+        file->offset = (uint64_t)offset;
+        return offset;
+    }
+    if (whence == 4 /* SEEK_HOLE */) {
+        if (offset < 0) return -ENXIO;
+        if ((uint64_t)offset > file->node->size) return -ENXIO;
+        file->offset = file->node->size;
+        return (int64_t)file->node->size;
+    }
+    if (whence < VFS_SEEK_SET || whence > VFS_SEEK_END) return -EINVAL;
 
     if (file->node->file_ops && file->node->file_ops->lseek) {
         return (int64_t)file->node->file_ops->lseek(file, offset, whence);
     }
 
-    int64_t new_offset = file->offset;
+    int64_t new_offset = (int64_t)file->offset;
     if (whence == VFS_SEEK_SET) new_offset = offset;
     else if (whence == VFS_SEEK_CUR) new_offset += offset;
     else if (whence == VFS_SEEK_END) new_offset = (int64_t)file->node->size + offset;
 
-    if (new_offset < 0) return -1;
+    if (new_offset < 0) return -EINVAL;
 
     file->offset = (uint64_t)new_offset;
     return new_offset;
@@ -754,8 +841,11 @@ int sys_open(process_fd_table_t *table, const char *path, uint32_t flags) {
     if (flags & VFS_O_WRITE) req_perms |= VFS_PERM_WRITE;
 
     vfs_node_t *node = vfs_resolve_path(path);
+    int created = 0;
     if (node && vfs_check_access(node, table->uid, table->gid, req_perms) != 0)
         return -EACCES;
+    if (node && (flags & VFS_O_CREAT) && (flags & VFS_O_EXCL))
+        return -EEXIST;
     if (!node && (flags & VFS_O_CREAT)) {
         char name[256];
         vfs_node_t *parent = vfs_resolve_path_ext(path, true, name);
@@ -763,20 +853,31 @@ int sys_open(process_fd_table_t *table, const char *path, uint32_t flags) {
         if (vfs_check_access(parent, table->uid, table->gid,
                              VFS_PERM_WRITE | VFS_PERM_EXEC) != 0)
             return -EACCES;
+        created = 1;
     }
 
     vfs_file_t *file = vfs_open(path, flags);
     if (!file) return -ENOENT;
-
-    for (int fd = 0; fd < VFS_MAX_FD; fd++) {
-        if (table->fds[fd] == NULL) {
-            table->fds[fd] = file;
-            return fd;
-        }
+    if (created && file->node && file->node->mount && file->node->mount->read_only) {
+        vfs_close(file);
+        return -EROFS;
+    }
+    if (node && (flags & VFS_O_DIRECTORY) && node->type != VFS_TYPE_DIR) {
+        vfs_close(file);
+        return -ENOTDIR;
+    }
+    if (node && (flags & VFS_O_WRITE) && node->type == VFS_TYPE_DIR) {
+        vfs_close(file);
+        return -EISDIR;
     }
 
-    vfs_close(file);
-    return -EMFILE;
+    int fd = vfs_fd_install(table, file, 0,
+                            (flags & VFS_O_CLOEXEC) ? VFS_FD_CLOEXEC : 0);
+    if (fd < 0) {
+        vfs_close(file);
+        return fd;
+    }
+    return fd;
 }
 
 int sys_read(process_fd_table_t *table, int fd, void *buf, uint64_t count) {
@@ -791,9 +892,51 @@ int sys_write(process_fd_table_t *table, int fd, const void *buf, uint64_t count
 
 int sys_close(process_fd_table_t *table, int fd) {
     if (!table || fd < 0 || fd >= VFS_MAX_FD || !table->fds[fd]) return -EBADF;
-    int res = vfs_close(table->fds[fd]);
-    table->fds[fd] = NULL;
-    return res;
+    return vfs_fd_release(table, fd);
+}
+
+int vfs_symlink(const char *target, const char *linkpath) {
+    if (!target || !linkpath || !target[0]) return -ENOENT;
+    if (vfs_resolve_path_nofollow(linkpath)) return -EEXIST;
+
+    char linkname[256] = {0};
+    vfs_node_t *parent = vfs_resolve_path_ext(linkpath, true, linkname);
+    if (!parent) return -ENOENT;
+    if (parent->type != VFS_TYPE_DIR) return -ENOTDIR;
+    if (!parent->ops || !parent->ops->symlink) return -EROFS;
+
+    int result = parent->ops->symlink(parent, linkname, target);
+    if (!result) inotify_vfs_event(parent, IN_CREATE, linkname);
+    return result;
+}
+
+int vfs_readlink(const char *path, char *buf, uint64_t size) {
+    if (!path || !buf) return -EINVAL;
+    if (size == 0) return -EINVAL;
+
+    vfs_node_t *node = vfs_resolve_path_nofollow(path);
+    if (!node) return -ENOENT;
+    if (node->type != VFS_TYPE_SYMLINK) return -EINVAL;
+    if (!node->ops || !node->ops->readlink) return -EINVAL;
+
+    int result = node->ops->readlink(node, buf, size);
+    if (result < 0) return -EINVAL;
+    return result;
+}
+
+/* Truncate through an open file description. The VFS only owns the cached
+   length; the filesystem must perform the real allocation change. */
+int vfs_truncate_node(vfs_node_t *node, uint64_t length) {
+    if (!node) return -EBADF;
+    if (node->type == VFS_TYPE_DIR) return -EISDIR;
+    if (node->mount && node->mount->read_only) return -EROFS;
+    if (!node->file_ops || !node->file_ops->truncate) return -EINVAL;
+
+    int result = vfs_drop_file_caps(node);
+    if (result) return result;
+    result = node->file_ops->truncate(node, length);
+    if (!result) inotify_vfs_event(node, IN_MODIFY, NULL);
+    return result;
 }
 
 int vfs_link(const char *oldpath, const char *newpath) {

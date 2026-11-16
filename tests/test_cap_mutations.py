@@ -4,16 +4,23 @@ import subprocess
 import tempfile
 root = Path(__file__).resolve().parents[1]
 sys = (root/'kernel/src/syscall/sys_file.c').read_text()
+import sys as _sysmod
+_sysmod.path.insert(0, str(root / 'tests'))
+import kernel_snip as _k
+sys = sys + '\n' + _k.function(sys, 'apply_umask')
 section = sys[sys.index('static int mutation_parent_access('):sys.index('uint64_t sys_mkdirat_impl(', sys.index('static int mutation_parent_access('))]
+import sys as _sys
+_sys.path.insert(0, str(Path(__file__).resolve().parent))
+import kernel_snip as _k
 for syscall, guard in [('sys_mkdirat_impl','mutation_parent_access(kpath)'),
                        ('sys_renameat_impl','mutation_parent_access(oldpath)'),
                        ('sys_unlinkat_impl','mutation_parent_access(kpath)'),
                        ('sys_fchmodat_impl','mutation_owner_access(vfs_resolve_path(kpath))'),
                        ('sys_fchmod_impl','mutation_owner_access(file->node)'),
-                       ('sys_link_impl','mutation_parent_access(knew)')]:
-    body=sys[sys.index('uint64_t '+syscall+'('):]
-    body=body[:body.index('\nuint64_t ',1)] if '\nuint64_t ' in body[1:] else body
-    assert guard in body, (syscall,guard)
+                       ('sys_linkat_impl','mutation_parent_access(knew)'),
+                       ('symlink_common','mutation_parent_access(linkpath)')]:
+    body = _k.function(sys, syscall)
+    assert guard in body, (syscall, guard)
 for name in ('BOLDON_CAP_SYS_ADMIN','BOLDON_CAP_SYS_BOOT'):
     assert name in sys
 code=r'''
@@ -26,7 +33,7 @@ code=r'''
 #define VFS_PERM_EXEC 1
 #define BOLDON_CAP_FOWNER (1ULL<<3)
 typedef struct { uint32_t uid,gid; } process_fd_table_t;
-typedef struct { uint32_t fsuid,fsgid; uint64_t cap_effective; process_fd_table_t *fd_table; } process_t;
+typedef struct { uint32_t fsuid,fsgid,umask; uint64_t cap_effective; process_fd_table_t *fd_table; } process_t;
 typedef struct { uint32_t uid,gid; int type; } vfs_node_t;
 static process_fd_table_t table;
 static process_t proc={ .fsuid=1000, .fsgid=1000, .fd_table=&table };
@@ -52,6 +59,11 @@ int main(void) {
     proc.fsuid = 1000;
     proc.cap_effective = BOLDON_CAP_FOWNER;
     assert(mutation_owner_access(&node) == 0);
+    /* New entries honour the process umask instead of the raw mode. */
+    proc.umask = 022;
+    assert(apply_umask(0777) == 0755);
+    proc.umask = 0;
+    assert(apply_umask(0777) == 0777);
 }
 '''
 with tempfile.TemporaryDirectory() as tmp:
